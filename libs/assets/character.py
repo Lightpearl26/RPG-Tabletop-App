@@ -105,18 +105,6 @@ class Character:
     name: str
     stats: Stats = field(default_factory=Stats)
 
-    # properties
-    @property
-    def token(self) -> Optional[Path]:
-        """
-        Get the file path of the character's token image.
-
-        Returns:
-            Optional[Path]: The file path of the character's token image, or None if not set.
-        """
-        token_path = get_current_campaign().character_path / "tokens" / f"{self.name}.png"
-        return Path(token_path) if exists(token_path) else None
-
     # class methods
     @classmethod
     def from_name(cls, name: str) -> Character:

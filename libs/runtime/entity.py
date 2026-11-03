@@ -12,6 +12,8 @@ the static definition of a character outside of a session.
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
+from os.path import exists
+from pathlib import Path
 from uuid import uuid4, UUID
 from json import load
 
@@ -279,6 +281,19 @@ class Entity:
             for effect in self.spell_effects
             if effect.effect_type == EffectType.DAMAGE_REDUCTION
         ))
+
+        # properties
+
+    @property
+    def token(self) -> Optional[Path]:
+        """
+        Get the file path of the character's token image.
+
+        Returns:
+            Optional[Path]: The file path of the character's token image, or None if not set.
+        """
+        token_path = get_current_campaign().entity_path / "tokens" / f"{self.name}.png"
+        return Path(token_path) if exists(token_path) else None
 
     # methods
     def get_stat(self, stat_name: str) -> int:

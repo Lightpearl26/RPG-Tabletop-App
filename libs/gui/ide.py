@@ -41,15 +41,17 @@ from ..assets.references import ReferenceUpdate
 from .browser import ResourceBrowser
 from .cards.base import ResourceCard
 from .cards.character import CharacterCard, THEME as CHARACTER_CARD_THEME
-from .cards.entity import THEME as ENTITY_CARD_THEME
+from .cards.entity import EntityCard, THEME as ENTITY_CARD_THEME
 from .cards.item import ItemCard, THEME as ITEM_CARD_THEME
 from .cards.map import MapCard, THEME as MAP_CARD_THEME
 from .cards.session import THEME as SESSION_CARD_THEME
 from .cards.spell import SpellCard, THEME as SPELL_CARD_THEME
 from .editor.base import ResourceEditor
 from .editor.character import CharacterEditor
+from .editor.entity import EntityEditor
 from .editor.item import ItemEditor
 from .editor.spell import SpellEditor
+from .editor.map import MapEditor
 from .theme import CAMPAIGN_MANAGER_STYLESHEET
 
 
@@ -68,6 +70,8 @@ EDITOR_TYPES: dict[str, type[ResourceEditor]] = {
     "characters": CharacterEditor,
     "items": ItemEditor,
     "spells": SpellEditor,
+    "entities": EntityEditor,
+    "maps": MapEditor
 }
 
 
@@ -763,6 +767,8 @@ class CampaignManagerWindow(QMainWindow):
                 for path in self.campaign.maps_path.iterdir()
                 if path.is_dir() and path.name != "media"
             ] if self.campaign.maps_path.is_dir() else []
+        if resource_type == "entities":
+            return [EntityCard(path.stem) for path in self.campaign.entity_path.glob("*.json")]
         return []
 
     def _on_resource_selected(self, resource_type: str, resource_id: str) -> None:

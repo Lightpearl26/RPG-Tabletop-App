@@ -85,6 +85,7 @@ class EntityEditor(ResourceEditor):
         root.setContentsMargins(24, 20, 24, 24)
         root.setSpacing(14)
 
+        header = QHBoxLayout(self)
         form = QFormLayout()
         self.name_input = QLineEdit()
         self.name_input.setObjectName("EntityNameField")
@@ -95,7 +96,9 @@ class EntityEditor(ResourceEditor):
         self.character_input.addItems(self._resource_names(self.campaign.character_path))
         form.addRow("Name", self.name_input)
         form.addRow("Base character", self.character_input)
-        root.addLayout(form)
+        header.addLayout(form)
+        # TODO : Add token input with functionalities
+        root.addLayout(header)
 
         grid = QGridLayout()
         grid.setSpacing(14)
