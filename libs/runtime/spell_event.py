@@ -64,6 +64,49 @@ class SpellEvent:
     id: UUID = field(default_factory=uuid4)
 
     # methods
+    def to_dict(self) -> dict:
+        """
+        Convert the instance to a dictionary.
+        """
+        return {
+            "spell_id": self.spell_id,
+            "caster_id": self.caster_id,
+            "targets_id": self.targets_id,
+            "effects": [effect.to_dict() for effect in self.effects],
+            "runtime_policy": self.runtime_policy.value,
+            "nb_cast": self.nb_cast,
+            "finished": self.finished,
+            "id": self.id
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict, effect_cache: dict) -> SpellEvent:
+        """
+        Create a SpellEvent instance from a dictionary.
+
+        Args:
+            data (dict): A dictionary containing the attributes of the SpellEvent.
+        """
+        effects_data = data.get("effects", [])
+        effects = []
+        for effect_data in effects_data:
+            effect_id = effect_data.get("id")
+            if effect_id in effect_cache:
+                effects.append(effect_cache[effect_id])
+            else:
+                effect = SpellEffect.from_dict(effect_data)
+                effects.append(effect)
+        return cls(
+            spell_id=data["spell_id"],
+            caster_id=data["caster_id"],
+            targets_id=data["targets_id"],
+            effects=effects,
+            runtime_policy=RuntimePolicy(data["runtime_policy"]),
+            nb_cast=data.get("nb_cast", 0),
+            finished=data.get("finished", False),
+            id=UUID(data["id"]) if "id" in data else uuid4()
+        )
+
     def apply(
         self,
         new_targets: list[str],

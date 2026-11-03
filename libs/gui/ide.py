@@ -53,6 +53,7 @@ from .editor.item import ItemEditor
 from .editor.spell import SpellEditor
 from .editor.map import MapEditor
 from .theme import CAMPAIGN_MANAGER_STYLESHEET
+from .runtime import RuntimeWindow
 
 
 RESOURCE_SECTIONS = (
@@ -995,7 +996,9 @@ class CampaignManagerWindow(QMainWindow):
         return [page for page in pages if isinstance(page, ResourceEditor)]
 
     def _confirm_close(self, editors: list[ResourceEditor]) -> bool:
-        """Ask what to do with the unsaved changes of `editors`; return whether closing may go on."""
+        """
+        Ask what to do with the unsaved changes of `editors`; return whether closing may go on.
+        """
         pending = [editor for editor in editors if editor.has_changes]
         if not pending:
             return True
@@ -1070,12 +1073,7 @@ class CampaignManagerWindow(QMainWindow):
         name = name.strip()
         if not accepted or not name:
             return
-        try:
-            from .runtime import RuntimeWindow
-            runtime_window = RuntimeWindow.start_new(self.campaign, name)
-        except Exception as exc:
-            QMessageBox.critical(self, "Nouvelle session", str(exc))
-            return
+        runtime_window = RuntimeWindow.start_new(self.campaign, name)
 
         self.start_session_requested.emit()
         self._runtime_windows.append(runtime_window)

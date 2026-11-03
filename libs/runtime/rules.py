@@ -79,4 +79,7 @@ class RuntimePermissions:
 
     @property
     def in_active_turn(self) -> bool:
+        """
+        Check if the player is in their active combat turn.
+        """
         return self.can_combat_actions

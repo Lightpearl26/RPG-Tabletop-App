@@ -60,6 +60,31 @@ class SpellEffect:
     # Unique identifier of the spell effect instance
     id: UUID = field(default_factory=uuid4)
 
+    def to_dict(self) -> dict:
+        """
+        Convert the instance to a dictionnary
+        """
+        return {
+            "effect_type": self.effect_type,
+            "effect_def": self.effect_def,
+            "target_id": self.target_id,
+            "target_stat": self.target_stat,
+            "delta": self.delta,
+            "duration": self.duration,
+            "event_id": self.event_id,
+            "id": self.id
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> SpellEffect:
+        """
+        Create a SpellEffect instance from a dictionary.
+
+        Args:
+            data (dict): A dictionary containing the attributes of the SpellEffect.
+        """
+        return cls(**data)
+
     def is_expired(self) -> bool:
         """
         Check if the spell effect has expired based on its duration.

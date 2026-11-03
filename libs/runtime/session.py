@@ -810,7 +810,9 @@ class SessionRuntime:
             for path in sorted(campaign.entity_path.glob("*.json")):
                 raw = loads(path.read_text(encoding="utf-8"))
                 entity_name = str(raw.get("name") or path.stem)
-                loaded.append(Entity.from_name(entity_name))
+                entity = Entity.from_name(entity_name)
+                if entity:
+                    loaded.append(entity)
             entities = loaded
 
         entity_dict = {str(entity.id): entity for entity in entities}
@@ -1394,7 +1396,7 @@ class SessionRuntime:
     def set_token_disclosure(
         self,
         token_id: str,
-        fields: Sequence[str],
+        token_fields: Sequence[str],
     ) -> SessionEvent:
         state = self._require_active_map()
         token = state.token_by_id(str(token_id))
@@ -1402,7 +1404,7 @@ class SessionRuntime:
             raise KeyError(f"Unknown token: {token_id}")
         allowed = set(DISCLOSABLE_FIELDS)
         normalized = []
-        for item in fields:
+        for item in token_fields:
             name = str(item).strip().lower()
             if name and name not in normalized:
                 if name not in allowed:

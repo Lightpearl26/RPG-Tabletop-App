@@ -577,7 +577,7 @@ class Entity:
         )
         try:
             with open(filename, "r", encoding="utf-8") as f:
-                raw = load(f)
+                raw: dict = load(f)
         except FileNotFoundError:
             return None
 
@@ -585,7 +585,10 @@ class Entity:
         if not character_name:
             return None
 
-        return cls.from_character(entity_name, character_name)
+        inst = cls.from_character(entity_name, character_name)
+        if inst:
+            inst.id = UUID(raw.get("id"))
+        return inst
 
     def to_dict(self) -> dict:
         """

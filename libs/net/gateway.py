@@ -13,7 +13,7 @@ from ..runtime.session import SessionEventType, SessionRuntime
 from .commands import ActionIntent, ActionKind, ClientCommand, ServerCommand
 from .models import DiceProposal, PendingKind, PendingRequest, PendingStatus
 from .projection import build_player_runtime_projection
-from .protocol import CommandMessage, ErrorMessage, ErrorType, NetworkMessage
+from .protocol import CommandMessage, ErrorType, NetworkMessage
 
 
 ActionPreparer = Callable[[SessionRuntime, str, ActionIntent, PendingRequest], None]

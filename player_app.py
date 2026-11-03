@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Standalone entry point for the RPG Tabletop Player Runtime."""
+
+"""
+Standalone entry point for the RPG Tabletop Player Runtime.
+"""
+
+
 from __future__ import annotations
 
 import sys
@@ -10,6 +15,7 @@ from libs.gui.player_runtime import PlayerLoginDialog, PlayerRuntimeWindow
 
 
 def main() -> int:
+    """Launching app"""
     app = QApplication(sys.argv)
     app.setApplicationName("RPG Tabletop Player")
     app.setOrganizationName("RPGTabletop")

@@ -58,6 +58,7 @@ def _spells_view(entity) -> dict[str, Any]:
         for name, spell in entity.spells.items()
     }
 
+
 def _event_view(spell_event) -> dict[str, Any]:
     data = spell_event.to_dict()
     effects = data.get("effects")
@@ -165,7 +166,7 @@ def _combat_view(runtime: SessionRuntime, entity_id: str) -> dict[str, Any]:
             visible_tokens = []
     visible_by_entity = {token.entity_id: token for token in visible_tokens}
 
-    def safe_entry(target_id: str, offset: int) -> dict[str, Any]:
+    def safe_entry(target_id: str, _: int) -> dict[str, Any]:
         if target_id == entity_id:
             entity = runtime.entities.get(target_id)
             token = visible_by_entity.get(target_id)
