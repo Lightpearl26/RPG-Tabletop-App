@@ -292,7 +292,7 @@ class Entity:
         Returns:
             Optional[Path]: The file path of the character's token image, or None if not set.
         """
-        token_path = get_current_campaign().entity_path / "tokens" / f"{self.name}.png"
+        token_path = get_current_campaign().entity_path / "tokens" / f"{self.name.lower().replace(" ", "_")}.webp"
         return Path(token_path) if exists(token_path) else None
 
     # methods

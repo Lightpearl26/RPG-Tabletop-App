@@ -306,7 +306,7 @@ class TokenManagerPanel(QWidget):
 
     def _entity_icon(self, entity, placed: bool) -> QIcon:
         try:
-            path = entity.character.token
+            path = entity.token
         except Exception:
             path = None
         key = (str(entity.id), entity.name, str(path), placed)

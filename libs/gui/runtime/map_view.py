@@ -168,7 +168,7 @@ class RuntimeMapView(QWidget):
         entity = self.runtime.entities.get(token.entity_id)
         if entity is None:
             return None
-        path = entity.character.token
+        path = entity.token
         if path is None:
             return None
         path = Path(path)

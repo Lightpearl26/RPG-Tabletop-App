@@ -8,19 +8,24 @@ from copy import deepcopy
 import json
 from uuid import uuid4
 from pathlib import Path
+from os.path import exists
 from typing import Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QRectF
+from PySide6.QtGui import QPixmap, QPainter, QPainterPath, QImage, QFont, QColor
 from PySide6.QtWidgets import (
     QComboBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton,
-    QSpinBox, QVBoxLayout, QWidget, QSizePolicy
+    QSpinBox, QVBoxLayout, QWidget, QSizePolicy, QFileDialog
 )
 
 from ...assets.campaign import Campaign
 from ...runtime.entity import StatsModifier
 from ..cards import STAT_NAMES, STAT_PALETTE
 from .base import ResourceEditor
+
+
+TOKEN_SIZE = 64
 
 
 class EntityEditor(ResourceEditor):
@@ -97,7 +102,13 @@ class EntityEditor(ResourceEditor):
         form.addRow("Name", self.name_input)
         form.addRow("Base character", self.character_input)
         header.addLayout(form)
-        # TODO : Add token input with functionalities
+        layout = QVBoxLayout()
+        label = QLabel("Token")
+        layout.addWidget(label)
+        self.token_input = QLabel()
+        self.token_input.mousePressEvent = self._select_token
+        layout.addWidget(self.token_input)
+        header.addLayout(layout)
         root.addLayout(header)
 
         grid = QGridLayout()
@@ -257,6 +268,33 @@ class EntityEditor(ResourceEditor):
     def _populate_fields(self) -> None:
         self.name_input.setText(str(self._data.get("name") or self.resource_id.replace("_", " ")))
         self.character_input.setCurrentText(str(self._data.get("character", "")))
+        pixmap = QPixmap(TOKEN_SIZE, TOKEN_SIZE)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        circle = QRectF(4, 4, TOKEN_SIZE-8, TOKEN_SIZE-8)
+        clip = QPainterPath()
+        clip.addEllipse(circle)
+        image_path = self.campaign.entity_path / "tokens" / f"{self.entity_name}.webp"
+        if not exists(image_path):
+            image_path = None
+        image = QImage(str(image_path)) if image_path is not None else QImage()
+        if not image.isNull():
+            side = min(image.width(), image.height())
+            source = QRectF((image.width()-side)/2.0, (image.height()-side)/2.0, side, side)
+            painter.drawImage(circle, image, source)
+        else:
+            painter.fillRect(circle, QColor("#2d3440"))
+            font = QFont()
+            font.setBold(True)
+            font.setPixelSize(24)
+            painter.setFont(font)
+            painter.setPen(QColor("#eef2f7"))
+            painter.drawText(circle, Qt.AlignmentFlag.AlignCenter, "No token")
+        painter.setClipping(False)
+        painter.end()
+        self.token_input.setPixmap(pixmap)
         modifiers = self._data.get("stats_modifier", {})
         if not isinstance(modifiers, dict):
             modifiers = {}
@@ -274,6 +312,25 @@ class EntityEditor(ResourceEditor):
         for spell in self._data.get("spells", []) or []:
             self.spells_field.addItem(str(spell))
         self._populate_runtime_fields()
+
+    def _select_token(self, event) -> None:
+        """
+        Select a new token image
+        """
+        source, _filter = QFileDialog.getOpenFileName(
+            self,
+            "Import token",
+            str(Path.cwd()),
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif);;All files (*)",
+        )
+        if source:
+            path = Path(source)
+            token_path = self.campaign.entity_path / "tokens"
+            image = QImage(str(path))
+            straight = image.convertToFormat(QImage.Format.Format_ARGB32)
+            saved = straight.save(str(token_path / f"{self.entity_name.lower().replace(" ", "_")}.webp"), "WEBP", 100)
+            if not saved:
+                raise OSError(f"Could not import image: {path}")
 
     def _populate_runtime_fields(self) -> None:
         """Summarize saved runtime values without constructing live objects."""
