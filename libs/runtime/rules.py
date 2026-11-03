@@ -18,6 +18,19 @@ PERCEPTION_POINTS_PER_VISION_CELL = 10
 BASE_MOVEMENT_CELLS = 3
 AGILITY_POINTS_PER_MOVEMENT_CELL = 15
 
+# Stats that only the GM may ever see or test.
+PRIVATE_STATS = frozenset({"mental_health", "drug_health"})
+
+# Stats a player may know about (own entity, or a token disclosed by the GM).
+PLAYER_STAT_NAMES = (
+    "hp", "stamina",
+    "str", "con", "dex", "agi", "int", "wis", "cha", "luc", "sur", "per",
+)
+# Fields the GM can disclose on a token
+DISCLOSABLE_FIELDS = ("name", *PLAYER_STAT_NAMES)
+# Stats drawn as a bar under a token (they come with a `<stat>_max`)
+RESOURCE_BAR_STATS = ("hp", "stamina")
+
 
 def vision_cells_from_per(perception: int) -> int:
     """Player field-of-view radius in grid cells (legacy V1 rule)."""

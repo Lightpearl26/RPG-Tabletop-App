@@ -102,7 +102,6 @@ class TokenInspectDialog(QDialog):
 
     FIELD_LABELS = {
         "name": "Nom", "hp": "HP", "stamina": "Stamina",
-        "mental_health": "Santé mentale", "drug_health": "Santé toxique",
         "str": "STR", "con": "CON", "dex": "DEX", "agi": "AGI",
         "int": "INT", "wis": "WIS", "cha": "CHA", "luc": "LUC",
         "sur": "SUR", "per": "PER",
@@ -129,7 +128,9 @@ class TokenInspectDialog(QDialog):
         else:
             form = QFormLayout()
             for key, value in visible:
-                form.addRow(self.FIELD_LABELS[key], QLabel(str(value)))
+                maximum = entity_view.get(f"{key}_max")
+                text = f"{value} / {maximum}" if maximum is not None else str(value)
+                form.addRow(self.FIELD_LABELS[key], QLabel(text))
             root.addLayout(form)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)

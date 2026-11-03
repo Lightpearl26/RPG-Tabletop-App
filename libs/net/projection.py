@@ -11,37 +11,40 @@ from __future__ import annotations
 from dataclasses import fields
 from typing import Any
 
+from ..runtime.rules import PLAYER_STAT_NAMES, PRIVATE_STATS, RESOURCE_BAR_STATS
 from ..runtime.session import SessionRuntime, SessionToken
 
 
-STAT_NAMES = (
-    "hp", "stamina", "mental_health", "drug_health",
-    "str", "con", "dex", "agi", "int", "wis",
-    "cha", "luc", "sur", "per",
-)
+STAT_NAMES = PLAYER_STAT_NAMES  # mental_health / drug_health are GM-only
+
+
+def _event_view(spell_event) -> dict[str, Any]:
+    data = spell_event.to_dict()
+    effects = data.get("effects")
+    if isinstance(effects, list):
+        data["effects"] = [
+            effect for effect in effects
+            if not (isinstance(effect, dict) and effect.get("target_stat") in PRIVATE_STATS)
+        ]
+    return data
 
 
 def _own_entity_view(runtime: SessionRuntime, entity_id: str) -> dict[str, Any]:
     entity = runtime.entities[str(entity_id)]
     stats = {name: int(entity.get_stat(name)) for name in STAT_NAMES}
+    stats_max = {name: int(entity.get_stat_max(name)) for name in RESOURCE_BAR_STATS}
     return {
         "id": str(entity.id),
         "name": entity.name,
         "character": entity.character.name,
         "stats": stats,
-        "items": entity.items.to_list(),
-        "spells": {
-            name: {
-                "name": spell.name,
-                "description": spell.description,
-                "cost": int(spell.cost),
-                "targeting": spell.targeting,
-                "runtime_policy": spell.runtime_policy.value,
-            }
-            for name, spell in entity.spells.items()
-        },
-        "spell_effects": [effect.to_dict() for effect in entity.spell_effects],
-        "spell_events": [event.to_dict() for event in entity.spell_events],
+        "stats_max": stats_max,
+        # ... items / spells inchangés ...
+        "spell_effects": [
+            effect.to_dict() for effect in entity.spell_effects
+            if effect.target_stat not in PRIVATE_STATS
+        ],
+        "spell_events": [_event_view(event) for event in entity.spell_events],
     }
 
 

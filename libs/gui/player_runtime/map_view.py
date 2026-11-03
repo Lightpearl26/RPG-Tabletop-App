@@ -11,6 +11,13 @@ from PySide6.QtGui import QColor, QBrush, QImage, QMouseEvent, QPainter, QPen, Q
 from PySide6.QtWidgets import QWidget
 
 from ...assets.map import MapElement, MediaCache, Vec2
+from ..widgets.token_overlay import draw_token_overlay
+
+def _number(value: Any) -> float | None:
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class PlayerMapView(QWidget):
@@ -476,13 +483,16 @@ class PlayerMapView(QWidget):
             painter.drawLine(QPointF(visible.left(), y), QPointF(visible.right(), y))
 
     def _draw_tokens(self, painter: QPainter) -> None:
-        own = self.own_entity
-        own_name = str(own.get("name", "Vous"))
+        own_name = str(self.own_entity.get("name", "Vous"))
         for token in self._tokens():
             pos = self._drag_preview if token.get("id") == self._drag_token_id and self._drag_preview else self._token_pos(token)
             rect = self._token_rect(token, pos)
+            public = token.get("public") if isinstance(token.get("public"), dict) else {}
+            name = str(public.get("name") or (own_name if token.get("self") else ""))
+            opacity = max(0.0, min(1.0, float(token.get("opacity", 1.0))))
+
             painter.save()
-            painter.setOpacity(max(0.0, min(1.0, float(token.get("opacity", 1.0)))))
+            painter.setOpacity(opacity)
             painter.setBrush(QBrush(QColor("#334155" if not token.get("self") else "#315b66")))
             outline = QColor("#89dceb") if token.get("self") else QColor("#64748b")
             token_id = str(token.get("id", ""))
@@ -492,11 +502,23 @@ class PlayerMapView(QWidget):
                 outline = QColor("#f9e2af")
             painter.setPen(QPen(outline, max(1.5, 2.0 / self.zoom)))
             painter.drawEllipse(rect)
-            public = token.get("public") if isinstance(token.get("public"), dict) else {}
-            label = own_name if token.get("self") else str(public.get("name", "?"))
-            initials = "".join(part[:1] for part in label.split())[:2].upper() or "?"
+            initials = "".join(part[:1] for part in name.split())[:2].upper() or "?"
             painter.setPen(QColor("#f4f4f5"))
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, initials)
+            painter.restore()
+
+            # Full name + bars: only what the server projected (disclosed, or own token)
+            painter.save()
+            painter.setOpacity(opacity)
+            draw_token_overlay(
+                painter,
+                rect,
+                name=name,
+                hp=_number(public.get("hp")),
+                hp_max=_number(public.get("hp_max")),
+                stamina=_number(public.get("stamina")),
+                stamina_max=_number(public.get("stamina_max")),
+            )
             painter.restore()
 
     def _draw_target_marker(self, painter: QPainter) -> None:

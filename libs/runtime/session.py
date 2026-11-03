@@ -43,6 +43,9 @@ from .spell_effect import SpellEffect
 from .spell_event import SpellEvent
 from ..dice import DiceCheck
 from .rules import (
+    DISCLOSABLE_FIELDS,
+    PLAYER_STAT_NAMES,
+    RESOURCE_BAR_STATS,
     SHOOT_STAMINA_COST,
     STRIKE_STAMINA_COST,
     RuntimePermissions,
@@ -1230,16 +1233,22 @@ class SessionRuntime:
         if entity is None:
             raise KeyError(f"Unknown entity: {token.entity_id}")
 
+        # An entity bound to the observer is "shared" with them: every field a
+        # player may know is visible without any GM disclosure. Private stats
+        # are never part of DISCLOSABLE_FIELDS, so they can never leak here.
+        if token.entity_id == str(observer_entity_id):
+            names: Sequence[str] = DISCLOSABLE_FIELDS
+        else:
+            names = [name for name in token.disclosed_fields if name in DISCLOSABLE_FIELDS]
+
         result: dict[str, Any] = {"entity_id": token.entity_id, "token_id": token.id}
-        for name in token.disclosed_fields:
+        for name in names:
             if name == "name":
                 result["name"] = entity.name
-            elif name in {
-                "hp", "stamina", "mental_health", "drug_health",
-                "str", "con", "dex", "agi", "int", "wis",
-                "cha", "luc", "sur", "per",
-            }:
+            elif name in PLAYER_STAT_NAMES:
                 result[name] = entity.get_stat(name)
+                if name in RESOURCE_BAR_STATS:
+                    result[f"{name}_max"] = entity.get_stat_max(name)
         return result
 
     def stat_check(self, entity_id: str, stat: str) -> SessionEvent:
@@ -1391,11 +1400,7 @@ class SessionRuntime:
         token = state.token_by_id(str(token_id))
         if token is None:
             raise KeyError(f"Unknown token: {token_id}")
-        allowed = {
-            "name", "hp", "stamina", "mental_health", "drug_health",
-            "str", "con", "dex", "agi", "int", "wis",
-            "cha", "luc", "sur", "per",
-        }
+        allowed = set(DISCLOSABLE_FIELDS)
         normalized = []
         for item in fields:
             name = str(item).strip().lower()

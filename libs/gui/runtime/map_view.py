@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QWidget
 from ...assets.map import DrawingElement, DrawTool, MapAsset, MediaCache, Rect, Vec2
 from ...runtime.session import SessionRuntime, SessionToken
 from .tokens import TOKEN_ENTITY_MIME
+from ..widgets.token_overlay import draw_token_overlay
 
 
 class RuntimeMapView(QWidget):
@@ -217,6 +218,21 @@ class RuntimeMapView(QWidget):
                 painter.setPen(pen)
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawEllipse(rect)
+                # Draw token overlay (name, HP, stamina) if entity exists
+                entity = self.runtime.entities.get(token.entity_id)
+                if entity is not None:
+                    painter.save()
+                    painter.setOpacity(max(0.0, min(1.0, token.opacity)))
+                    draw_token_overlay(
+                        painter,
+                        rect,
+                        name=entity.name,
+                        hp=entity.get_stat("hp"),
+                        hp_max=entity.get_stat_max("hp"),
+                        stamina=entity.get_stat("stamina"),
+                        stamina_max=entity.get_stat_max("stamina"),
+                    )
+                    painter.restore()
         finally:
             painter.restore()
 
@@ -370,6 +386,7 @@ class RuntimeMapView(QWidget):
         event.acceptProposedAction()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt API
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
         if event.button() == Qt.MouseButton.MiddleButton:
             self._panning = True
             self._pan_last = event.position()
@@ -506,3 +523,34 @@ class RuntimeMapView(QWidget):
         self.center.y += before.y - after.y
         self.update()
         event.accept()
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if (
+            event.key() == Qt.Key.Key_Delete
+            and self.selected_token_id
+            and self._drawing_tool is None
+        ):
+            self._remove_selected_token()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _remove_selected_token(self) -> None:
+        state = self.runtime.active_map
+        token = state.token_by_id(self.selected_token_id) if state is not None else None
+        if token is None:
+            self.selected_token_id = None
+            return
+        entity = self.runtime.entities.get(token.entity_id)
+        label = entity.name if entity is not None else token.entity_id
+        try:
+            self.runtime.remove_token(token.id)
+        except Exception as exc:
+            self.status_message.emit(str(exc))
+            return
+        self.selected_token_id = None
+        self._drag_token_id = None
+        self._drag_start_pos = None
+        self.status_message.emit(f"Token retiré de la map : {label}")
+        self.runtime_changed.emit()
+        self.update()

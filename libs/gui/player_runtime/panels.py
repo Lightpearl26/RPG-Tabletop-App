@@ -17,7 +17,7 @@ from ...net import ActionIntent, ActionKind, TargetSelection
 
 STAT_ORDER = (
     "str", "con", "agi", "dex", "int", "wis", "cha", "luc", "sur", "per",
-    "hp", "stamina", "mental_health", "drug_health",
+    "hp", "stamina",
 )
 STAT_LABELS = {
     "str": "STR", "con": "CON", "agi": "AGI", "dex": "DEX",
@@ -50,8 +50,7 @@ class CharacterPanel(QWidget):
         self.resource_group = QGroupBox("Ressources")
         self.resource_form = QFormLayout(self.resource_group)
         self.resource_values: dict[str, QLabel] = {}
-        for key, label in (("hp", "HP"), ("stamina", "Stamina"),
-                           ("mental_health", "Santé mentale"), ("drug_health", "Santé toxique")):
+        for key, label in (("hp", "HP"), ("stamina", "Stamina")):
             value = QLabel("—")
             self.resource_values[key] = value
             self.resource_form.addRow(label, value)
@@ -65,7 +64,7 @@ class CharacterPanel(QWidget):
         stats_layout.setVerticalSpacing(7)
         self.stat_values: dict[str, QLabel] = {}
         for index, stat in enumerate(STAT_ORDER):
-            if stat in {"hp", "stamina", "mental_health", "drug_health"}:
+            if stat in {"hp", "stamina"}:
                 continue
             label = QLabel(STAT_LABELS[stat])
             label.setStyleSheet(f"color: {STAT_COLORS[stat]}; font-weight: 700;")
@@ -104,8 +103,11 @@ class CharacterPanel(QWidget):
         self.name_label.setText(str(entity.get("name", "Entity")))
         self.character_label.setText(f"Personnage : {entity.get('character', '—')}")
         stats = entity.get("stats", {}) if isinstance(entity.get("stats"), dict) else {}
+        stats_max = entity.get("stats_max", {}) if isinstance(entity.get("stats_max"), dict) else {}
         for key, label in self.resource_values.items():
-            label.setText(str(stats.get(key, "—")))
+            value = stats.get(key, "—")
+            maximum = stats_max.get(key)
+            label.setText(f"{value} / {maximum}" if maximum is not None and key in stats else str(value))
         for key, label in self.stat_values.items():
             label.setText(str(stats.get(key, "—")))
 

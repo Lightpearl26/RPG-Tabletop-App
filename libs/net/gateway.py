@@ -6,7 +6,9 @@ from typing import Any, Callable
 
 from ..assets.map import MapAsset, Vec2
 from ..dice import DiceCheck
-from ..runtime.rules import chebyshev_distance, grid_cell, STRIKE_STAMINA_COST, SHOOT_STAMINA_COST
+from ..runtime.rules import (
+    PRIVATE_STATS, chebyshev_distance, grid_cell, STRIKE_STAMINA_COST, SHOOT_STAMINA_COST,
+)
 from ..runtime.session import SessionEventType, SessionRuntime
 from .commands import ActionIntent, ActionKind, ClientCommand, ServerCommand
 from .models import DiceProposal, PendingKind, PendingRequest, PendingStatus
@@ -274,6 +276,8 @@ class RuntimeNetworkGateway:
 
     def _prepare_stat_check(self, username: str, entity_id: str, request: CommandMessage) -> PendingRequest:
         stat = str(request.args.get("stat", "")).strip().lower()
+        if stat in PRIVATE_STATS:
+            raise ValueError("Cette caractéristique est réservée au MJ")
         entity = self.runtime.entities[entity_id]
         if not stat or not hasattr(entity.character.stats, stat):
             raise ValueError(f"Unknown stat: {stat}")

@@ -298,6 +298,13 @@ class Entity:
         )
         return base_stat + modifier + item_modifier + spell_modifier
 
+    def get_stat_max(self, stat_name: str) -> int:
+        """
+        Maximum of a resource: base stat + items, without runtime changes
+        (spell effects, spent stamina). Used for resource bars.
+        """
+        return self.get_stat(stat_name)
+
     def strike(
         self,
         target: Entity,

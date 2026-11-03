@@ -5,6 +5,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QVBoxLayout
 
 from ...runtime.session import SessionRuntime
+from ...runtime.rules import DISCLOSABLE_FIELDS  # mental_health / drug_health are never disclosable
 
 
 DISCLOSABLE_FIELDS = (
@@ -30,7 +31,10 @@ class TokenDisclosureDialog(QDialog):
         title = QLabel(entity.name if entity else token.entity_id)
         title.setStyleSheet("font-size: 16px; font-weight: 700;")
         root.addWidget(title)
-        hint = QLabel("Checked fields are the only entity data sent to players who can currently see this token.")
+        hint = QLabel(
+            "Checked fields are the only entity data sent to players who can currently see this token "
+            "(HP and stamina also show their bars on the map). Mental and drug health always stay GM-only."
+        )
         hint.setWordWrap(True)
         hint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         root.addWidget(hint)
