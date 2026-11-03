@@ -288,7 +288,7 @@ class EntityEditor(ResourceEditor):
             painter.fillRect(circle, QColor("#2d3440"))
             font = QFont()
             font.setBold(True)
-            font.setPixelSize(24)
+            font.setPixelSize(8)
             painter.setFont(font)
             painter.setPen(QColor("#eef2f7"))
             painter.drawText(circle, Qt.AlignmentFlag.AlignCenter, "No token")

@@ -8,15 +8,55 @@ stay server-side.
 
 from __future__ import annotations
 
-from dataclasses import fields
 from typing import Any
 
 from ..runtime.rules import PLAYER_STAT_NAMES, PRIVATE_STATS, RESOURCE_BAR_STATS
 from ..runtime.session import SessionRuntime, SessionToken
+from ..assets.item import Item
 
 
 STAT_NAMES = PLAYER_STAT_NAMES  # mental_health / drug_health are GM-only
 
+
+def _items_view(entity) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for name, quantity in entity.items.items.items():
+        item = entity.items._item_cache.get(name)
+        if item is None:
+            try:
+                item = Item.from_name(name)
+            except (OSError, KeyError, ValueError):
+                item = None
+        modifiers: list[list[Any]] = []
+        description = ""
+        if item is not None:
+            description = item.description
+            for entry in item.modifier:
+                try:
+                    stat, amount = entry
+                    if str(stat) not in PRIVATE_STATS:  # GM-only stats never leak
+                        modifiers.append([str(stat), int(amount)])
+                except (TypeError, ValueError):
+                    continue
+        result.append({
+            "name": name,
+            "quantity": int(quantity),
+            "description": description,
+            "modifier": modifiers,
+        })
+    return result
+
+
+def _spells_view(entity) -> dict[str, Any]:
+    return {
+        name: {
+            "cost": int(spell.cost),
+            "targeting": str(spell.targeting),
+            "description": spell.description,
+            "policy": spell.runtime_policy.value,
+        }
+        for name, spell in entity.spells.items()
+    }
 
 def _event_view(spell_event) -> dict[str, Any]:
     data = spell_event.to_dict()
@@ -39,7 +79,8 @@ def _own_entity_view(runtime: SessionRuntime, entity_id: str) -> dict[str, Any]:
         "character": entity.character.name,
         "stats": stats,
         "stats_max": stats_max,
-        # ... items / spells inchangés ...
+        "items": _items_view(entity),
+        "spells": _spells_view(entity),
         "spell_effects": [
             effect.to_dict() for effect in entity.spell_effects
             if effect.target_stat not in PRIVATE_STATS
@@ -54,6 +95,12 @@ def _token_view(runtime: SessionRuntime, observer_id: str, token: SessionToken) 
         summary = runtime.public_entity_view(observer_id, token.id)
     except (KeyError, PermissionError):
         summary = {}
+    entity = runtime.entities[str(token.entity_id)]
+    if entity.token:
+        with entity.token.open("rb") as file:
+            raw = file.read().hex()
+    else:
+        raw = None
     return {
         "id": token.id,
         "entity_id": token.entity_id,
@@ -63,6 +110,7 @@ def _token_view(runtime: SessionRuntime, observer_id: str, token: SessionToken) 
         "opacity": token.opacity,
         "self": token.entity_id == observer_id,
         "public": summary,
+        "image": raw
     }
 
 

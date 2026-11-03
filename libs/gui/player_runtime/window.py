@@ -23,6 +23,8 @@ from .map_view import PlayerMapView
 from .panels import ActionPanel, CharacterPanel, ChatPanel
 from ..widgets.combat_turn_widget import CombatTurnWidget
 from .style import PLAYER_RUNTIME_STYLESHEET
+from .panels import ActionPanel, ChatPanel
+from .sheet import CharacterSheetWindow
 
 
 class PlayerRuntimeWindow(QMainWindow):
@@ -56,6 +58,7 @@ class PlayerRuntimeWindow(QMainWindow):
         self.resize(1440, 900)
         self.setMinimumSize(980, 640)
         self.setStyleSheet(PLAYER_RUNTIME_STYLESHEET)
+        self._sheet: CharacterSheetWindow | None = None
         self._build_ui()
         self._connect_signals()
 
@@ -67,92 +70,117 @@ class PlayerRuntimeWindow(QMainWindow):
         layout.setContentsMargins(10, 10, 10, 8)
         layout.setSpacing(8)
 
-        header = QWidget()
+        header = QFrame()
         header.setObjectName("PlayerHeader")
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(12, 8, 12, 8)
-        header_layout.setSpacing(14)
         self.title_label = QLabel("RPG TABLETOP")
         self.title_label.setObjectName("PlayerTitle")
+        self.turn_label = QLabel("—")
+        self.turn_label.setObjectName("PlayerMuted")
+        self.budget_label = QLabel("")
+        self.budget_label.hide()
+        header_layout.addWidget(self.title_label)
+        header_layout.addStretch(1)
+        header_layout.addWidget(self.turn_label)
+        layout.addWidget(header)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setHandleWidth(4)
+        splitter.addWidget(self._build_left_panel())
+        splitter.addWidget(self._build_map_panel())
+        splitter.addWidget(self._build_right_panel())
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+        splitter.setCollapsible(1, False)
+        splitter.setSizes([300, 860, 340])
+        layout.addWidget(splitter, 1)
+
+        self.setCentralWidget(root)
+        self.statusBar().showMessage("Connexion au serveur MJ…")
+
+    def _build_left_panel(self) -> QWidget:
+        """Left: connection state and chat."""
+        panel = QWidget()
+        panel.setMinimumWidth(260)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        box = QFrame()
+        box.setObjectName("PlayerPanel")
+        box_layout = QVBoxLayout(box)
+        box_layout.setContentsMargins(10, 8, 10, 10)
+        box_layout.setSpacing(5)
+        heading = QLabel("CONNEXION")
+        heading.setObjectName("PlayerSectionTitle")
         self.connection_label = QLabel("Connexion en cours…")
         self.connection_label.setObjectName("PlayerMuted")
         self.session_label = QLabel("Session : —")
         self.session_label.setObjectName("PlayerMuted")
         self.entity_label = QLabel("Entity : en attente du MJ")
         self.entity_label.setObjectName("PlayerMuted")
-        self.turn_label = QLabel("—")
-        self.turn_label.setObjectName("PlayerMuted")
-        self.budget_label = QLabel("")
-        self.budget_label.setObjectName("PlayerMuted")
-        self.budget_label.hide()
-        header_layout.addWidget(self.title_label)
-        header_layout.addWidget(self.connection_label)
-        header_layout.addStretch(1)
-        header_layout.addWidget(self.session_label)
-        header_layout.addWidget(self.entity_label)
-        header_layout.addWidget(self.turn_label)
-        layout.addWidget(header)
+        for label in (self.connection_label, self.session_label, self.entity_label):
+            label.setWordWrap(True)
+        buttons = QHBoxLayout()
+        self.reconnect_button = QPushButton("Se reconnecter")
+        self.disconnect_button = QPushButton("Déconnecter")
+        self.reconnect_button.clicked.connect(self._reconnect)
+        self.disconnect_button.clicked.connect(self._disconnect)
+        buttons.addWidget(self.reconnect_button)
+        buttons.addWidget(self.disconnect_button)
+        box_layout.addWidget(heading)
+        box_layout.addWidget(self.connection_label)
+        box_layout.addWidget(self.session_label)
+        box_layout.addWidget(self.entity_label)
+        box_layout.addLayout(buttons)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setHandleWidth(4)
-        self.map_view = PlayerMapView(self.controller.cache_root)
-        map_container = QWidget()
-        map_layout = QVBoxLayout(map_container)
-        map_layout.setContentsMargins(0, 0, 0, 0)
-        map_layout.setSpacing(5)
-        map_toolbar = QHBoxLayout()
-        self.fit_button = QPushButton("Ajuster")
-        self.center_button = QPushButton("Centrer sur moi")
+        self.chat_panel = ChatPanel()
+        layout.addWidget(box)
+        layout.addWidget(self.chat_panel, 1)
+        return panel
+
+    def _build_map_panel(self) -> QWidget:
+        """Center: the map."""
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(5)
+        toolbar = QHBoxLayout()
+        self.fit_button = QPushButton("Recentrer la vue")
         self.reload_assets_button = QPushButton("Recharger les assets")
         self.map_status = QLabel("En attente de la carte du MJ")
         self.map_status.setObjectName("PlayerMuted")
+        self.map_view = PlayerMapView(self.controller.cache_root)
         self.fit_button.clicked.connect(self.map_view.fit_map)
-        self.center_button.clicked.connect(self.map_view.center_on_me)
         self.reload_assets_button.clicked.connect(self._retry_map_assets)
-        map_toolbar.addWidget(self.fit_button)
-        map_toolbar.addWidget(self.center_button)
-        map_toolbar.addWidget(self.reload_assets_button)
-        map_toolbar.addStretch(1)
-        map_toolbar.addWidget(self.map_status)
-        map_layout.addLayout(map_toolbar)
-        map_layout.addWidget(self.map_view, 1)
-        splitter.addWidget(map_container)
+        toolbar.addWidget(self.fit_button)
+        toolbar.addWidget(self.reload_assets_button)
+        toolbar.addStretch(1)
+        toolbar.addWidget(self.map_status)
+        layout.addLayout(toolbar)
+        layout.addWidget(self.map_view, 1)
+        return container
 
-        self.right_tabs = QTabWidget()
-        self.character_panel = CharacterPanel()
-        self.combat_page = QWidget()
-        combat_layout = QVBoxLayout(self.combat_page)
-        combat_layout.setContentsMargins(6, 6, 6, 6)
-        combat_layout.setSpacing(8)
-        self.combat_widget = CombatTurnWidget(self.combat_page)
-        combat_layout.addWidget(self.combat_widget)
+    def _build_right_panel(self) -> QWidget:
+        """Right: combat, actions and stat checks."""
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 4, 0)
+        layout.setSpacing(8)
+        self.combat_widget = CombatTurnWidget()
         self.action_panel = ActionPanel()
-        targeting_scroll = QScrollArea()
-        targeting_scroll.setWidgetResizable(True)
-        targeting_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        targeting_scroll.setWidget(self.action_panel)
-        combat_layout.addWidget(targeting_scroll, 1)
-        self.chat_panel = ChatPanel()
-        self.right_tabs.addTab(self.character_panel, "Fiche")
-        self.right_tabs.addTab(self.combat_page, "Combat")
-        self.right_tabs.addTab(self.chat_panel, "Discussion")
-        self.right_tabs.setCurrentWidget(self.combat_page)
-        self.right_tabs.setMinimumWidth(330)
-        splitter.addWidget(self.right_tabs)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 0)
-        splitter.setSizes([1020, 390])
-        layout.addWidget(splitter, 1)
+        layout.addWidget(self.combat_widget)
+        layout.addWidget(self.action_panel)
+        layout.addStretch(1)
 
-        self.setCentralWidget(root)
-        self.statusBar().showMessage("Connexion au serveur MJ…")
-
-        reconnect_action = QAction("Se reconnecter", self)
-        reconnect_action.triggered.connect(self._reconnect)
-        self.menuBar().addAction(reconnect_action)
-        disconnect_action = QAction("Déconnecter", self)
-        disconnect_action.triggered.connect(self._disconnect)
-        self.menuBar().addAction(disconnect_action)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setMinimumWidth(330)
+        scroll.setWidget(content)
+        return scroll
 
     def _connect_signals(self) -> None:
         self.controller.message_received.connect(self._on_network_message)
@@ -176,6 +204,7 @@ class PlayerRuntimeWindow(QMainWindow):
         self.combat_widget.spell_requested.connect(self.action_panel.begin_spell)
         self.combat_widget.end_turn_requested.connect(self.controller.request_end_turn)
         self.chat_panel.send_requested.connect(self.controller.send_chat)
+        self.map_view.character_sheet_requested.connect(self._open_character_sheet)
 
     # --------------------------------------------------------------- connection
     def connect_to_server(self) -> None:
@@ -252,7 +281,7 @@ class PlayerRuntimeWindow(QMainWindow):
                 self.chat_panel.append_message("Système", str(error), system=True)
             return
         if label == "move":
-            self.statusBar().showMessage("Demande de déplacement envoyée au MJ", 4000)
+            self.statusBar().showMessage("Déplacement envoyé", 4000)
         elif label == "stat_check":
             self.statusBar().showMessage("Test envoyé au MJ", 4000)
         elif label == "action":
@@ -366,7 +395,7 @@ class PlayerRuntimeWindow(QMainWindow):
             details = f"{dice} [{roll_text}]" if dice or roll_text else "jet"
             text = f"Test {stat} : {details} = {total} — {outcome}"
         elif command == "MOVE_RESULT":
-            text = "Déplacement validé par le MJ."
+            text = "Déplacement effectué."
         elif command == "END_TURN_RESULT":
             text = "Ton tour est terminé."
         else:
@@ -410,7 +439,8 @@ class PlayerRuntimeWindow(QMainWindow):
         self.projection = dict(projection) if projection else None
         if not projection:
             self.map_view.set_projection({})
-            self.character_panel.set_entity(None)
+            if self._sheet is not None:
+                self._sheet.hide()
             self.action_panel.set_projection({})
             self.combat_widget.set_combat_state({"active": False}, animate=False)
             self.combat_widget.set_action_options(spells=[])
@@ -435,7 +465,8 @@ class PlayerRuntimeWindow(QMainWindow):
         self._set_session_cache(str(session.get("id", "")))
         if isinstance(map_data, dict):
             self._prepare_map_cache(map_data)
-        self.character_panel.set_entity(entity)
+        if self._sheet is not None and self._sheet.isVisible():
+            self._sheet.set_entity(entity)
         self.action_panel.set_projection(projection)
         self.map_view.set_projection(projection)
 
@@ -500,6 +531,17 @@ class PlayerRuntimeWindow(QMainWindow):
             self._schedule_visible_asset_request()
         else:
             self.map_status.setText("Aucune carte active")
+
+    def _open_character_sheet(self) -> None:
+        entity = (self.projection or {}).get("entity")
+        if not isinstance(entity, dict):
+            return
+        if self._sheet is None:
+            self._sheet = CharacterSheetWindow(self)
+        self._sheet.set_entity(entity)
+        self._sheet.show()
+        self._sheet.raise_()
+        self._sheet.activateWindow()
 
     def _set_session_cache(self, session_id: str) -> None:
         """Isolate downloaded map files between sessions/campaigns."""

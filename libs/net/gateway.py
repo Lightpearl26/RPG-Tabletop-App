@@ -115,7 +115,8 @@ class RuntimeNetworkGateway:
 
     def _remove_pending(self, pending: PendingRequest) -> None:
         self._pending.pop(pending.approval_id, None)
-        self._pending_by_user.pop(pending.username, None)
+        if self._pending_by_user.get(pending.username) == pending.approval_id:
+            self._pending_by_user.pop(pending.username, None)
 
     def cancel(self, username: str, approval_id: str) -> PendingRequest:
         pending = self.pending(approval_id)
@@ -363,7 +364,9 @@ class RuntimeNetworkGateway:
 
             if command is ClientCommand.MOVE_REQUEST:
                 pending = self._prepare_move(username, entity_id, request)
-                return self._queue(pending) if self.require_gm_approval else self._execute_immediate(pending)
+                if self._requires_gm(pending.kind):
+                    return self._queue(pending)
+                return self._execute_immediate(pending)
             if command is ClientCommand.STAT_CHECK_REQUEST:
                 pending = self._prepare_stat_check(username, entity_id, request)
                 return self._queue(pending) if self.require_gm_approval else self._execute_immediate(pending)
@@ -385,10 +388,21 @@ class RuntimeNetworkGateway:
         except (KeyError, ValueError) as exc:
             return self._rejected(request, ErrorType.REQUEST_REJECTED, str(exc))
 
+    def _requires_gm(self, kind: PendingKind) -> bool:
+        if not self.require_gm_approval:
+            return False
+        # Out of combat, a player moves freely: no GM confirmation needed
+        if kind is PendingKind.MOVE and self.runtime.combat is None:
+            return False
+        return True
+
     def _execute_immediate(self, pending: PendingRequest) -> GatewayResult:
+        # Not registered per user: an immediate request never blocks a waiting one
         self._pending[pending.approval_id] = pending
-        self._pending_by_user[pending.username] = pending.approval_id
-        _pending, result = self.approve(pending.approval_id)
+        try:
+            _pending, result = self.approve(pending.approval_id)
+        finally:
+            self._pending.pop(pending.approval_id, None)
         return result
 
     @staticmethod

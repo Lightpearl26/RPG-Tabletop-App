@@ -7,7 +7,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QBrush, QImage, QMouseEvent, QPainter, QPen, QWheelEvent, QResizeEvent
+from PySide6.QtGui import QColor, QBrush, QImage, QMouseEvent, QPainter, QPen, QWheelEvent, QResizeEvent, QPainterPath
 from PySide6.QtWidgets import QWidget
 
 from ...assets.map import MapElement, MediaCache, Vec2
@@ -26,6 +26,7 @@ class PlayerMapView(QWidget):
     target_selection_changed = Signal(object)
     status_message = Signal(str)
     viewport_changed = Signal()
+    character_sheet_requested = Signal()
 
     MIN_ZOOM = 0.05
     MAX_ZOOM = 6.0
@@ -113,6 +114,7 @@ class PlayerMapView(QWidget):
         if self._targeting_mode == "self":
             own = self._own_token()
             self._selected_target_ids = [str(own.get("id", ""))] if own is not None else []
+        self._apply_view_lock()
         self._emit_target_selection()
         self.update()
         self.viewport_changed.emit()
@@ -158,15 +160,26 @@ class PlayerMapView(QWidget):
         self.update()
 
     def center_on_me(self) -> None:
+        if self._fov_rect() is not None:
+            self._apply_view_lock()
+            self.update()
+            self.viewport_changed.emit()
+            return
         token = self._own_token()
         if token is None:
             return
-        pos = self._token_pos(token)
-        self.center = pos
+        self.center = self._token_pos(token)
         self.update()
         self.viewport_changed.emit()
 
     def fit_map(self) -> None:
+        fov = self._fov_rect()
+        if fov is not None:
+            self.zoom = self._min_zoom(fov)
+            self._apply_view_lock()
+            self.update()
+            self.viewport_changed.emit()
+            return
         asset = self._asset_data()
         size = asset.get("size") if asset else None
         if not isinstance(size, (list, tuple)) or len(size) != 2 or self.width() <= 0 or self.height() <= 0:
@@ -223,10 +236,70 @@ class PlayerMapView(QWidget):
             self.center.y + (point.y() - self.height() / 2) / self.zoom,
         )
 
-    def _visible_world_rect(self) -> QRectF:
+    def _view_rect(self) -> QRectF:
         top_left = self.screen_to_world(QPointF(0, 0))
         bottom_right = self.screen_to_world(QPointF(self.width(), self.height()))
         return QRectF(top_left.x, top_left.y, bottom_right.x - top_left.x, bottom_right.y - top_left.y)
+
+    def _visible_world_rect(self) -> QRectF:
+        """What the player may see: the viewport limited to the field of view."""
+        view = self._view_rect()
+        fov = self._fov_rect()
+        return view.intersected(fov) if fov is not None else view
+
+    def _fov_rect(self) -> QRectF | None:
+        """In-game field of view (square of `radius_cells` around the own token)."""
+        if self.map_data is None:
+            return None
+        fov = self.map_data.get("fov")
+        grid = self._grid()
+        if not isinstance(fov, dict) or not grid.get("enabled", True):
+            return None
+        try:
+            radius = int(fov.get("radius_cells", 0) or 0)
+            origin = fov.get("origin")
+            x, y = float(origin[0]), float(origin[1])
+            cell = float(grid.get("cell_size", 64) or 64)
+            offset = grid.get("offset", [0, 0])
+            ox, oy = float(offset[0]), float(offset[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+        if radius <= 0 or cell <= 0:
+            return None
+        col = floor((x - ox) / cell)
+        row = floor((y - oy) / cell)
+        side = (radius * 2 + 1) * cell
+        return QRectF(ox + (col - radius) * cell, oy + (row - radius) * cell, side, side)
+
+    def _min_zoom(self, fov: QRectF | None = None) -> float:
+        fov = fov if fov is not None else self._fov_rect()
+        if fov is None:
+            return self.MIN_ZOOM
+        return min(
+            max(1.0, self.width()) / fov.width(),
+            max(1.0, self.height()) / fov.height(),
+        )
+
+    def _apply_view_lock(self) -> None:
+        """Center on the own token; never zoom out beyond the field of view."""
+        fov = self._fov_rect()
+        if fov is None:
+            return
+        self.center = Vec2(fov.center().x(), fov.center().y())
+        self.zoom = max(self._min_zoom(fov), min(self.MAX_ZOOM, self.zoom))
+
+    def _draw_fov_mask(self, painter: QPainter, fov: QRectF) -> None:
+        """Hide everything around the field of view (aspect ratio leftovers)."""
+        view = self._view_rect().adjusted(-8, -8, 8, 8)
+        color = QColor("#11141a")
+        for rect in (
+            QRectF(view.left(), view.top(), view.width(), fov.top() - view.top()),
+            QRectF(view.left(), fov.bottom(), view.width(), view.bottom() - fov.bottom()),
+            QRectF(view.left(), fov.top(), fov.left() - view.left(), fov.height()),
+            QRectF(fov.right(), fov.top(), view.right() - fov.right(), fov.height()),
+        ):
+            if rect.width() > 0 and rect.height() > 0:
+                painter.fillRect(rect, color)
 
     def _asset_data(self) -> dict[str, Any] | None:
         if self.map_data is None:
@@ -300,20 +373,32 @@ class PlayerMapView(QWidget):
                 painter.scale(self.zoom, self.zoom)
                 painter.translate(-self.center.x, -self.center.y)
                 map_rect = QRectF(0, 0, float(size[0]), float(size[1]))
+                fov = self._fov_rect()
+                play_rect = map_rect.intersected(fov) if fov is not None else map_rect
+
                 painter.fillRect(map_rect, QColor("#1e1e2e"))
                 painter.save()
                 try:
-                    painter.setClipRect(map_rect)
+                    painter.setClipRect(play_rect)
                     self._draw_compiled_tiles(painter, asset, map_rect)
                     self._draw_runtime_elements(painter)
                 finally:
                     painter.restore()
+
+                if fov is not None:
+                    self._draw_fov_mask(painter, fov)
+
+                painter.save()
+                try:
+                    painter.setClipRect(play_rect)
+                    self._draw_movement_range(painter)
+                    self._draw_grid(painter, map_rect)
+                finally:
+                    painter.restore()
+
                 painter.save()
                 try:
                     painter.setClipRect(map_rect)
-                    self._draw_fov(painter)
-                    self._draw_movement_range(painter)
-                    self._draw_grid(painter, map_rect)
                     self._draw_tokens(painter)
                     self._draw_target_marker(painter)
                 finally:
@@ -386,36 +471,6 @@ class PlayerMapView(QWidget):
             except (OSError, ValueError, RuntimeError):
                 continue
 
-    def _draw_fov(self, painter: QPainter) -> None:
-        fov = self.map_data.get("fov", {}) if self.map_data else {}
-        origin = fov.get("origin") if isinstance(fov, dict) else None
-        radius = int(fov.get("radius_cells", 0)) if isinstance(fov, dict) else 0
-        grid = self._grid()
-        if not origin or radius <= 0 or not grid.get("enabled", True):
-            return
-        try:
-            x, y = float(origin[0]), float(origin[1])
-            cell = float(grid.get("cell_size", 64))
-            offset = grid.get("offset", [0, 0])
-            ox, oy = float(offset[0]), float(offset[1])
-        except (TypeError, ValueError, IndexError):
-            return
-        col = floor((x - ox) / cell)
-        row = floor((y - oy) / cell)
-        rect = QRectF(
-            ox + (col - radius) * cell,
-            oy + (row - radius) * cell,
-            (radius * 2 + 1) * cell,
-            (radius * 2 + 1) * cell,
-        )
-        color = QColor("#89dceb")
-        color.setAlpha(45)
-        painter.fillRect(rect, color)
-        pen = QPen(QColor("#89dceb"), max(1.0, 1.5 / self.zoom), Qt.PenStyle.DashLine)
-        painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRect(rect)
-
     def _draw_movement_range(self, painter: QPainter) -> None:
         if self._has_pending or not self.combat.get("active") or not self.combat.get("own_turn"):
             return
@@ -487,9 +542,10 @@ class PlayerMapView(QWidget):
         for token in self._tokens():
             pos = self._drag_preview if token.get("id") == self._drag_token_id and self._drag_preview else self._token_pos(token)
             rect = self._token_rect(token, pos)
-            public = token.get("public") if isinstance(token.get("public"), dict) else {}
+            public = token.get("public") if isinstance(token.get("public"), dict) else dict()
             name = str(public.get("name") or (own_name if token.get("self") else ""))
             opacity = max(0.0, min(1.0, float(token.get("opacity", 1.0))))
+            image = token.get("image")
 
             painter.save()
             painter.setOpacity(opacity)
@@ -502,9 +558,21 @@ class PlayerMapView(QWidget):
                 outline = QColor("#f9e2af")
             painter.setPen(QPen(outline, max(1.5, 2.0 / self.zoom)))
             painter.drawEllipse(rect)
-            initials = "".join(part[:1] for part in name.split())[:2].upper() or "?"
-            painter.setPen(QColor("#f4f4f5"))
-            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, initials)
+            if image:
+                temp_file = Path.cwd() / "temp.webp"
+                with temp_file.open("wb") as file:
+                    file.write(bytes.fromhex(image))
+                image = QImage(str(temp_file))
+                clipath = QPainterPath()
+                clipath.addEllipse(rect)
+                painter.setClipPath(clipath)
+                painter.drawImage(rect, image)
+                painter.setClipping(False)
+                temp_file.unlink()
+            else:
+                initials = "".join(part[:1] for part in name.split())[:2].upper() or "?"
+                painter.setPen(QColor("#f4f4f5"))
+                painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, initials)
             painter.restore()
 
             # Full name + bars: only what the server projected (disclosed, or own token)
@@ -536,22 +604,30 @@ class PlayerMapView(QWidget):
     # ------------------------------------------------------------------ input
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.MiddleButton:
-            self._panning = True
-            self._pan_last = event.position()
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            # The view is locked on the player's token when a field of view exists
+            if self._fov_rect() is None:
+                self._panning = True
+                self._pan_last = event.position()
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
             event.accept()
             return
 
         world = self.screen_to_world(event.position())
         token = self._token_at(world)
         if event.button() == Qt.MouseButton.RightButton:
-            if token is not None and self.permissions.get("can_inspect_visible_tokens", False):
-                self.token_inspect_requested.emit(str(token.get("id", "")))
-                event.accept()
-                return
+            if token is not None:
+                if token.get("self"):
+                    self.character_sheet_requested.emit()
+                    event.accept()
+                    return
+                if self.permissions.get("can_inspect_visible_tokens", False):
+                    self.token_inspect_requested.emit(str(token.get("id", "")))
+                    event.accept()
+                    return
 
         if event.button() != Qt.MouseButton.LeftButton:
             return
+        # ... la suite (ciblage, sélection, drag) est inchangée
 
         if self._targeting_mode:
             if self._targeting_mode == "area":
@@ -625,19 +701,24 @@ class PlayerMapView(QWidget):
     def wheelEvent(self, event: QWheelEvent) -> None:
         if self.map_data is None:
             return
-        before = self.screen_to_world(event.position())
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
-        self.zoom = max(self.MIN_ZOOM, min(self.MAX_ZOOM, self.zoom * factor))
-        after = self.screen_to_world(event.position())
-        self.center = Vec2(
-            self.center.x + before.x - after.x,
-            self.center.y + before.y - after.y,
-        )
+        if self._fov_rect() is not None:
+            self.zoom = self.zoom * factor
+            self._apply_view_lock()
+        else:
+            before = self.screen_to_world(event.position())
+            self.zoom = max(self.MIN_ZOOM, min(self.MAX_ZOOM, self.zoom * factor))
+            after = self.screen_to_world(event.position())
+            self.center = Vec2(
+                self.center.x + before.x - after.x,
+                self.center.y + before.y - after.y,
+            )
         self.update()
         self.viewport_changed.emit()
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
+        self._apply_view_lock()
         self.viewport_changed.emit()
 
     # --------------------------------------------------------------- movement
