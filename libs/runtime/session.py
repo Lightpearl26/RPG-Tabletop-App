@@ -54,6 +54,7 @@ from .rules import (
     movement_cells_from_agi,
     vision_cells_from_per,
 )
+from .live_sync import apply_asset_update, build_asset_update
 
 
 SESSION_FORMAT_VERSION = 2
@@ -291,6 +292,7 @@ class SessionEventType(str, Enum):
     ACTION_STAMINA_SPENT = "action_stamina_spent"
     STAT_CHECK = "stat_check"
     NOTE = "note"
+    ASSET_UPDATED = "asset_updated"
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,6 +383,8 @@ def entity_to_snapshot(entity: Entity) -> dict[str, Any]:
     """
 
     data = entity.to_dict()
+    data["id"] = str(entity.id)
+    data["authored_modifier"] = entity.authored_modifier.to_dict()
     data["character_snapshot"] = _character_to_dict(entity.character)
     data["spell_snapshots"] = {
         name: _spell_to_dict(spell)
@@ -437,15 +441,15 @@ def _restore_entities(
         for item_name, item_data in raw.get("item_snapshots", {}).items():
             inventory._item_cache[str(item_name)] = Item.from_dict(item_data)
 
+        modifier = raw.get("stat_modifier", raw.get("stat_modifiers", {}))
         entity = Entity(
             name=str(raw["name"]),
             character=character,
             spells=spells,
             items=inventory,
             id=UUID(str(raw.get("id") or entity_id)),
-            stats_modifier=StatsModifier.from_dict(
-                raw.get("stat_modifier", raw.get("stat_modifiers", {}))
-            ),
+            stats_modifier=StatsModifier.from_dict(modifier),
+            authored_modifier=StatsModifier.from_dict(raw.get("authored_modifier", modifier)),
         )
         restored[str(entity.id)] = entity
         campaign.entities.register(str(entity.id), entity)
@@ -1009,6 +1013,10 @@ class SessionRuntime:
                 )
             return
 
+        if event.type is SessionEventType.ASSET_UPDATED:
+            apply_asset_update(self, data)
+            return
+
         if event.type is SessionEventType.ENTITY_CREATED:
             raw = dict(data["entity"])
             restored = _restore_entities(
@@ -1509,6 +1517,18 @@ class SessionRuntime:
             message=f"Entity removed: {entity.name}",
             source_id=str(entity_id),
             target_ids=(str(entity_id),),
+        )
+
+    def sync_asset(self, kind: str, name: str) -> Optional[SessionEvent]:
+        """Record the saved campaign asset `name` (kind: character, item, spell, entity)."""
+        update = build_asset_update(self, kind, name)
+        if update is None:
+            return None
+        return self._dispatch(
+            SessionEventType.ASSET_UPDATED,
+            update.data,
+            message=update.message,
+            target_ids=update.entity_ids,
         )
 
     def apply_resolved_effect(

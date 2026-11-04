@@ -41,6 +41,8 @@ from .players import PlayerAssignmentPanel
 from .registry import EntityRegistryPanel
 from .style import RUNTIME_STYLESHEET
 from .tokens import TokenManagerPanel
+from ...runtime.live_sync import RESOURCE_KINDS
+from .add_entities import AddEntitiesDialog
 
 
 class RuntimeWindow(QMainWindow):
@@ -124,6 +126,10 @@ class RuntimeWindow(QMainWindow):
         note = QAction("Note", self)
         note.triggered.connect(self.add_note)
         bar.addAction(note)
+
+        add_entities = QAction("Ajouter des entités", self)
+        add_entities.triggered.connect(self.add_entities)
+        bar.addAction(add_entities)
 
         bar.addSeparator()
         self.server_summary_label = QLabel("● Serveur arrêté · 0 joueur")
@@ -338,6 +344,42 @@ class RuntimeWindow(QMainWindow):
         self.bridge.async_done.connect(self._async_done)
 
     # ------------------------------------------------------------- runtime
+    def add_entities(self) -> None:
+        dialog = AddEntitiesDialog(self.runtime, self)
+        if not dialog.exec():
+            return
+        added: list[str] = []
+        for entity in dialog.entities():
+            try:
+                self.runtime.add_entity(entity)
+            except Exception as exc:
+                QMessageBox.critical(self, "Ajouter des entités", f"{entity.name} : {exc}")
+                break
+            added.append(entity.name)
+        if added:
+            self.statusBar().showMessage(f"Entités ajoutées : {', '.join(added)}", 6000)
+            self._runtime_changed()
+
+    def on_asset_saved(self, resource_type: str, resource_id: str) -> None:
+        """Called by the IDE each time an asset is saved."""
+        if resource_type == "maps":
+            if resource_id == self.runtime.active_map_id:
+                self.map_view.reload_active_map(reset_camera=False)
+                self.broadcast_runtime_sync()
+                self.statusBar().showMessage(f"Carte « {resource_id} » rechargée.", 4000)
+            return
+        kind = RESOURCE_KINDS.get(resource_type)
+        if kind is None:
+            return
+        try:
+            event = self.runtime.sync_asset(kind, resource_id)
+        except Exception as exc:  # invalid or half-written file: keep the session untouched
+            self.statusBar().showMessage(f"Synchronisation impossible ({resource_id}) : {exc}", 8000)
+            return
+        if event is not None:
+            self.statusBar().showMessage(event.message, 5000)
+            self._runtime_changed()
+
     def _map_selected(self) -> None:
         map_id = self.map_combo.currentData()
         if map_id == self.runtime.active_map_id:

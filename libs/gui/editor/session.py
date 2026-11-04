@@ -298,7 +298,7 @@ class SessionEditor(ResourceEditor):
 
     def _sync_buttons(self) -> None:
         saved = not self.is_new
-        self.launch_button.setEnabled(saved and not self.has_changes)
+        self.launch_button.setEnabled(saved)
         self.duplicate_button.setEnabled(saved)
         self.rename_button.setEnabled(saved)
         self.tabs.setTabEnabled(1, saved)

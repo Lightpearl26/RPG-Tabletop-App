@@ -160,6 +160,7 @@ class Entity:
     stats_modifier: StatsModifier = field(default_factory=StatsModifier)
     spell_events: list[SpellEvent] = field(default_factory=list)
     spell_effects: list[SpellEffect] = field(default_factory=list)
+    authored_modifier: StatsModifier = field(default_factory=StatsModifier)
 
     # properties
     @property
@@ -535,7 +536,7 @@ class Entity:
         except FileNotFoundError:
             raw = {}
 
-        stat_modifier = StatsModifier.from_dict(raw.get("stat_modifier", {}))
+        stat_modifier = StatsModifier.from_dict(raw.get("stats_modifier", {}))
 
         spells = {}
         for spell_name in raw.get("spells", []):
@@ -556,6 +557,7 @@ class Entity:
             name=entity_name,
             character=character,
             stats_modifier=stat_modifier,
+            authored_modifier=StatsModifier.from_dict(stat_modifier.to_dict()),
             spells=spells,
             items=items,
         )

@@ -78,6 +78,7 @@ EDITOR_TYPES: dict[str, type[ResourceEditor]] = {
     "maps": MapEditor,
     "sessions": SessionEditor,
 }
+_LIVE_RESOURCES = {"characters", "entities", "items", "spells", "maps"}
 
 
 class CampaignOverview(QWidget):
@@ -312,6 +313,13 @@ class CampaignManagerWindow(QMainWindow):
         toolbar.addWidget(self.save_button)
         toolbar.addWidget(self.validate_button)
         toolbar.addWidget(self.start_session_button)
+
+    def _notify_runtimes(self, resource_type: str, resource_id: str) -> None:
+        if resource_type not in _LIVE_RESOURCES:
+            return
+        for window in self._runtime_windows:
+            if window.isVisible():
+                window.on_asset_saved(resource_type, resource_id)
 
     def _preload_categories(self) -> None:
         """Show every category page once to pay the first-show cost, invisibly."""
@@ -804,6 +812,7 @@ class CampaignManagerWindow(QMainWindow):
             page.session_in_use = self._session_in_use
             page.launch_requested.connect(self._launch_session)
             page.sessions_changed.connect(self._on_sessions_changed)
+
         if page is not None:
             self.documents.setCurrentWidget(page)
             return
@@ -832,6 +841,10 @@ class CampaignManagerWindow(QMainWindow):
             page.modified_changed.connect(
                 lambda _modified, editor=page: self._refresh_document_title(editor)
             )
+            if isinstance(page, SessionEditor):
+                page.session_in_use = self._session_in_use
+                page.launch_requested.connect(self._launch_session)
+                page.sessions_changed.connect(self._on_sessions_changed)
         else:
             page = ResourceDocument(
                 resource_type,
@@ -856,6 +869,7 @@ class CampaignManagerWindow(QMainWindow):
         name: str,
     ) -> None:
         resource_id = Path(file_path).stem
+        self._notify_runtimes(resource_type, resource_id)
         self._document_pages = {
             key: page
             for key, page in self._document_pages.items()
@@ -908,6 +922,10 @@ class CampaignManagerWindow(QMainWindow):
 
         if not updates:
             return
+
+        for update in updates:
+            if update.source == "entities":
+                self._notify_runtimes("entities", update.path.stem)
 
         for source in sorted({update.source for update in updates}):
             self._refresh_category(source)
@@ -983,6 +1001,9 @@ class CampaignManagerWindow(QMainWindow):
         resource_id: str,
     ) -> None:
         self.resource_delete_requested.emit(resource_type, resource_id)
+        self._delete_resource(resource_type, resource_id)
+        self._refresh_category(resource_type)
+        self.overview.refresh_counts()
 
     def _on_document_tab_changed(self, index: int) -> None:
         page = self.documents.widget(index)
@@ -1126,3 +1147,19 @@ class CampaignManagerWindow(QMainWindow):
     @staticmethod
     def _singular_title(resource_type: str) -> str:
         return next(singular for key, _, singular, _ in RESOURCE_SECTIONS if key == resource_type)
+
+    def _delete_resource(self, resource_type: str, resource_id: str) -> None:
+        editor_key = (resource_type, resource_id)
+        editor = self._document_pages.get(editor_key)
+        if isinstance(editor, ResourceEditor):
+            if not self._confirm_close([editor]):
+                return
+            self._document_pages.pop(editor_key)
+            index = self.documents.indexOf(editor)
+            if index >= 0:
+                self.documents.removeTab(index)
+            editor.deleteLater()
+        try:
+            delete_resource(self.campaign, resource_type, resource_id)
+        except OSError as error:
+            self.statusBar().showMessage(f"Could not delete {resource_id}: {error}", 6000)
