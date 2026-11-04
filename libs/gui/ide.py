@@ -54,6 +54,9 @@ from .editor.spell import SpellEditor
 from .editor.map import MapEditor
 from .theme import CAMPAIGN_MANAGER_STYLESHEET
 from .runtime import RuntimeWindow
+from ..runtime import session_store
+from .cards.session import SessionCard
+from .editor.session import SessionEditor
 
 
 RESOURCE_SECTIONS = (
@@ -72,7 +75,8 @@ EDITOR_TYPES: dict[str, type[ResourceEditor]] = {
     "items": ItemEditor,
     "spells": SpellEditor,
     "entities": EntityEditor,
-    "maps": MapEditor
+    "maps": MapEditor,
+    "sessions": SessionEditor,
 }
 
 
@@ -770,6 +774,8 @@ class CampaignManagerWindow(QMainWindow):
             ] if self.campaign.maps_path.is_dir() else []
         if resource_type == "entities":
             return [EntityCard(path.stem) for path in self.campaign.entity_path.glob("*.json")]
+        if resource_type == "sessions":
+            return [SessionCard(i.name, i.updated_at) for i in session_store.list_sessions(self.campaign)]
         return []
 
     def _on_resource_selected(self, resource_type: str, resource_id: str) -> None:
@@ -794,6 +800,10 @@ class CampaignManagerWindow(QMainWindow):
             key = (resource_type, resource_id)
 
         page = self._document_pages.get(key)
+        if isinstance(page, SessionEditor):
+            page.session_in_use = self._session_in_use
+            page.launch_requested.connect(self._launch_session)
+            page.sessions_changed.connect(self._on_sessions_changed)
         if page is not None:
             self.documents.setCurrentWidget(page)
             return
@@ -867,6 +877,23 @@ class CampaignManagerWindow(QMainWindow):
         index = self.documents.indexOf(editor)
         if index >= 0:
             self.documents.setTabText(index, self._document_title(editor))
+
+    def _session_in_use(self, name: str) -> bool:
+        # isVisible : une fenêtre fermée reste dans la liste (destroyed n'est jamais émis)
+        return any(w.isVisible() and w.runtime.session.name == name for w in self._runtime_windows)
+
+    def _launch_session(self, name: str) -> None:
+        for w in self._runtime_windows:
+            if w.isVisible() and w.runtime.session.name == name:
+                w.raise_(); w.activateWindow(); return
+        try:
+            window = RuntimeWindow.open_saved(self.campaign, self.campaign.session_path(name))
+        except Exception as error:
+            self.statusBar().showMessage(f"Impossible d'ouvrir {name} : {error}", 6000); return
+        self._show_runtime_window(window)   # à extraire de _on_start_session_clicked
+
+    def _on_sessions_changed(self) -> None:
+        self._refresh_category("sessions"); self.overview.refresh_counts()
 
     def _on_resource_renamed(
         self,
@@ -1063,6 +1090,21 @@ class CampaignManagerWindow(QMainWindow):
         self.validate_requested.emit()
         self.statusBar().showMessage("Validation requested.", 4000)
 
+    def _show_runtime_window(self, window: RuntimeWindow) -> None:
+        self.start_session_requested.emit()
+        self._runtime_windows.append(window)
+        window.destroyed.connect(
+            lambda _obj=None, window=window: (
+                self._runtime_windows.remove(window)
+                if window in self._runtime_windows else None
+            )
+        )
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        self.overview.refresh_counts()
+        self.statusBar().showMessage(f"Session lancée : {window.runtime.session.name}", 5000)
+
     def _on_start_session_clicked(self) -> None:
         name, accepted = QInputDialog.getText(
             self,
@@ -1075,19 +1117,7 @@ class CampaignManagerWindow(QMainWindow):
             return
         runtime_window = RuntimeWindow.start_new(self.campaign, name)
 
-        self.start_session_requested.emit()
-        self._runtime_windows.append(runtime_window)
-        runtime_window.destroyed.connect(
-            lambda _obj=None, window=runtime_window: (
-                self._runtime_windows.remove(window)
-                if window in self._runtime_windows else None
-            )
-        )
-        runtime_window.show()
-        runtime_window.raise_()
-        runtime_window.activateWindow()
-        self.overview.refresh_counts()
-        self.statusBar().showMessage(f"Session lancée : {name}", 5000)
+        self._show_runtime_window(runtime_window)
 
     @staticmethod
     def _section_title(resource_type: str) -> str:

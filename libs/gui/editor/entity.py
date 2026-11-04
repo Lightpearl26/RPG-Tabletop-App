@@ -12,7 +12,7 @@ from os.path import exists
 from typing import Optional
 
 from PySide6.QtCore import Qt, QRectF
-from PySide6.QtGui import QPixmap, QPainter, QPainterPath, QImage, QFont, QColor
+from PySide6.QtGui import QPixmap, QPainter, QPainterPath, QImage, QFont, QColor, QImageReader
 from PySide6.QtWidgets import (
     QComboBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton,
@@ -313,7 +313,7 @@ class EntityEditor(ResourceEditor):
             self.spells_field.addItem(str(spell))
         self._populate_runtime_fields()
 
-    def _select_token(self, event) -> None:
+    def _select_token(self, _) -> None:
         """
         Select a new token image
         """
@@ -326,11 +326,15 @@ class EntityEditor(ResourceEditor):
         if source:
             path = Path(source)
             token_path = self.campaign.entity_path / "tokens"
+            previous_limit = QImageReader.allocationLimit()
+            QImageReader.setAllocationLimit(0)
             image = QImage(str(path))
             straight = image.convertToFormat(QImage.Format.Format_ARGB32)
             saved = straight.save(str(token_path / f"{self.entity_name.lower().replace(" ", "_")}.webp"), "WEBP", 100)
             if not saved:
                 raise OSError(f"Could not import image: {path}")
+            QImageReader.setAllocationLimit(previous_limit)
+            self._populate_fields()
 
     def _populate_runtime_fields(self) -> None:
         """Summarize saved runtime values without constructing live objects."""
