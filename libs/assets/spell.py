@@ -592,6 +592,35 @@ class Effect:
     formula: Formula
     effect_type: EffectType
 
+    def to_dict(self) -> dict[str, Any]:
+        """
+        Convert the effect to the JSON form used in spell files.
+        """
+        return {
+            "target": ".".join(self.target),
+            "operator": self.operator,
+            "formula": self.formula.expression,
+            "effect_type": EffectType(self.effect_type).value,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Effect:
+        """
+        Create an effect from the JSON form used in spell files.
+        """
+        target_scope, target_stat = str(data.get("target", "target.hp")).split(".", 1)
+        formula = Formula(str(data.get("formula", "")))
+        try:
+            formula.compile()
+        except (ValueError, SyntaxError):
+            pass  # kept for display; it is compiled again before any evaluation
+        return cls(
+            target=(target_scope, target_stat),  # type: ignore[arg-type]
+            operator=data.get("operator", "bonus"),
+            formula=formula,
+            effect_type=EffectType(data.get("effect_type", "other")),
+        )
+
 
 # Define Spell Object
 @dataclass
@@ -616,6 +645,31 @@ class Spell:
     effects: list[Effect]
     delay: float | int = float("inf")
     trigger_condition: Optional[Formula] = None
+
+    def to_public_dict(self) -> dict[str, Any]:
+        """
+        Summary of the spell as character sheets show it, without any formula.
+
+        Safe to send to the player who knows the spell.
+        """
+        delay = self.delay
+        finite_delay = isinstance(delay, (int, float)) and isfinite(float(delay))
+        return {
+            "name": self.name,
+            "description": self.description,
+            "cost": int(self.cost),
+            "targeting": str(getattr(self.targeting, "value", self.targeting) or "single"),
+            "policy": RuntimePolicy(self.runtime_policy).value,
+            "delay": int(delay) if finite_delay else None,
+            "effects": [
+                {
+                    "target": ".".join(effect.target),
+                    "operator": str(effect.operator),
+                    "effect_type": EffectType(effect.effect_type).value,
+                }
+                for effect in self.effects
+            ],
+        }
 
     # class methods
     @classmethod

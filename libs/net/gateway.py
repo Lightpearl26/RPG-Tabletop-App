@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from ..assets.map import MapAsset, Vec2
 from ..dice import DiceCheck
+from ..runtime.initiative import check_roll
 from ..runtime.rules import (
     PRIVATE_STATS, chebyshev_distance, grid_cell, STRIKE_STAMINA_COST, SHOOT_STAMINA_COST,
 )
@@ -19,6 +20,8 @@ from .protocol import CommandMessage, ErrorType, NetworkMessage
 ActionPreparer = Callable[[SessionRuntime, str, ActionIntent, PendingRequest], None]
 ActionExecutor = Callable[[SessionRuntime, str, PendingRequest], dict[str, Any]]
 PendingCallback = Callable[[PendingRequest], None]
+# username, entity id, d20 result
+InitiativeCallback = Callable[[str, str, int], None]
 
 
 @dataclass(slots=True)
@@ -53,6 +56,9 @@ class RuntimeNetworkGateway:
         self._bindings: dict[str, str] = {}
         self._pending: dict[str, PendingRequest] = {}
         self._pending_by_user: dict[str, str] = {}
+        # Initiative asked to a player and not answered yet: username -> entity id
+        self._initiative_requests: dict[str, str] = {}
+        self.on_initiative: InitiativeCallback | None = None
 
     # ---------------------------------------------------------------- binding
     def bind(self, username: str, entity_id: str) -> None:
@@ -68,6 +74,37 @@ class RuntimeNetworkGateway:
 
     def entity_for(self, username: str) -> str | None:
         return self._bindings.get(str(username).strip())
+
+    def username_for(self, entity_id: str) -> str | None:
+        """The player currently bound to an entity, if any."""
+        return next(
+            (username for username, bound in self._bindings.items() if bound == str(entity_id)),
+            None,
+        )
+
+    # ------------------------------------------------------------- initiative
+    def expect_initiative(self, username: str, entity_id: str) -> None:
+        """Accept one INITIATIVE_ROLL from this player for this entity."""
+        if self.entity_for(username) != str(entity_id):
+            raise PermissionError("This player does not control this entity.")
+        self._initiative_requests[str(username)] = str(entity_id)
+
+    def forget_initiative(self, username: str) -> bool:
+        return self._initiative_requests.pop(str(username), None) is not None
+
+    def _receive_initiative(self, username: str, request: CommandMessage) -> GatewayResult:
+        entity_id = self._initiative_requests.get(username)
+        if entity_id is None:
+            raise RuntimeError("No initiative roll was asked.")
+        value = check_roll(request.args.get("value"))
+        del self._initiative_requests[username]
+        if self.on_initiative is not None:
+            self.on_initiative(username, entity_id, value)
+        return GatewayResult(replies=[CommandMessage(
+            ServerCommand.INITIATIVE_RESULT.value,
+            {"entity_id": entity_id, "value": value},
+            reply_to=request.message_id,
+        )])
 
     def projection_for(self, username: str) -> dict[str, Any]:
         entity_id = self.entity_for(username)
@@ -350,6 +387,9 @@ class RuntimeNetworkGateway:
             entity_id = self.entity_for(username)
             if entity_id is None:
                 raise PermissionError("No Entity is bound to this player")
+
+            if command is ClientCommand.INITIATIVE_ROLL:
+                return self._receive_initiative(username, request)
 
             if command is ClientCommand.TOKEN_INSPECT_REQUEST:
                 token_id = str(request.args.get("token_id", "")).strip()

@@ -12,6 +12,7 @@ import sys
 from PySide6.QtWidgets import QApplication, QDialog
 
 from libs.gui.player_runtime import PlayerLoginDialog, PlayerRuntimeWindow
+from libs.gui.appearance import apply_dark_theme
 
 
 def main() -> int:
@@ -19,6 +20,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("RPG Tabletop Player")
     app.setOrganizationName("RPGTabletop")
+    apply_dark_theme(app)
 
     login = PlayerLoginDialog()
     if login.exec() != QDialog.DialogCode.Accepted:

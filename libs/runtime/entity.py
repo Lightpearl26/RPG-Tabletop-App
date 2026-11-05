@@ -314,6 +314,29 @@ class Entity:
         )
         return base_stat + modifier + item_modifier + spell_modifier
 
+    def stat_breakdown(self, stat_name: str) -> tuple[int, int, int, int]:
+        """
+        Parts of a stat as `get_stat` adds them: (base, runtime modifier, items, effects).
+
+        An item missing from the campaign counts as 0 instead of raising, so a
+        character sheet can still be drawn.
+        """
+        base = int(getattr(self.character.stats, stat_name, 0))
+        modifier = int(getattr(self.stats_modifier, stat_name, 0))
+        try:
+            items = int(self.items.get_stat_modifier(stat_name))
+        except (OSError, KeyError, ValueError):
+            items = 0
+        effects = sum(
+            int(effect.delta)
+            for effect in self.spell_effects
+            if effect.target_stat == stat_name
+            and effect.effect_type not in (
+                EffectType.DAMAGE_AMPLIFICATION, EffectType.DAMAGE_REDUCTION
+            )
+        )
+        return base, modifier, items, effects
+
     def get_stat_max(self, stat_name: str) -> int:
         """
         Maximum of a resource: base stat + items, without runtime changes
@@ -553,6 +576,21 @@ class Entity:
             raw.get("items", raw.get("inventory", []))
         )
 
+        # Runtime state saved in the asset by a previous session. Effects created by
+        # an event of this entity on itself share one instance with the event.
+        effect_cache: dict[str, SpellEffect] = {}
+        spell_effects: list[SpellEffect] = []
+        for effect_data in raw.get("spell_effects", []) or []:
+            if isinstance(effect_data, dict):
+                effect = SpellEffect.from_dict(effect_data)
+                effect_cache[str(effect.id)] = effect
+                spell_effects.append(effect)
+        spell_events = [
+            SpellEvent.from_dict(event_data, effect_cache)
+            for event_data in raw.get("spell_events", []) or []
+            if isinstance(event_data, dict)
+        ]
+
         return cls(
             name=entity_name,
             character=character,
@@ -560,6 +598,8 @@ class Entity:
             authored_modifier=StatsModifier.from_dict(stat_modifier.to_dict()),
             spells=spells,
             items=items,
+            spell_effects=spell_effects,
+            spell_events=spell_events,
         )
 
     @classmethod
@@ -605,4 +645,6 @@ class Entity:
             "stat_modifier": self.stats_modifier.to_dict() if self.stats_modifier else {},
             "spells": list(self.spells.keys()) if self.spells else [],
             "items": self.items.to_list() if self.items else [],
+            "spell_effects": [effect.to_dict() for effect in self.spell_effects],
+            "spell_events": [event.to_dict() for event in self.spell_events],
         }

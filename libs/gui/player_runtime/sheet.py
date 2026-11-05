@@ -1,20 +1,53 @@
 # -*- coding: utf-8 -*-
-"""Independent, non-modal character sheet of the Player Runtime."""
+"""
+Independent, non-modal character sheet of the Player Runtime.
+
+Same header, tabs and columns as the GM sheet (`libs.gui.runtime.sheet`), read
+only, and built from the player projection: no GM-only stat, no formula.
+"""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtGui import QImage
 from PySide6.QtWidgets import (
-    QAbstractItemView, QDialog, QGridLayout, QHBoxLayout, QLabel, QListWidget,
-    QProgressBar, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QDialog,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
 )
 
-from .panels import STAT_COLORS, STAT_LABELS
+from ..widgets.sheet_parts import (
+    CORE_STATS,
+    EFFECT_LABELS,
+    EFFECTS_COLUMNS,
+    EVENTS_COLUMNS,
+    ITEMS_COLUMNS,
+    POLICY_LABELS,
+    STAT_COLORS,
+    STATS_COLUMNS,
+    SheetHeader,
+    SpellGrid,
+    cell,
+    duration_label,
+    effect_origin_label,
+    effect_value_label,
+    header_label,
+    make_table,
+    modifiers_label,
+    muted,
+    set_resource_bar,
+    stat_label,
+)
 
-CORE_STATS = ("str", "con", "dex", "agi", "int", "wis", "cha", "luc", "sur", "per")
-STAT_BAR_MAX = 300
-RESOURCES = (("hp", "HP", "#f38ba8"), ("stamina", "Stamina", "#fab387"))
+
+RESOURCE_STATS = ("hp", "stamina")  # mental and drug health stay GM-only
+SHEET_STATS = (*RESOURCE_STATS, *CORE_STATS)
 
 
 def _int(value: Any, default: int = 0) -> int:
@@ -24,6 +57,18 @@ def _int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _list(value: Any) -> list:
+    return value if isinstance(value, list) else []
+
+
+def _dict(value: Any) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _signed(value: int) -> str:
+    return f"{value:+d}" if value else "—"
+
+
 class CharacterSheetWindow(QDialog):
     """Opened by a right click on the player's own token."""
 
@@ -31,146 +76,154 @@ class CharacterSheetWindow(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Fiche de personnage")
         self.setModal(False)
-        self.resize(540, 580)
+        self.resize(720, 640)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 12, 14, 12)
         root.setSpacing(10)
-        self.name_label = QLabel("—")
-        self.name_label.setObjectName("PlayerTitle")
-        self.character_label = QLabel("")
-        self.character_label.setObjectName("PlayerMuted")
-        root.addWidget(self.name_label)
-        root.addWidget(self.character_label)
-
-        self.resource_bars: dict[str, QProgressBar] = {}
-        for key, label, color in RESOURCES:
-            row = QHBoxLayout()
-            name = QLabel(label)
-            name.setFixedWidth(64)
-            bar = QProgressBar()
-            bar.setFormat("%v / %m")
-            bar.setStyleSheet(f"QProgressBar::chunk {{ background: {color}; }}")
-            self.resource_bars[key] = bar
-            row.addWidget(name)
-            row.addWidget(bar, 1)
-            root.addLayout(row)
+        self.header = SheetHeader(RESOURCE_STATS)
+        root.addWidget(self.header)
 
         self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_stats_tab(), "Caractéristiques")
+        self.items_table = make_table(ITEMS_COLUMNS)
+        self.items_table.setColumnWidth(0, 170)
+        self.items_table.setColumnWidth(1, 60)
+        self.items_table.setColumnWidth(2, 170)
+        self.tabs.addTab(self.items_table, "Inventaire")
+        self.spell_grid = SpellGrid()
+        self.tabs.addTab(self.spell_grid, "Sorts")
+        self.effects_table = make_table(EFFECTS_COLUMNS)
+        self.effects_table.setColumnWidth(0, 220)
+        self.effects_table.setColumnWidth(1, 170)
+        self.tabs.addTab(self.effects_table, "Effets actifs")
+        self.events_table = make_table(EVENTS_COLUMNS)
+        self.events_table.setColumnWidth(0, 150)
+        self.tabs.addTab(self.events_table, "Sorts en cours")
         root.addWidget(self.tabs, 1)
 
-        stats_page = QWidget()
-        grid = QGridLayout(stats_page)
-        grid.setContentsMargins(12, 12, 12, 12)
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(9)
-        self.stat_values: dict[str, QLabel] = {}
-        self.stat_bars: dict[str, QProgressBar] = {}
-        for row, stat in enumerate(CORE_STATS):
-            color = STAT_COLORS.get(stat, "#7F8A9B")
-            label = QLabel(STAT_LABELS.get(stat, stat.upper()))
-            label.setStyleSheet(f"color: {color}; font-weight: 700;")
-            label.setFixedWidth(48)
-            value = QLabel("—")
-            value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            value.setFixedWidth(40)
-            bar = QProgressBar()
-            bar.setRange(0, STAT_BAR_MAX)
-            bar.setTextVisible(False)
-            bar.setFixedHeight(8)
-            bar.setStyleSheet(f"QProgressBar::chunk {{ background: {color}; }}")
-            self.stat_values[stat] = value
-            self.stat_bars[stat] = bar
-            grid.addWidget(label, row, 0)
-            grid.addWidget(value, row, 1)
-            grid.addWidget(bar, row, 2)
-        grid.setColumnStretch(2, 1)
-        grid.setRowStretch(len(CORE_STATS), 1)
-        self.tabs.addTab(stats_page, "Caractéristiques")
+        footer = QHBoxLayout()
+        footer.addStretch(1)
+        close = QPushButton("Fermer")
+        close.clicked.connect(self.close)
+        footer.addWidget(close)
+        root.addLayout(footer)
 
-        self.items_table = self._make_table(("Objet", "Qté", "Modificateurs"))
-        self.tabs.addTab(self.items_table, "Inventaire")
-        self.spells_table = self._make_table(("Sort", "Coût", "Ciblage", "Description"))
-        self.tabs.addTab(self.spells_table, "Sorts")
-        self.effects_list = QListWidget()
-        self.tabs.addTab(self.effects_list, "Effets")
+    def _build_stats_tab(self) -> QWidget:
+        page = QWidget()
+        root = QVBoxLayout(page)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(5)
+        for column, title in enumerate(STATS_COLUMNS):
+            label = header_label(title)
+            if title == "Modif.":
+                label.setToolTip("Modificateur fixé par le MJ")
+            grid.addWidget(label, 0, column)
 
-    @staticmethod
-    def _make_table(headers: tuple[str, ...]) -> QTableWidget:
-        table = QTableWidget(0, len(headers))
-        table.setHorizontalHeaderLabels(list(headers))
-        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        table.verticalHeader().setVisible(False)
-        table.horizontalHeader().setStretchLastSection(True)
-        return table
+        self.stat_cells: dict[str, tuple[QLabel, ...]] = {}
+        row = 1
+        for stat in SHEET_STATS:
+            if stat == CORE_STATS[0]:
+                line = QFrame()
+                line.setFrameShape(QFrame.Shape.HLine)
+                line.setStyleSheet("color: #303642;")
+                grid.addWidget(line, row, 0, 1, len(STATS_COLUMNS))
+                row += 1
+            name = QLabel(stat_label(stat))
+            name.setStyleSheet(f"font-weight: 700; color: {STAT_COLORS.get(stat, '#e5e9ef')};")
+            values = tuple(QLabel("—") for _ in range(len(STATS_COLUMNS) - 1))
+            values[-1].setStyleSheet("font-weight: 700;")
+            for column, widget in enumerate((name, *values)):
+                grid.addWidget(widget, row, column)
+            self.stat_cells[stat] = values
+            row += 1
+        grid.setColumnStretch(len(STATS_COLUMNS), 1)
+        root.addLayout(grid)
+        root.addWidget(muted("Total = base + modificateur + objets + effets."))
+        root.addStretch(1)
+        return page
 
-    @staticmethod
-    def _fill(table: QTableWidget, rows: list[tuple[list[str], str]]) -> None:
-        table.setRowCount(len(rows))
-        for r, (cells, tooltip) in enumerate(rows):
-            for c, text in enumerate(cells):
-                item = QTableWidgetItem(text)
-                if tooltip:
-                    item.setToolTip(tooltip)
-                table.setItem(r, c, item)
-        table.resizeColumnsToContents()
+    # ---------------------------------------------------------------- refresh
+    def set_entity(self, entity: dict[str, Any], token_image: Optional[bytes] = None) -> None:
+        """Show the projection of the player's entity (and its token picture)."""
+        stats = _dict(entity.get("stats"))
+        stats_max = _dict(entity.get("stats_max"))
+        details = _dict(entity.get("stats_detail"))
+        name = str(entity.get("name", "Entity"))
+        self.setWindowTitle(f"Fiche — {name}")
 
-    def set_entity(self, entity: dict[str, Any]) -> None:
-        stats = entity.get("stats") if isinstance(entity.get("stats"), dict) else {}
-        stats_max = entity.get("stats_max") if isinstance(entity.get("stats_max"), dict) else {}
-        self.name_label.setText(str(entity.get("name", "Entity")))
-        self.character_label.setText(f"Personnage : {entity.get('character', '—')}")
-        self.setWindowTitle(f"Fiche — {entity.get('name', 'Entity')}")
-
-        for key, bar in self.resource_bars.items():
-            value = _int(stats.get(key))
-            maximum = _int(stats_max.get(key), value)
-            bar.setRange(0, max(1, maximum, value))
-            bar.setValue(max(0, value))
-        for stat in CORE_STATS:
+        image = None
+        if token_image:
+            image = QImage.fromData(token_image)
+        level = entity.get("level")
+        self.header.set_identity(
+            name,
+            str(entity.get("character", "")),
+            _int(level) if level is not None else None,
+            image,
+            True,
+        )
+        for stat, bar in self.header.bars.items():
             value = _int(stats.get(stat))
-            self.stat_values[stat].setText(str(value) if stat in stats else "—")
-            self.stat_bars[stat].setValue(max(0, min(STAT_BAR_MAX, value)))
+            set_resource_bar(bar, value, _int(stats_max.get(stat), value))
+        self.header.set_damage_modifiers(
+            _int(entity.get("damage_reduction")), _int(entity.get("damage_amplification"))
+        )
 
-        rows = []
-        for item in entity.get("items", []) if isinstance(entity.get("items"), list) else []:
-            if not isinstance(item, dict):
-                rows.append(([str(item), "", ""], ""))
-                continue
-            mods = []
-            for entry in item.get("modifier", []) or []:
-                try:
-                    stat, amount = entry
-                    mods.append(f"{STAT_LABELS.get(str(stat), str(stat).upper())} {int(amount):+d}")
-                except (TypeError, ValueError):
-                    continue
-            rows.append((
-                [str(item.get("name", "Objet")), str(item.get("quantity", "")), ", ".join(mods)],
-                str(item.get("description", "")),
-            ))
-        self._fill(self.items_table, rows)
+        for stat, (base, modifier, items, effects, total) in self.stat_cells.items():
+            parts = _list(details.get(stat))
+            if len(parts) == 4:
+                base.setText(str(_int(parts[0])))
+                modifier.setText(_signed(_int(parts[1])))
+                items.setText(_signed(_int(parts[2])))
+                effects.setText(_signed(_int(parts[3])))
+            else:  # an older server sends totals only
+                for label in (base, modifier, items, effects):
+                    label.setText("—")
+            total.setText(str(_int(stats.get(stat))) if stat in stats else "—")
 
-        rows = []
-        spells = entity.get("spells") if isinstance(entity.get("spells"), dict) else {}
-        for name, detail in spells.items():
-            detail = detail if isinstance(detail, dict) else {}
-            description = str(detail.get("description", ""))
-            rows.append((
-                [str(name), f"{detail.get('cost', '?')} STA",
-                 str(detail.get("targeting", "single")), description],
-                description,
-            ))
-        self._fill(self.spells_table, rows)
+        self._fill_items(_list(entity.get("items")))
+        spells = _dict(entity.get("spells"))
+        self.spell_grid.set_spells(
+            sorted(((str(key), _dict(value)) for key, value in spells.items()), key=lambda p: p[0].casefold()),
+            "Aucun sort connu.",
+        )
+        self._fill_effects(_list(entity.get("spell_effects")))
+        self._fill_events(_list(entity.get("spell_events")))
 
-        self.effects_list.clear()
-        for effect in entity.get("spell_effects", []) if isinstance(entity.get("spell_effects"), list) else []:
-            if not isinstance(effect, dict):
-                continue
-            stat = str(effect.get("target_stat", "?"))
-            duration = _int(effect.get("duration"), 0)
-            self.effects_list.addItem(
-                f"{effect.get('effect_type', '?')} · {STAT_LABELS.get(stat, stat.upper())} "
-                f"{_int(effect.get('delta')):+d} · "
-                f"{'permanent' if duration < 0 else f'{duration} tour(s)'}"
-            )
+    def _fill_items(self, items: list) -> None:
+        rows = [item for item in items if isinstance(item, dict)]
+        self.items_table.setRowCount(len(rows))
+        for row, item in enumerate(rows):
+            quantity = _int(item.get("quantity"), 1)
+            description = str(item.get("description", ""))
+            self.items_table.setItem(row, 0, cell(item.get("name", "Objet")))
+            self.items_table.setItem(row, 1, cell(quantity))
+            self.items_table.setItem(row, 2, cell(modifiers_label(item.get("modifier"), quantity)))
+            self.items_table.setItem(row, 3, cell(description, tooltip=description))
+
+    def _fill_effects(self, effects: list) -> None:
+        rows = [effect for effect in effects if isinstance(effect, dict)]
+        self.effects_table.setRowCount(len(rows))
+        for row, effect in enumerate(rows):
+            effect_type = str(effect.get("effect_type", "other"))
+            origin = effect_origin_label(str(effect.get("origin") or ""), str(effect.get("source") or ""))
+            self.effects_table.setItem(row, 0, cell(origin, tooltip=origin))
+            self.effects_table.setItem(row, 1, cell(EFFECT_LABELS.get(effect_type, effect_type)))
+            self.effects_table.setItem(row, 2, cell(stat_label(str(effect.get("target_stat", "?")))))
+            self.effects_table.setItem(row, 3, cell(effect_value_label(effect_type, _int(effect.get("delta")))))
+            self.effects_table.setItem(row, 4, cell(duration_label(_int(effect.get("duration"), -1))))
+
+    def _fill_events(self, events: list) -> None:
+        rows = [event for event in events if isinstance(event, dict)]
+        self.events_table.setRowCount(len(rows))
+        for row, event in enumerate(rows):
+            policy = str(event.get("runtime_policy", ""))
+            targets = len(_list(event.get("targets_id")))
+            self.events_table.setItem(row, 0, cell(event.get("spell_id", "?")))
+            self.events_table.setItem(row, 1, cell(f"{targets} cible(s)"))
+            self.events_table.setItem(row, 2, cell(POLICY_LABELS.get(policy, policy)))
+            self.events_table.setItem(row, 3, cell(_int(event.get("nb_cast"))))
+            self.events_table.setItem(row, 4, cell("Terminé" if event.get("finished") else "En cours"))
+            self.events_table.setItem(row, 5, cell(len(_list(event.get("effects")))))

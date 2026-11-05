@@ -13,6 +13,8 @@ class RuntimeNetworkBridge(QObject):
     client_disconnected = Signal(str)
     chat_received = Signal(str, str)
     async_done = Signal(str, object, object)
+    # username, entity id, d20 result sent by a player
+    initiative_received = Signal(str, str, int)
 
     def on_log(self, message: str) -> None:
         self.log_received.emit(str(message))
@@ -31,3 +33,6 @@ class RuntimeNetworkBridge(QObject):
 
     def on_chat(self, sender: str, message: str) -> None:
         self.chat_received.emit(str(sender), str(message))
+
+    def on_initiative(self, username: str, entity_id: str, value: int) -> None:
+        self.initiative_received.emit(str(username), str(entity_id), int(value))

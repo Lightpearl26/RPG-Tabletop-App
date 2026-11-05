@@ -71,13 +71,16 @@ def unique_name(campaign: Campaign, base: str) -> str:
     return candidate
 
 
-def entity_names(campaign: Campaign) -> list[str]:
+def resource_names(directory: Path) -> list[str]:
     """
-    Names of the entities of the campaign, as `Entity.from_name` expects them.
+    Display names of the JSON resources of a campaign folder.
+
+    The `name` stored in each file is used, or the file name when it has none;
+    the asset loaders resolve both back to the file.
     """
     names: set[str] = set()
-    if campaign.entity_path.is_dir():
-        for path in campaign.entity_path.glob("*.json"):
+    if directory.is_dir():
+        for path in directory.glob("*.json"):
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
                 name = raw.get("name") if isinstance(raw, dict) else None
@@ -85,6 +88,34 @@ def entity_names(campaign: Campaign) -> list[str]:
                 name = None
             names.add(str(name).strip() if name else path.stem.replace("_", " "))
     return sorted(names, key=str.casefold)
+
+
+def entity_names(campaign: Campaign) -> list[str]:
+    """
+    Names of the entities of the campaign, as `Entity.from_name` expects them.
+    """
+    return resource_names(campaign.entity_path)
+
+
+def character_names(campaign: Campaign) -> list[str]:
+    """
+    Names of the characters of the campaign, as `Character.from_name` expects them.
+    """
+    return resource_names(campaign.character_path)
+
+
+def item_names(campaign: Campaign) -> list[str]:
+    """
+    Names of the items of the campaign, as `Item.from_name` expects them.
+    """
+    return resource_names(campaign.item_path)
+
+
+def spell_names(campaign: Campaign) -> list[str]:
+    """
+    Names of the spells of the campaign, as `Spell.from_name` expects them.
+    """
+    return resource_names(campaign.spell_path)
 
 
 def map_names(campaign: Campaign) -> list[str]:
@@ -452,3 +483,15 @@ def rename(campaign: Campaign, name: str, new_name: str) -> Path:
         target.rename(source)
         raise
     return target
+
+def delete(campaign: Campaign, name: str) -> None:
+    """
+    Delete a session folder. The session must not be open in a runtime window.
+    """
+    source = campaign.session_path(name)
+    if not (source / SESSION_FILE).is_file():
+        raise FileNotFoundError(f"Session not found: {source}")
+    trash = source.with_name(f".{source.name}.deleted")
+    shutil.rmtree(trash, ignore_errors=True)
+    source.rename(trash)
+    shutil.rmtree(trash, ignore_errors=True)

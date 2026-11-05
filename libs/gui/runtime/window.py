@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Any
 
-from PySide6.QtCore import Qt, QTimer, QSettings, QSize
+from PySide6.QtCore import Qt, QTimer, QSettings, QSize, Signal
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QColor
 from PySide6.QtWidgets import (
     QComboBox,
@@ -32,13 +32,12 @@ from ..theme import CAMPAIGN_MANAGER_STYLESHEET
 from ..widgets.chat_panel import ChatPanel
 from .bridge import RuntimeNetworkBridge
 from .combat import CombatPanel
-from .disclosure import TokenDisclosureDialog
 from .journal import JournalPanel
 from .map_view import RuntimeMapView
 from .network import NetworkPanel
 from .pending import PendingPanel
 from .players import PlayerAssignmentPanel
-from .registry import EntityRegistryPanel
+from .sheet import GMCharacterSheet
 from .style import RUNTIME_STYLESHEET
 from .tokens import TokenManagerPanel
 from ...runtime.live_sync import RESOURCE_KINDS
@@ -46,6 +45,9 @@ from .add_entities import AddEntitiesDialog
 
 
 class RuntimeWindow(QMainWindow):
+    # File stems of the entity assets written at a session save
+    assets_written = Signal(list)
+
     def __init__(
         self,
         runtime: SessionRuntime,
@@ -67,6 +69,8 @@ class RuntimeWindow(QMainWindow):
         self._server_starting = False
         self._server_stopping = False
         self._settings = QSettings("RPGTabletop", "GMRuntime")
+        # Open character sheets, by entity id
+        self._sheets: dict[str, GMCharacterSheet] = {}
 
         self.setObjectName("RuntimeWindow")
         self.setWindowTitle(f"RPG Tabletop Runtime — {runtime.session.name}")
@@ -225,17 +229,11 @@ class RuntimeWindow(QMainWindow):
         )
         self.combat_dock.setMinimumWidth(345)
 
-        self.registry_panel = EntityRegistryPanel(self.runtime, self)
-        self.registry_dock = self._dock(
-            "Entités", self.registry_panel, Qt.DockWidgetArea.RightDockWidgetArea
-        )
-        self.tabifyDockWidget(self.combat_dock, self.registry_dock)
-
         self.token_panel = TokenManagerPanel(self.runtime, self)
         self.token_dock = self._dock(
             "Tokens", self.token_panel, Qt.DockWidgetArea.RightDockWidgetArea
         )
-        self.tabifyDockWidget(self.registry_dock, self.token_dock)
+        self.tabifyDockWidget(self.combat_dock, self.token_dock)
 
         self.pending_panel = PendingPanel(
             self.runtime,
@@ -296,15 +294,13 @@ class RuntimeWindow(QMainWindow):
 
     def _build_docks_for_restore(self) -> None:
         # Recreate only the dock arrangement, keeping all existing widgets alive.
-        for dock in (self.network_dock, self.combat_dock, self.registry_dock,
-                     self.token_dock, self.pending_dock, self.players_dock,
-                     self.journal_dock):
+        for dock in (self.network_dock, self.combat_dock, self.token_dock,
+                     self.pending_dock, self.players_dock, self.journal_dock):
             self.removeDockWidget(dock)
             dock.show()
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.network_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.combat_dock)
-        self.tabifyDockWidget(self.combat_dock, self.registry_dock)
-        self.tabifyDockWidget(self.registry_dock, self.token_dock)
+        self.tabifyDockWidget(self.combat_dock, self.token_dock)
         self.tabifyDockWidget(self.token_dock, self.pending_dock)
         self.tabifyDockWidget(self.pending_dock, self.players_dock)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.journal_dock)
@@ -323,10 +319,18 @@ class RuntimeWindow(QMainWindow):
 
     def _connect(self) -> None:
         self.map_view.runtime_changed.connect(self._runtime_changed)
-        self.map_view.token_context_requested.connect(self._show_token_disclosure)
+        self.map_view.token_context_requested.connect(self._open_sheet_for_token)
+        self.token_panel.sheet_requested.connect(self.open_sheet)
         self.map_view.status_message.connect(self.statusBar().showMessage)
         self.combat_panel.runtime_changed.connect(self._runtime_changed)
         self.combat_panel.action_requested.connect(self._gm_action_requested)
+        self.combat_panel.player_lookup = self._player_for_entity
+        self.combat_panel.initiative_requested.connect(self._request_initiative)
+        self.combat_panel.initiative_cancelled.connect(self._cancel_initiative)
+        self.token_panel.combat_add_requested.connect(self._add_to_initiative)
+        self.bridge.initiative_received.connect(
+            lambda username, entity_id, value: self.combat_panel.receive_player_roll(entity_id, value, username)
+        )
         self.network_panel.start_requested.connect(self.start_server)
         self.network_panel.stop_requested.connect(self.stop_server)
         self.player_assignment_panel.bind_requested.connect(self.bind_player)
@@ -405,8 +409,8 @@ class RuntimeWindow(QMainWindow):
         if force or seq != self._last_seq:
             self._last_seq = seq
             self.map_view.reload_active_map(reset_camera=False)
-            self.registry_panel.refresh()
             self.token_panel.refresh()
+            self._refresh_sheets()
             self.combat_panel.refresh(reset_list=False)
             self.journal_panel.refresh()
             self.player_assignment_panel.refresh_entities()
@@ -438,13 +442,50 @@ class RuntimeWindow(QMainWindow):
             f"● Serveur actif · {len(clients)} joueur(s) · {average}"
         )
 
+    def _write_entity_assets(self) -> list[str]:
+        """
+        Write the character sheet edits to the entity files of the campaign.
+
+        Returns:
+            list[str]: The names of the entities written.
+        """
+        for sheet in list(self._sheets.values()):
+            sheet.flush_pending()
+        try:
+            event = self.runtime.write_entity_assets()
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Fichiers des entités",
+                "Les modifications des fiches n'ont pas pu être écrites dans les fichiers "
+                f"de la campagne :\n{exc}\n\nElles restent dans la session et seront "
+                "réessayées à la prochaine sauvegarde.",
+            )
+            return []
+        if event is None:
+            return []
+        written = event.data.get("entities", {})
+        self.assets_written.emit([str(info["file"]) for info in written.values()])
+        return sorted(str(info["name"]) for info in written.values())
+
     def save_session(self) -> None:
+        written = self._write_entity_assets()
         try:
             path = self.runtime.save()
         except Exception as exc:
             QMessageBox.critical(self, "Sauvegarder la session", str(exc))
             return
-        self.statusBar().showMessage(f"Session sauvegardée : {path}", 5000)
+        message = f"Session sauvegardée : {path}"
+        if written:
+            message += f"  •  fichiers mis à jour : {', '.join(written)}"
+        session_only = [
+            self.runtime.entities[entity_id].name
+            for entity_id in self.runtime.entities_without_asset()
+            if entity_id in self.runtime.entities
+        ]
+        if session_only:
+            message += f"  •  entités de session (sans fichier) : {', '.join(session_only)}"
+        self.statusBar().showMessage(message, 8000)
 
     def add_note(self) -> None:
         text, ok = QInputDialog.getMultiLineText(self, "Note de session", "Note :")
@@ -453,19 +494,41 @@ class RuntimeWindow(QMainWindow):
         self.runtime.add_note(text.strip())
         self._runtime_changed()
 
-    def _show_token_disclosure(self, token_id: str) -> None:
-        try:
-            dialog = TokenDisclosureDialog(self.runtime, token_id, self)
-        except Exception as exc:
-            QMessageBox.warning(self, "Token", str(exc))
-            return
-        if dialog.exec():
+    # ------------------------------------------------------- character sheets
+    def open_sheet(self, entity_id: str) -> None:
+        """Show the character sheet of an entity, reusing the open one."""
+        sheet = self._sheets.get(str(entity_id))
+        if sheet is None:
             try:
-                self.runtime.set_token_disclosure(token_id, dialog.selected_fields())
-            except Exception as exc:
-                QMessageBox.critical(self, "Token", str(exc))
+                sheet = GMCharacterSheet(self.runtime, str(entity_id), self)
+            except KeyError:
+                self.statusBar().showMessage("Cette entité n'est plus dans la session.", 4000)
                 return
-            self._runtime_changed()
+            sheet.runtime_changed.connect(self._runtime_changed)
+            # A closed sheet is deleted (WA_DeleteOnClose): forget it right away
+            def forget(*_args, entity_id=str(entity_id), sheet=sheet) -> None:
+                self._forget_sheet(entity_id, sheet)
+
+            sheet.finished.connect(forget)
+            sheet.destroyed.connect(forget)
+            self._sheets[str(entity_id)] = sheet
+        sheet.show()
+        sheet.raise_()
+        sheet.activateWindow()
+
+    def _forget_sheet(self, entity_id: str, sheet: GMCharacterSheet) -> None:
+        if self._sheets.get(entity_id) is sheet:
+            del self._sheets[entity_id]
+
+    def _open_sheet_for_token(self, token_id: str) -> None:
+        state = self.runtime.active_map
+        token = state.token_by_id(token_id) if state is not None else None
+        if token is not None:
+            self.open_sheet(token.entity_id)
+
+    def _refresh_sheets(self) -> None:
+        for sheet in list(self._sheets.values()):
+            sheet.refresh()
 
     def _gm_action_requested(self, kind: str, action_id: str) -> None:
         self.statusBar().showMessage(
@@ -534,6 +597,7 @@ class RuntimeWindow(QMainWindow):
                 on_client_connected=self.bridge.on_client_connected,
                 on_client_disconnected=self.bridge.on_client_disconnected,
                 on_chat=self.bridge.on_chat,
+                on_initiative=self.bridge.on_initiative,
             )
             self._server_starting = True
             self._server_stopping = False
@@ -647,6 +711,34 @@ class RuntimeWindow(QMainWindow):
     def _network_log(self, message: str) -> None:
         self.statusBar().showMessage(message, 5000)
 
+    # ------------------------------------------------------------- initiative
+    def _player_for_entity(self, entity_id: str) -> str | None:
+        """Username of the connected player bound to an entity, if any."""
+        server = self.server
+        if server is None or not server.is_running or server.gateway is None:
+            return None
+        try:
+            username = server.gateway.username_for(entity_id)
+            return username if username is not None and username in server.clients else None
+        except RuntimeError:  # dict changed by the network thread meanwhile
+            return None
+
+    def _request_initiative(self, username: str, entity_id: str) -> None:
+        if self.server is None:
+            return
+        self._submit(self.server.request_initiative(username, entity_id), f"initiative:{username}")
+
+    def _cancel_initiative(self, username: str) -> None:
+        if self.server is None:
+            return
+        self._submit(self.server.cancel_initiative(username), f"initiative_cancel:{username}")
+
+    def _add_to_initiative(self, entity_id: str) -> None:
+        self.combat_panel.add_entity(entity_id)
+        self.combat_dock.show()
+        self.combat_dock.raise_()
+        self.combat_panel.tabs.setCurrentWidget(self.combat_panel.initiative_page)
+
     def bind_player(self, username: str, entity_id: str) -> None:
         if self.server is None:
             return
@@ -690,6 +782,9 @@ class RuntimeWindow(QMainWindow):
         self.refresh_timer.stop()
         self._settings.setValue("dock_state", self.saveState())
         self._settings.setValue("geometry", self.saveGeometry())
+        for sheet in list(self._sheets.values()):
+            sheet.close()
+        self._write_entity_assets()
         try:
             self.runtime.save()
         except Exception:

@@ -66,6 +66,7 @@ class ReferenceUpdate:
 REFERENCES = (
     Reference("entities", "spells", ("spells",), "names"),
     Reference("entities", "items", ("items", "inventory"), "entries"),
+    Reference("entities", "characters", ("character",), "name"),
 )
 
 # Resource types stored as one JSON file each, and the Campaign attribute of their folder

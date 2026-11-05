@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 
 from ..assets.campaign import Campaign, get_current_campaign, set_current_campaign
 from ..assets.references import ReferenceUpdate
+from ..assets import resources
 from .browser import ResourceBrowser
 from .cards.base import ResourceCard
 from .cards.character import CharacterCard, THEME as CHARACTER_CARD_THEME
@@ -988,23 +989,6 @@ class CampaignManagerWindow(QMainWindow):
             is_new=True,
         )
 
-    def _on_resource_duplicate_requested(
-        self,
-        resource_type: str,
-        resource_id: str,
-    ) -> None:
-        self.resource_duplicate_requested.emit(resource_type, resource_id)
-
-    def _on_resource_delete_requested(
-        self,
-        resource_type: str,
-        resource_id: str,
-    ) -> None:
-        self.resource_delete_requested.emit(resource_type, resource_id)
-        self._delete_resource(resource_type, resource_id)
-        self._refresh_category(resource_type)
-        self.overview.refresh_counts()
-
     def _on_document_tab_changed(self, index: int) -> None:
         page = self.documents.widget(index)
         if page is self.overview:
@@ -1114,6 +1098,7 @@ class CampaignManagerWindow(QMainWindow):
     def _show_runtime_window(self, window: RuntimeWindow) -> None:
         self.start_session_requested.emit()
         self._runtime_windows.append(window)
+        window.assets_written.connect(self._on_runtime_assets_written)
         window.destroyed.connect(
             lambda _obj=None, window=window: (
                 self._runtime_windows.remove(window)
@@ -1125,6 +1110,38 @@ class CampaignManagerWindow(QMainWindow):
         window.activateWindow()
         self.overview.refresh_counts()
         self.statusBar().showMessage(f"Session lancée : {window.runtime.session.name}", 5000)
+
+    def _on_runtime_assets_written(self, stems: list) -> None:
+        """
+        A runtime wrote character sheet changes to entity files: show them.
+
+        An open editor without unsaved changes reloads the file. One with unsaved
+        changes is left alone; saving it would replace what the session wrote.
+        """
+        conflicts: list[str] = []
+        for stem in stems:
+            page = self._document_pages.get(("entities", str(stem)))
+            if not isinstance(page, ResourceEditor):
+                continue
+            if page.has_changes:
+                conflicts.append(page.title)
+                continue
+            try:
+                page.reload_from_disk()
+            except (OSError, ValueError) as error:
+                self.statusBar().showMessage(f"Rechargement impossible ({stem}) : {error}", 6000)
+                continue
+            self._refresh_document_title(page)
+        self._refresh_category("entities")
+        if conflicts:
+            QMessageBox.warning(
+                self,
+                "Entités modifiées par la session",
+                "La session vient d'écrire dans ces entités, ouvertes avec des modifications "
+                f"non enregistrées : {', '.join(conflicts)}.\n\n"
+                "Les enregistrer remplacerait l'inventaire, les sorts et les modificateurs "
+                "écrits par la session.",
+            )
 
     def _on_start_session_clicked(self) -> None:
         name, accepted = QInputDialog.getText(
@@ -1148,18 +1165,113 @@ class CampaignManagerWindow(QMainWindow):
     def _singular_title(resource_type: str) -> str:
         return next(singular for key, _, singular, _ in RESOURCE_SECTIONS if key == resource_type)
 
-    def _delete_resource(self, resource_type: str, resource_id: str) -> None:
-        editor_key = (resource_type, resource_id)
-        editor = self._document_pages.get(editor_key)
-        if isinstance(editor, ResourceEditor):
-            if not self._confirm_close([editor]):
-                return
-            self._document_pages.pop(editor_key)
+    def _copy_name_suggestion(self, resource_type: str, resource_id: str) -> str:
+        if resource_type == "sessions":
+            return session_store.unique_name(self.campaign, f"{resource_id} (copy)")
+        try:
+            return resources.suggest_copy_name(self.campaign, resource_type, resource_id)
+        except (OSError, ValueError):
+            return f"{resource_id} (copy)"
+
+    def _on_resource_duplicate_requested(self, resource_type: str, resource_id: str) -> None:
+        self.resource_duplicate_requested.emit(resource_type, resource_id)
+        singular = self._singular_title(resource_type)
+        name, accepted = QInputDialog.getText(
+            self,
+            f"Duplicate {singular}",
+            "Name of the copy:",
+            text=self._copy_name_suggestion(resource_type, resource_id),
+        )
+        name = name.strip()
+        if not accepted or not name:
+            return
+        try:
+            if resource_type == "sessions":
+                session_store.duplicate(self.campaign, resource_id, name)
+            else:
+                resources.duplicate_resource(self.campaign, resource_type, resource_id, name)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, f"Duplicate {singular}", str(error))
+            return
+        self._refresh_category(resource_type)
+        self.overview.refresh_counts()
+        self.statusBar().showMessage(f'Duplicated "{resource_id}" as "{name}".', 5000)
+
+    def _on_resource_delete_requested(self, resource_type: str, resource_id: str) -> None:
+        self.resource_delete_requested.emit(resource_type, resource_id)
+        if self._delete_resource(resource_type, resource_id):
+            self._refresh_category(resource_type)
+            self.overview.refresh_counts()
+
+    def _delete_resource(self, resource_type: str, resource_id: str) -> bool:
+        """Ask, delete, then bring the open pages and the runtimes up to date."""
+        singular = self._singular_title(resource_type)
+        updates: list[ReferenceUpdate] = []
+        try:
+            if resource_type == "sessions":
+                if self._session_in_use(resource_id):
+                    raise ValueError("This session is open in a runtime window: close it first.")
+            else:
+                updates = resources.delete_impact(self.campaign, resource_type, resource_id)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, f"Delete {singular}", str(error))
+            return False
+
+        text = f'Delete {singular.lower()} "{resource_id}"? This cannot be undone.'
+        if updates:
+            references = sum(update.count for update in updates)
+            text += f"\n\n{references} reference(s) to it will be removed from {len(updates)} file(s)."
+        if resource_type == "maps":
+            text += "\n\nSessions that use this map will no longer be able to load it."
+        answer = QMessageBox.question(
+            self,
+            f"Delete {singular}",
+            text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+
+        try:
+            if resource_type == "sessions":
+                session_store.delete(self.campaign, resource_id)
+            else:
+                updates = resources.delete_resource(self.campaign, resource_type, resource_id)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, f"Delete {singular}", str(error))
+            return False
+
+        self._forget_deleted(resource_type, resource_id, updates)
+        return True
+
+    def _forget_deleted(
+        self,
+        resource_type: str,
+        resource_id: str,
+        updates: list[ReferenceUpdate],
+    ) -> None:
+        # The page of the deleted resource closes without asking: deleting was confirmed
+        editor = self._document_pages.pop((resource_type, resource_id), None)
+        if editor is not None:
             index = self.documents.indexOf(editor)
             if index >= 0:
                 self.documents.removeTab(index)
             editor.deleteLater()
-        try:
-            delete_resource(self.campaign, resource_type, resource_id)
-        except OSError as error:
-            self.statusBar().showMessage(f"Could not delete {resource_id}: {error}", 6000)
+
+        # Other open pages must not write the deleted references back on their next save
+        for page in self._document_pages.values():
+            if isinstance(page, ResourceEditor):
+                page.remove_references(resource_type, resource_id)
+
+        for source in sorted({update.source for update in updates}):
+            self._refresh_category(source)
+        for update in updates:
+            if update.source == "entities":
+                self._notify_runtimes("entities", update.path.stem)
+
+        if self.inspector_name.text() == resource_id:
+            self.inspector_name.setText("Nothing selected")
+            self.inspector_type.setText("")
+            self.inspector_details.setText("Select a resource to inspect its details.")
+        self.statusBar().showMessage(f'Deleted "{resource_id}".', 5000)

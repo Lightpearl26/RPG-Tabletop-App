@@ -10,7 +10,7 @@ the RPG Tabletop App.
 # import built-in modules
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Optional, TYPE_CHECKING
+from typing import Iterable, Optional, TYPE_CHECKING
 from uuid import UUID, uuid4
 
 # import local modules
@@ -66,45 +66,52 @@ class SpellEvent:
     # methods
     def to_dict(self) -> dict:
         """
-        Convert the instance to a dictionary.
+        Convert the instance to a JSON-serializable dictionary.
         """
         return {
             "spell_id": self.spell_id,
-            "caster_id": self.caster_id,
-            "targets_id": self.targets_id,
+            "caster_id": str(self.caster_id),
+            "targets_id": [str(target_id) for target_id in self.targets_id],
             "effects": [effect.to_dict() for effect in self.effects],
-            "runtime_policy": self.runtime_policy.value,
-            "nb_cast": self.nb_cast,
-            "finished": self.finished,
-            "id": self.id
+            "runtime_policy": RuntimePolicy(self.runtime_policy).value,
+            "nb_cast": int(self.nb_cast),
+            "finished": bool(self.finished),
+            "id": str(self.id),
         }
 
     @classmethod
-    def from_dict(cls, data: dict, effect_cache: dict) -> SpellEvent:
+    def from_dict(cls, data: dict, effect_cache: Optional[dict] = None) -> SpellEvent:
         """
         Create a SpellEvent instance from a dictionary.
 
         Args:
             data (dict): A dictionary containing the attributes of the SpellEvent.
+            effect_cache (dict): Effects already restored, by `str(effect.id)`. An effect
+                                 found there is shared instead of duplicated, so the
+                                 event and its target keep one instance.
         """
-        effects_data = data.get("effects", [])
+        effect_cache = {} if effect_cache is None else effect_cache
         effects = []
-        for effect_data in effects_data:
-            effect_id = effect_data.get("id")
-            if effect_id in effect_cache:
-                effects.append(effect_cache[effect_id])
-            else:
+        for effect_data in data.get("effects", []):
+            effect_id = str(effect_data.get("id"))
+            effect = effect_cache.get(effect_id)
+            if effect is None:
                 effect = SpellEffect.from_dict(effect_data)
-                effects.append(effect)
+                effect_cache[str(effect.id)] = effect
+            effects.append(effect)
+        event_id = data.get("id")
         return cls(
-            spell_id=data["spell_id"],
-            caster_id=data["caster_id"],
-            targets_id=data["targets_id"],
+            spell_id=str(data["spell_id"]),
+            caster_id=str(data["caster_id"]),
+            targets_id=[str(target_id) for target_id in data.get("targets_id", [])],
             effects=effects,
-            runtime_policy=RuntimePolicy(data["runtime_policy"]),
-            nb_cast=data.get("nb_cast", 0),
-            finished=data.get("finished", False),
-            id=UUID(data["id"]) if "id" in data else uuid4()
+            runtime_policy=RuntimePolicy(
+                getattr(data["runtime_policy"], "value", data["runtime_policy"])
+            ),
+            nb_cast=int(data.get("nb_cast", 0)),
+            finished=bool(data.get("finished", False)),
+            id=(event_id if isinstance(event_id, UUID) else UUID(str(event_id)))
+            if event_id else uuid4(),
         )
 
     def apply(
@@ -459,3 +466,30 @@ class SpellEvent:
         """
         self.finished = True
         self.purge()
+
+
+def share_effects(entities: Iterable[Entity]) -> None:
+    """
+    Make every reference to one effect id point at the same SpellEffect instance.
+
+    An effect lives both in its target's `spell_effects` and in the `effects` of the
+    event that created it. Entities restored one by one (from their own asset file)
+    get separate copies; ticking the event would then miss the target's copy.
+    The target's instance wins.
+    """
+    entities = list(entities)
+    shared: dict[str, SpellEffect] = {}
+    for entity in entities:
+        unique: list[SpellEffect] = []
+        for effect in entity.spell_effects:
+            key = str(effect.id)
+            if key not in shared:
+                shared[key] = effect
+            if all(str(other.id) != key for other in unique):
+                unique.append(shared[key])
+        entity.spell_effects = unique
+    for entity in entities:
+        for spell_event in entity.spell_events:
+            spell_event.effects = [
+                shared.setdefault(str(effect.id), effect) for effect in spell_event.effects
+            ]

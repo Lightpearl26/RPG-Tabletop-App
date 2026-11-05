@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 from ...net import ClientSettings
 from ...net.protocol import ChatMessage, CommandMessage, ErrorMessage
 from .connection import PlayerNetworkController
-from .dialogs import PlayerLoginDialog, TokenInspectDialog
+from .dialogs import InitiativeRollDialog, PlayerLoginDialog, TokenInspectDialog
 from .map_view import PlayerMapView
 from .panels import ActionPanel, CharacterPanel, ChatPanel
 from ..widgets.combat_turn_widget import CombatTurnWidget
@@ -59,6 +59,7 @@ class PlayerRuntimeWindow(QMainWindow):
         self.setMinimumSize(980, 640)
         self.setStyleSheet(PLAYER_RUNTIME_STYLESHEET)
         self._sheet: CharacterSheetWindow | None = None
+        self._initiative_dialog: InitiativeRollDialog | None = None
         self._build_ui()
         self._connect_signals()
 
@@ -365,11 +366,41 @@ class PlayerRuntimeWindow(QMainWindow):
             self._refresh_players_from_client()
             if name:
                 self.chat_panel.append_message("Système", f"{name} a quitté la partie.", system=True)
+        elif command == "INITIATIVE_REQUEST":
+            self._ask_initiative(str(args.get("name", "")))
+        elif command == "INITIATIVE_CANCELLED":
+            self._close_initiative_dialog()
+            self.chat_panel.append_message("Système", "Le MJ a annulé le jet d'initiative.", system=True)
+        elif command == "INITIATIVE_RESULT":
+            text = f"Initiative envoyée au MJ : {args.get('value', '?')}"
+            self.chat_panel.append_message("Système", text, system=True)
+            self.statusBar().showMessage(text, 5000)
         elif command == "ASSET_CHUNK":
             self.map_view.update()
         elif command == "ASSET_DONE":
             self.map_view.update()
             self.statusBar().showMessage("Synchronisation des ressources de carte terminée", 4000)
+
+    # --------------------------------------------------------------- initiative
+    def _ask_initiative(self, entity_name: str) -> None:
+        self._close_initiative_dialog()
+        dialog = InitiativeRollDialog(entity_name, self)
+        dialog.roll_chosen.connect(self.controller.send_initiative)
+        dialog.finished.connect(lambda _result, dialog=dialog: self._forget_initiative_dialog(dialog))
+        self._initiative_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self.chat_panel.append_message("Système", "Le MJ lance le combat : lance ton d20 d'initiative.", system=True)
+
+    def _forget_initiative_dialog(self, dialog: InitiativeRollDialog) -> None:
+        if self._initiative_dialog is dialog:
+            self._initiative_dialog = None
+
+    def _close_initiative_dialog(self) -> None:
+        dialog, self._initiative_dialog = self._initiative_dialog, None
+        if dialog is not None:
+            dialog.close()
 
     def _handle_action_result(self, command: str, args: dict[str, Any]) -> None:
         self._clear_pending()
@@ -466,7 +497,7 @@ class PlayerRuntimeWindow(QMainWindow):
         if isinstance(map_data, dict):
             self._prepare_map_cache(map_data)
         if self._sheet is not None and self._sheet.isVisible():
-            self._sheet.set_entity(entity)
+            self._sheet.set_entity(entity, self._own_token_image())
         self.action_panel.set_projection(projection)
         self.map_view.set_projection(projection)
 
@@ -532,13 +563,25 @@ class PlayerRuntimeWindow(QMainWindow):
         else:
             self.map_status.setText("Aucune carte active")
 
+    def _own_token_image(self) -> bytes | None:
+        """Picture of the player's own token, as sent with the map."""
+        map_data = (self.projection or {}).get("map")
+        tokens = map_data.get("tokens", []) if isinstance(map_data, dict) else []
+        for token in tokens if isinstance(tokens, list) else []:
+            if isinstance(token, dict) and token.get("self") and token.get("image"):
+                try:
+                    return bytes.fromhex(str(token["image"]))
+                except ValueError:
+                    return None
+        return None
+
     def _open_character_sheet(self) -> None:
         entity = (self.projection or {}).get("entity")
         if not isinstance(entity, dict):
             return
         if self._sheet is None:
             self._sheet = CharacterSheetWindow(self)
-        self._sheet.set_entity(entity)
+        self._sheet.set_entity(entity, self._own_token_image())
         self._sheet.show()
         self._sheet.raise_()
         self._sheet.activateWindow()

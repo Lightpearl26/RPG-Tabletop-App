@@ -344,11 +344,12 @@ class EntityEditor(ResourceEditor):
                 continue
             duration = effect.get("duration", "?")
             duration_label = "permanent" if isinstance(duration, int) and duration < 0 else f"duration: {duration}"
+            origin = f" · {effect['origin']}" if effect.get("origin") else ""
             self.spell_effects_field.addItem(
                 f"{effect.get('effect_type', '?')} · {effect.get('target_stat', '?')} "
-                f"({effect.get('delta', '?'):+}) · {duration_label}"
+                f"({effect.get('delta', '?'):+}) · {duration_label}{origin}"
                 if isinstance(effect.get("delta"), (int, float)) else
-                f"{effect.get('effect_type', '?')} · {effect.get('target_stat', '?')} · {duration_label}"
+                f"{effect.get('effect_type', '?')} · {effect.get('target_stat', '?')} · {duration_label}{origin}"
             )
         self.spell_events_field.clear()
         for event in self._data.get("spell_events", []) or []:

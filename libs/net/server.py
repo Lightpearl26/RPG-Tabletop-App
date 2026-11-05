@@ -60,6 +60,7 @@ class RPGNetworkServer:
         on_client_connected: ClientCallback | None = None,
         on_client_disconnected: ClientCallback | None = None,
         on_chat: ChatCallback | None = None,
+        on_initiative=None,
     ) -> None:
         settings.validate()
         self.settings = settings
@@ -97,6 +98,8 @@ class RPGNetworkServer:
                 if self.on_pending is not None:
                     self.on_pending(pending)
             self.gateway.on_pending = pending_hook
+            if on_initiative is not None:
+                self.gateway.on_initiative = on_initiative
 
     def _log(self, message: str) -> None:
         self.on_log(str(message))
@@ -301,6 +304,28 @@ class RPGNetworkServer:
             ServerCommand.RUNTIME_SYNC.value, {"projection": self.gateway.projection_for(username)}
         ))
 
+    async def request_initiative(self, username: str, entity_id: str) -> None:
+        """Ask a player for the d20 initiative of their entity."""
+        if self.gateway is None:
+            raise RuntimeError("No RuntimeNetworkGateway is connected")
+        session = self.clients.get(username)
+        if session is None:
+            raise KeyError(f"Player is not connected: {username}")
+        self.gateway.expect_initiative(username, entity_id)
+        entity = self.gateway.runtime.entities.get(str(entity_id))
+        await session.connection.send(CommandMessage(
+            ServerCommand.INITIATIVE_REQUEST.value,
+            {"entity_id": str(entity_id), "name": entity.name if entity is not None else ""},
+        ))
+
+    async def cancel_initiative(self, username: str) -> None:
+        """Withdraw an initiative request the player has not answered."""
+        if self.gateway is None or not self.gateway.forget_initiative(username):
+            return
+        session = self.clients.get(username)
+        if session is not None:
+            await session.connection.send(CommandMessage(ServerCommand.INITIATIVE_CANCELLED.value, {}))
+
     async def unbind_player(self, username: str) -> None:
         if self.gateway is not None:
             self.gateway.unbind(username)
@@ -492,6 +517,7 @@ class RPGNetworkServer:
             if pending is not None:
                 with suppress(Exception):
                     self.gateway.cancel(username, pending.approval_id)
+            self.gateway.forget_initiative(username)
             self.gateway.unbind(username)
         await session.connection.close()
         if announce:

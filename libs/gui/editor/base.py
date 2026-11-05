@@ -125,6 +125,18 @@ class ResourceEditor(QWidget):
         finally:
             self._tracking_paused = False
 
+    def reload_from_disk(self) -> None:
+        """
+        Show the file as it is now on disk, dropping what the widgets held.
+
+        Used when something else wrote the file (a runtime saving its session).
+        """
+        if self.is_new:
+            return
+        self._load(self.resource_id)
+        self._reload_fields()
+        self._mark_clean()
+
     def save(self) -> Path:
         """Write the editor content to disk and return the file path."""
         data = self._collect_data()

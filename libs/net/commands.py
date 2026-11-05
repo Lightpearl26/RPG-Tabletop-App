@@ -18,6 +18,7 @@ class ClientCommand(str, Enum):
     END_TURN_REQUEST = "END_TURN_REQUEST"
     ASSET_MANIFEST_REQUEST = "ASSET_MANIFEST_REQUEST"
     ASSET_REQUEST = "ASSET_REQUEST"
+    INITIATIVE_ROLL = "INITIATIVE_ROLL"
 
 
 class ServerCommand(str, Enum):
@@ -41,6 +42,10 @@ class ServerCommand(str, Enum):
     ASSET_MANIFEST = "ASSET_MANIFEST"
     ASSET_CHUNK = "ASSET_CHUNK"
     ASSET_DONE = "ASSET_DONE"
+    # The GM asks a player for the d20 initiative of their entity
+    INITIATIVE_REQUEST = "INITIATIVE_REQUEST"
+    INITIATIVE_CANCELLED = "INITIATIVE_CANCELLED"
+    INITIATIVE_RESULT = "INITIATIVE_RESULT"
 
 
 class ActionKind(str, Enum):

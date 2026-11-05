@@ -17,6 +17,7 @@ import sys
 from PySide6.QtWidgets import QApplication
 
 from libs.gui.ide import CampaignManagerWindow
+from libs.gui.appearance import apply_dark_theme
 
 
 def main() -> int:
@@ -32,6 +33,7 @@ def main() -> int:
     """
     app = QApplication(sys.argv)
     app.setApplicationName("RPG Tabletop App")
+    apply_dark_theme(app)
 
     window = CampaignManagerWindow()
     window.show()

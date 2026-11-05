@@ -120,6 +120,9 @@ class PlayerNetworkController(QObject):
     def request_action(self, intent) -> None:
         self._send_command("action", ClientCommand.ACTION_REQUEST, intent.to_dict())
 
+    def send_initiative(self, value: int) -> None:
+        self._send_command("initiative", ClientCommand.INITIATIVE_ROLL, {"value": int(value)})
+
     def request_end_turn(self) -> None:
         self._send_command("end_turn", ClientCommand.END_TURN_REQUEST)
 

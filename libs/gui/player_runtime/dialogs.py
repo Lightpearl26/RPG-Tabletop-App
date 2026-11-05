@@ -2,12 +2,13 @@
 """Login and token-inspection dialogs for the Player Runtime."""
 from __future__ import annotations
 
+import random
 from hashlib import sha256
 
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QSettings, Qt, Signal
 from PySide6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFormLayout, QLabel,
-    QLineEdit, QMessageBox, QSpinBox, QVBoxLayout, QWidget,
+    QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel,
+    QLineEdit, QMessageBox, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from ...net import ClientSettings
@@ -136,3 +137,63 @@ class TokenInspectDialog(QDialog):
         buttons.rejected.connect(self.reject)
         buttons.accepted.connect(self.accept)
         root.addWidget(buttons)
+
+
+class InitiativeRollDialog(QDialog):
+    """
+    The GM starts a combat and asks for the player's d20.
+
+    The player rolls here, or types the result of a real die, then sends it.
+    """
+
+    roll_chosen = Signal(int)
+
+    def __init__(self, entity_name: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Initiative")
+        self.setModal(False)
+        self.setMinimumWidth(340)
+        root = QVBoxLayout(self)
+        title = QLabel(f"Initiative — {entity_name}" if entity_name else "Initiative")
+        title.setObjectName("PlayerTitle")
+        root.addWidget(title)
+        hint = QLabel(
+            "Le MJ lance le combat. Lance ton d20, ou saisis le résultat de ton dé : "
+            "le plus petit résultat joue en premier."
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("PlayerMuted")
+        root.addWidget(hint)
+
+        row = QHBoxLayout()
+        self.value = QSpinBox()
+        self.value.setRange(0, 20)
+        self.value.setSpecialValueText("—")
+        self.value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.value.setMinimumHeight(48)
+        self.value.setStyleSheet("font-size: 24px; font-weight: 700;")
+        self.value.valueChanged.connect(self._sync)
+        roll = QPushButton("Lancer le d20")
+        roll.clicked.connect(self._roll)
+        row.addWidget(self.value, 1)
+        row.addWidget(roll)
+        root.addLayout(row)
+
+        buttons = QDialogButtonBox()
+        self.send_button = buttons.addButton("Envoyer au MJ", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.send_button.setObjectName("PrimaryButton")
+        buttons.accepted.connect(self.accept)
+        root.addWidget(buttons)
+        self._sync()
+
+    def _roll(self) -> None:
+        self.value.setValue(random.randint(1, 20))
+
+    def _sync(self, *_args) -> None:
+        self.send_button.setEnabled(self.value.value() > 0)
+
+    def accept(self) -> None:
+        if self.value.value() <= 0:
+            return
+        self.roll_chosen.emit(self.value.value())
+        super().accept()

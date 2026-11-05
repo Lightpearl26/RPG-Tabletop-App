@@ -48,24 +48,29 @@ def _items_view(entity) -> list[dict[str, Any]]:
 
 
 def _spells_view(entity) -> dict[str, Any]:
-    return {
-        name: {
-            "cost": int(spell.cost),
-            "targeting": str(spell.targeting),
-            "description": spell.description,
-            "policy": spell.runtime_policy.value,
-        }
-        for name, spell in entity.spells.items()
-    }
+    # Name, cost, targeting, policy, delay and which stats each effect touches:
+    # never the formulas.
+    return {name: spell.to_public_dict() for name, spell in entity.spells.items()}
 
 
-def _event_view(spell_event) -> dict[str, Any]:
+def _effect_view(effect: dict[str, Any], spell_names: dict[str, str]) -> dict[str, Any]:
+    """
+    One active effect as the player sees it: no formula (`effect_def`), and the
+    spell it comes from only when the player cast it.
+    """
+    data = {key: value for key, value in effect.items() if key != "effect_def"}
+    event_id = effect.get("event_id")
+    data["source"] = spell_names.get(str(event_id), "Sort") if event_id else ""
+    return data
+
+
+def _event_view(spell_event, spell_names: dict[str, str]) -> dict[str, Any]:
     data = spell_event.to_dict()
     effects = data.get("effects")
     if isinstance(effects, list):
         data["effects"] = [
-            effect for effect in effects
-            if not (isinstance(effect, dict) and effect.get("target_stat") in PRIVATE_STATS)
+            _effect_view(effect, spell_names) for effect in effects
+            if isinstance(effect, dict) and effect.get("target_stat") not in PRIVATE_STATS
         ]
     return data
 
@@ -74,19 +79,26 @@ def _own_entity_view(runtime: SessionRuntime, entity_id: str) -> dict[str, Any]:
     entity = runtime.entities[str(entity_id)]
     stats = {name: int(entity.get_stat(name)) for name in STAT_NAMES}
     stats_max = {name: int(entity.get_stat_max(name)) for name in RESOURCE_BAR_STATS}
+    # Spells the player cast: their effects may say which spell they come from
+    spell_names = {str(event.id): event.spell_id for event in entity.spell_events}
     return {
         "id": str(entity.id),
         "name": entity.name,
         "character": entity.character.name,
+        "level": int(entity.character.stats.level),
         "stats": stats,
         "stats_max": stats_max,
+        # [base, modifier, items, effects] of each stat, as the GM sheet shows it
+        "stats_detail": {name: list(entity.stat_breakdown(name)) for name in STAT_NAMES},
+        "damage_reduction": int(entity.damage_reduction),
+        "damage_amplification": int(entity.damage_amplification),
         "items": _items_view(entity),
         "spells": _spells_view(entity),
         "spell_effects": [
-            effect.to_dict() for effect in entity.spell_effects
+            _effect_view(effect.to_dict(), spell_names) for effect in entity.spell_effects
             if effect.target_stat not in PRIVATE_STATS
         ],
-        "spell_events": [_event_view(event) for event in entity.spell_events],
+        "spell_events": [_event_view(event, spell_names) for event in entity.spell_events],
     }
 
 

@@ -246,6 +246,11 @@ class _TokenList(QListWidget):
 class TokenManagerPanel(QWidget):
     """Lists only Entities loaded in the current SessionRuntime."""
 
+    # Entity id whose character sheet should open
+    sheet_requested = Signal(str)
+    # Entity id to put in the combat initiative
+    combat_add_requested = Signal(str)
+
     def __init__(self, runtime: SessionRuntime, parent=None) -> None:
         super().__init__(parent)
         self.runtime = runtime
@@ -263,7 +268,8 @@ class TokenManagerPanel(QWidget):
         root.addWidget(title)
         hint = QLabel(
             "Glisse une entité sur la map pour placer ou déplacer son token, "
-            "ou sur un dossier pour la ranger. Clic droit pour plus d'actions."
+            "ou sur un dossier pour la ranger. Double-clic ou clic droit pour "
+            "ouvrir sa feuille de personnage."
         )
         hint.setObjectName("RuntimeMuted")
         hint.setWordWrap(True)
@@ -381,7 +387,9 @@ class TokenManagerPanel(QWidget):
     # ------------------------------------------------------------ navigation
     def _open_item(self, item: QListWidgetItem) -> None:
         kind = item.data(ROLE_KIND)
-        if kind == "folder":
+        if kind == "entity":
+            self.sheet_requested.emit(str(item.data(Qt.ItemDataRole.UserRole)))
+        elif kind == "folder":
             self._current_folder = str(item.data(Qt.ItemDataRole.UserRole))
             self.search.clear()
             self.refresh()
@@ -444,6 +452,12 @@ class TokenManagerPanel(QWidget):
 
         if kind == "entity":
             entity_id = str(item.data(Qt.ItemDataRole.UserRole))
+            sheet_action = menu.addAction("Feuille de personnage…")
+            sheet_action.triggered.connect(lambda _=False, i=entity_id: self.sheet_requested.emit(i))
+            menu.setDefaultAction(sheet_action)
+            combat_action = menu.addAction("Ajouter à l'initiative")
+            combat_action.triggered.connect(lambda _=False, i=entity_id: self.combat_add_requested.emit(i))
+            menu.addSeparator()
             move_menu = menu.addMenu("Déplacer vers")
             root_action = move_menu.addAction("Racine")
             root_action.setEnabled(self.store.folder_of(entity_id) is not None)
