@@ -65,7 +65,8 @@ rpg_tabletop/
 ├── core/               logique pure : dés, stats, règles, géométrie, dossiers utilisateur
 ├── assets/             données de campagne et leur persistance (map/ : cartes)
 ├── session/            partie en cours : entités, actions, ciblage, initiative,
-│                       runtime, journal et sauvegarde
+│                       journal et sauvegarde ; runtime/ : SessionRuntime découpé en
+│                       mixins (events, player_rules, maps, entities, sheet_edits, combat)
 ├── net/                réseau (serveur, client, protocole, TLS, relais) — sans Qt
 └── ui/
     ├── theme/              palette Qt et feuilles de style
