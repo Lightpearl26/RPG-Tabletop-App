@@ -1,0 +1,49 @@
+diff --git a/libs/gui/player_runtime/window.py b/libs/gui/player_runtime/window.py
+index 9c5cf81..425c5e8 100644
+--- a/libs/gui/player_runtime/window.py
++++ b/libs/gui/player_runtime/window.py
+@@ -366,12 +366,12 @@ class PlayerRuntimeWindow(QMainWindow):
+             name = str(args.get("username", ""))
+             self._refresh_players_from_client()
+             if name:
+-                self.chat_panel.append_message("Système", f"{name} a rejoint la partie.", system=True)
++                self.chat_panel.append_log(INFO, f"[+] {name}")
+         elif command == "PLAYER_LEFT":
+             name = str(args.get("username", ""))
+             self._refresh_players_from_client()
+             if name:
+-                self.chat_panel.append_message("Système", f"{name} a quitté la partie.", system=True)
++                self.chat_panel.append_log(INFO, f"[-] {name}")
+         elif command == "INITIATIVE_REQUEST":
+             self._ask_initiative(str(args.get("name", "")))
+         elif command == "INITIATIVE_CANCELLED":
+diff --git a/libs/gui/runtime/window.py b/libs/gui/runtime/window.py
+index 75ad597..c59e804 100644
+--- a/libs/gui/runtime/window.py
++++ b/libs/gui/runtime/window.py
+@@ -363,8 +363,8 @@ class RuntimeWindow(QMainWindow):
+         self.bridge.pending_created.connect(self.pending_panel.add_or_update)
+         self.bridge.pending_updated.connect(self.pending_panel.add_or_update)
+         self.bridge.chat_received.connect(self._chat_received)
+-        self.bridge.client_connected.connect(lambda _u: self.refresh_all(force=True))
+-        self.bridge.client_disconnected.connect(lambda _u: self.refresh_all(force=True))
++        self.bridge.client_connected.connect(self._client_connected)
++        self.bridge.client_disconnected.connect(self._client_disconnected)
+         self.bridge.async_done.connect(self._async_done)
+ 
+     # ------------------------------------------------------------- runtime
+@@ -812,6 +812,14 @@ class RuntimeWindow(QMainWindow):
+             self.network_loop.stop()
+             self.network_loop = None
+ 
++    def _client_connected(self, username: str) -> None:
++        self.chat_panel.append_log(INFO, f"[+] {username}")
++        self.refresh_all(force=True)
++
++    def _client_disconnected(self, username: str) -> None:
++        self.chat_panel.append_log(INFO, f"[-] {username}")
++        self.refresh_all(force=True)
++
+     def _network_log(self, message: str) -> None:
+         self.statusBar().showMessage(message, 5000)
+         self.chat_panel.append_log(network_log_level(message), str(message), "Serveur")

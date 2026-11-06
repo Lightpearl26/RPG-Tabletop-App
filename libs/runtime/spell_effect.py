@@ -74,6 +74,11 @@ class SpellEffect:
     # Free description of the cause, written by the GM
     origin: str = ""
 
+    # Spell and caster that created the effect ("" for a GM or weapon effect);
+    # kept when the spell event itself is gone
+    spell_id: str = ""
+    caster_id: str = ""
+
     def to_dict(self) -> dict[str, Any]:
         """
         Convert the instance to a JSON-serializable dictionary.
@@ -88,6 +93,8 @@ class SpellEffect:
             "duration": int(self.duration),
             "event_id": str(self.event_id) if self.event_id is not None else None,
             "origin": str(self.origin),
+            "spell_id": str(self.spell_id),
+            "caster_id": str(self.caster_id),
         }
 
     @classmethod
@@ -114,6 +121,8 @@ class SpellEffect:
             event_id=_uuid_or_none(data.get("event_id")),
             id=_uuid_or_none(data.get("id")) or uuid4(),
             origin=str(data.get("origin") or ""),
+            spell_id=str(data.get("spell_id") or ""),
+            caster_id=str(data.get("caster_id") or ""),
         )
 
     def is_expired(self) -> bool:

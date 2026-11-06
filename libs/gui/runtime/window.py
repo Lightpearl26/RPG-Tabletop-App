@@ -23,13 +23,17 @@ from PySide6.QtWidgets import (
 
 from ...assets.map import DrawTool
 from ...net.assets import AssetCatalog
+from ...net.commands import ActionIntent, ActionKind, TargetSelection
+from ...net.gateway import GM_USER, GatewayResult, RuntimeNetworkGateway
+from ...net.models import PendingRequest, PendingStatus
 from ...net.config import RelaySettings, ServerSettings, TLSSettings
 from ...net.protocol import ChatMessage
 from ...net.runner import AsyncioLoopThread
 from ...net.server import RPGNetworkServer, create_runtime_server
 from ...runtime.session import Session, SessionRuntime
+from ...runtime.targeting import TargetingError, targeting_spec
 from ..theme import CAMPAIGN_MANAGER_STYLESHEET
-from ..widgets.chat_panel import ChatPanel
+from ..widgets.chat_panel import DEBUG, ERROR, INFO, WARNING, ChatPanel, network_log_level
 from .bridge import RuntimeNetworkBridge
 from .combat import CombatPanel
 from .journal import JournalPanel
@@ -64,6 +68,19 @@ class RuntimeWindow(QMainWindow):
         self.network_loop: AsyncioLoopThread | None = None
         self.server: RPGNetworkServer | None = None
         self.bridge = RuntimeNetworkBridge(self)
+        # One request list for the whole session: player requests (through the
+        # server) and the actions the GM makes entities do, server or not.
+        self.gateway = RuntimeNetworkGateway(
+            runtime,
+            action_preparer=action_preparer,
+            action_executor=action_executor,
+            require_gm_approval=True,
+        )
+        self.gateway.on_pending = self.bridge.on_pending
+        self.gateway.on_pending_updated = self.bridge.on_pending_updated
+        self.gateway.on_initiative = self.bridge.on_initiative
+        # Action waiting for its targets on the map: (entity id, kind, spell name)
+        self._gm_action: tuple[str, str, str] | None = None
         self._last_seq = -1
         self._closing = False
         self._server_starting = False
@@ -237,12 +254,13 @@ class RuntimeWindow(QMainWindow):
 
         self.pending_panel = PendingPanel(
             self.runtime,
-            actions_executable=self.action_executor is not None,
+            actions_executable=True,
             parent=self,
         )
         self.pending_dock = self._dock(
             "Demandes joueurs", self.pending_panel, Qt.DockWidgetArea.RightDockWidgetArea
         )
+        self.pending_dock.setWindowTitle("Demandes")  # players' and GM's (object name kept for layouts)
         self.tabifyDockWidget(self.token_dock, self.pending_dock)
 
         self.player_assignment_panel = PlayerAssignmentPanel(self.runtime, self)
@@ -255,7 +273,7 @@ class RuntimeWindow(QMainWindow):
         self.combat_dock.raise_()
 
         self.bottom_tabs = QTabWidget()
-        self.chat_panel = ChatPanel(self.bottom_tabs)
+        self.chat_panel = ChatPanel(self.bottom_tabs, settings_scope="GMRuntime")
         self.journal_panel = JournalPanel(self.runtime, self.bottom_tabs)
         self.bottom_tabs.addTab(self.chat_panel, "Chat")
         self.bottom_tabs.addTab(self.journal_panel, "Journal")
@@ -324,6 +342,8 @@ class RuntimeWindow(QMainWindow):
         self.map_view.status_message.connect(self.statusBar().showMessage)
         self.combat_panel.runtime_changed.connect(self._runtime_changed)
         self.combat_panel.action_requested.connect(self._gm_action_requested)
+        self.map_view.action_targets_chosen.connect(self._gm_targets_chosen)
+        self.map_view.targeting_cancelled.connect(self._gm_targeting_cancelled)
         self.combat_panel.player_lookup = self._player_for_entity
         self.combat_panel.initiative_requested.connect(self._request_initiative)
         self.combat_panel.initiative_cancelled.connect(self._cancel_initiative)
@@ -343,8 +363,8 @@ class RuntimeWindow(QMainWindow):
         self.bridge.pending_created.connect(self.pending_panel.add_or_update)
         self.bridge.pending_updated.connect(self.pending_panel.add_or_update)
         self.bridge.chat_received.connect(self._chat_received)
-        self.bridge.client_connected.connect(lambda _u: self.refresh_all(force=True))
-        self.bridge.client_disconnected.connect(lambda _u: self.refresh_all(force=True))
+        self.bridge.client_connected.connect(self._client_connected)
+        self.bridge.client_disconnected.connect(self._client_disconnected)
         self.bridge.async_done.connect(self._async_done)
 
     # ------------------------------------------------------------- runtime
@@ -408,6 +428,11 @@ class RuntimeWindow(QMainWindow):
         seq = self.runtime.session.current_seq
         if force or seq != self._last_seq:
             self._last_seq = seq
+            combat = self.runtime.combat
+            if self._gm_action is not None and (
+                combat is None or combat.current_entity_id != self._gm_action[0]
+            ):
+                self.map_view.cancel_targeting()  # the turn moved on
             self.map_view.reload_active_map(reset_camera=False)
             self.token_panel.refresh()
             self._refresh_sheets()
@@ -530,11 +555,83 @@ class RuntimeWindow(QMainWindow):
         for sheet in list(self._sheets.values()):
             sheet.refresh()
 
+    # ------------------------------------------------------------- GM actions
     def _gm_action_requested(self, kind: str, action_id: str) -> None:
-        self.statusBar().showMessage(
-            f"Action MJ {kind}{f' : {action_id}' if action_id else ''} : resolver direct à connecter.",
-            6000,
+        """The GM makes the entity whose turn it is strike, shoot or cast."""
+        combat = self.runtime.combat
+        entity_id = combat.current_entity_id if combat is not None else None
+        entity_id = str(entity_id or "")
+        entity = self.runtime.entities.get(entity_id)
+        if entity is None:
+            return
+        spell = None
+        if kind == "spell":
+            spell = entity.get_spell(action_id)
+            if spell is None:
+                QMessageBox.warning(self, "Action", f"{entity.name} ne connaît pas le sort {action_id}.")
+                return
+        if spell is not None and str(spell.targeting) == "self":
+            self._submit_gm_action(entity_id, kind, action_id, TargetSelection())
+            return
+        try:
+            spec = targeting_spec(self.runtime, entity_id, kind, spell, gm=True)
+        except TargetingError as exc:
+            QMessageBox.warning(self, "Action", str(exc))
+            return
+        what = {"strike": "Strike", "shoot": "Shoot"}.get(kind, action_id)
+        if spec["mode"] == "multi":
+            how = "clique les cibles en vert puis Entrée"
+        elif spec["allowed"] is None:
+            how = "clique la case visée"
+        else:
+            how = "clique une cible en vert"
+        if spec["allowed"] is not None and not spec["allowed"]:
+            how = "aucune cible valide en vue"
+        spec["entity_id"] = entity_id
+        spec["label"] = f"{entity.name} · {what} — {how} · Échap pour annuler"
+        self._gm_action = (entity_id, kind, action_id)
+        self._map_tool_actions["Sélection"].setChecked(True)
+        self.map_view.start_targeting(spec)
+        self.statusBar().showMessage(spec["label"], 8000)
+
+    def _gm_targets_chosen(self, selection: dict) -> None:
+        action, self._gm_action = self._gm_action, None
+        if action is None:
+            return
+        point = selection.get("point")
+        self._submit_gm_action(
+            action[0], action[1], action[2],
+            TargetSelection(
+                token_ids=tuple(str(item) for item in selection.get("token_ids", [])),
+                point=(float(point[0]), float(point[1])) if point is not None else None,
+            ),
         )
+
+    def _gm_targeting_cancelled(self) -> None:
+        self._gm_action = None
+        self.statusBar().showMessage("Action annulée.", 3000)
+
+    def _submit_gm_action(self, entity_id: str, kind: str, action_id: str, selection: TargetSelection) -> None:
+        intent = ActionIntent(ActionKind(kind), action_id if kind == "spell" else "", selection)
+        self.statusBar().clearMessage()
+        if self._network_active():
+            self._submit(self._gm_action_async(entity_id, intent), "gm_action")
+            return
+        try:
+            self.gateway.submit_gm_action(entity_id, intent)
+        except (ValueError, KeyError, PermissionError, RuntimeError) as exc:
+            QMessageBox.warning(self, "Action impossible", str(exc))
+            return
+        self._show_requests()
+
+    async def _gm_action_async(self, entity_id: str, intent: ActionIntent) -> PendingRequest:
+        pending, result = self.gateway.submit_gm_action(entity_id, intent)
+        await self.server.deliver(result)
+        return pending
+
+    def _show_requests(self) -> None:
+        self.pending_dock.show()
+        self.pending_dock.raise_()
 
     # ------------------------------------------------------------- network
     def _server_settings(self) -> ServerSettings:
@@ -588,11 +685,9 @@ class RuntimeWindow(QMainWindow):
             self.server = create_runtime_server(
                 self.runtime,
                 settings,
-                action_preparer=self.action_preparer,
-                action_executor=self.action_executor,
+                gateway=self.gateway,
                 asset_catalog=self._asset_catalog(),
                 on_log=self.bridge.on_log,
-                on_pending=self.bridge.on_pending,
                 on_pending_updated=self.bridge.on_pending_updated,
                 on_client_connected=self.bridge.on_client_connected,
                 on_client_disconnected=self.bridge.on_client_disconnected,
@@ -651,12 +746,19 @@ class RuntimeWindow(QMainWindow):
     def _async_done(self, label: str, result, error) -> None:
         if error is not None:
             if label == "gm_chat":
-                self.chat_panel.append_message("Système", str(error), system=True)
+                self.chat_panel.append_log(ERROR, str(error))
+            elif label == "gm_action" or label.startswith(("approve:", "reject:")):
+                self.chat_panel.append_log(WARNING, f"Action impossible : {error}")
+                QMessageBox.warning(self, "Action impossible", str(error))
+            elif label == "cancel_die":
+                self.chat_panel.append_log(DEBUG, f"Fermeture du dé côté joueur impossible : {error}")
             else:
+                self.chat_panel.append_log(ERROR, f"Réseau : {error}")
                 QMessageBox.critical(self, "Runtime réseau", str(error))
             if label == "server_started":
                 self._server_starting = False
                 self._server_stopping = False
+                self._detach_gateway()
                 self.network_panel.set_running(False)
                 self.player_assignment_panel.set_server_running(False)
                 self.chat_panel.set_connected(False)
@@ -690,16 +792,18 @@ class RuntimeWindow(QMainWindow):
         elif label == "server_stopped":
             self._server_stopping = False
             self._server_starting = False
+            self._detach_gateway()
             self.network_panel.set_running(False)
             self.player_assignment_panel.set_server_running(False)
             self.chat_panel.set_connected(False)
             self.server = None
             self._shutdown_network_runner()
             self.refresh_all(force=True)
+        elif label == "gm_action":
+            self._show_requests()
         elif label.startswith("approve:") or label.startswith("reject:"):
-            approval_id = label.split(":", 1)[1]
-            self.pending_panel.remove(approval_id)
-            self.refresh_all(force=True)
+            pending, result = result
+            self._pending_handled(pending, result)
         elif label.startswith("bind:"):
             self.refresh_all(force=True)
 
@@ -708,8 +812,17 @@ class RuntimeWindow(QMainWindow):
             self.network_loop.stop()
             self.network_loop = None
 
+    def _client_connected(self, username: str) -> None:
+        self.chat_panel.append_log(INFO, f"[+] {username}")
+        self.refresh_all(force=True)
+
+    def _client_disconnected(self, username: str) -> None:
+        self.chat_panel.append_log(INFO, f"[-] {username}")
+        self.refresh_all(force=True)
+
     def _network_log(self, message: str) -> None:
         self.statusBar().showMessage(message, 5000)
+        self.chat_panel.append_log(network_log_level(message), str(message), "Serveur")
 
     # ------------------------------------------------------------- initiative
     def _player_for_entity(self, entity_id: str) -> str | None:
@@ -744,30 +857,99 @@ class RuntimeWindow(QMainWindow):
             return
         self._submit(self.server.bind_player(username, entity_id), f"bind:{username}")
 
+    # ------------------------------------------------------------- requests
+    def _network_active(self) -> bool:
+        return self.server is not None and self.server.is_running and self.network_loop is not None
+
+    def _detach_gateway(self) -> None:
+        """No server any more: nobody is connected, requests are handled here."""
+        self.gateway.on_pending = self.bridge.on_pending
+        self.gateway.is_connected = lambda _username: False
+
+    def _awaiting_dice(self, approval_id: str) -> dict[str, str]:
+        """Dice of a request still waiting for a player: key -> player."""
+        try:
+            pending = self.gateway.pending(approval_id)
+        except KeyError:
+            return {}
+        return {key: die.owner for key, die in pending.proposed_dice.items() if die.awaiting and die.owner}
+
+    def _close_player_dice(self, approval_id: str, before: dict[str, str]) -> None:
+        """The GM set dice a player was asked to roll: close the player's dialog."""
+        still = self._awaiting_dice(approval_id)
+        for key, owner in before.items():
+            if key not in still and self._network_active():
+                self._submit(self.server.cancel_die(owner, approval_id, key), "cancel_die")
+
+    def _pending_handled(self, pending: PendingRequest, result: GatewayResult) -> None:
+        if pending.status is PendingStatus.WAITING:  # damage dice asked again
+            self.pending_panel.add_or_update(pending)
+        else:
+            self.pending_panel.remove(pending.approval_id)
+        self.refresh_all(force=True)
+        entity = self.runtime.entities.get(pending.entity_id)
+        for reply in result.replies:  # resolutions are Info lines in the GM chat
+            message = str(reply.args.get("message", ""))
+            if not message:
+                continue
+            who = f"{entity.name} — " if entity is not None else ""
+            if pending.username != GM_USER:
+                who = f"{pending.username} · {who}"
+            failed = reply.args.get("success") is False
+            self.chat_panel.append_log(WARNING if failed else INFO, who + message)
+            if pending.username == GM_USER:
+                self.statusBar().showMessage(who + message, 10000)
+
+    async def _approve_async(self, approval_id: str):
+        pending, result = self.gateway.approve(approval_id)
+        await self.server.deliver(result, pending.username)
+        return pending, result
+
+    async def _reject_async(self, approval_id: str, reason: str):
+        pending, result = self.gateway.reject(approval_id, reason=reason)
+        await self.server.deliver(result, pending.username)
+        return pending, result
+
     def approve_pending(self, approval_id: str, targets, dice) -> None:
-        if self.server is None:
-            return
+        before = self._awaiting_dice(approval_id)
         try:
             if targets is not None or dice is not None:
-                self.server.edit_pending_action(approval_id, targets=targets, dice=dice)
+                pending = self.gateway.edit_action(approval_id, targets=targets, dice=dice)
+                self.pending_panel.add_or_update(pending)
         except Exception as exc:
-            QMessageBox.warning(self, "Demande joueur", str(exc))
+            QMessageBox.warning(self, "Demande", str(exc))
             return
-        self._submit(self.server.approve_pending(approval_id), f"approve:{approval_id}")
-
-    def reject_pending(self, approval_id: str, reason: str) -> None:
-        if self.server is None:
-            return
-        self._submit(self.server.reject_pending(approval_id, reason=reason), f"reject:{approval_id}")
-
-    def reroll_pending(self, approval_id: str, dice_key: str) -> None:
-        if self.server is None:
+        self._close_player_dice(approval_id, before)
+        if self._network_active():
+            self._submit(self._approve_async(approval_id), f"approve:{approval_id}")
             return
         try:
-            pending = self.server.reroll_pending_die(approval_id, dice_key)
-            self.pending_panel.add_or_update(pending)
+            pending, result = self.gateway.approve(approval_id)
         except Exception as exc:
-            QMessageBox.warning(self, "Demande joueur", str(exc))
+            QMessageBox.warning(self, "Action impossible", str(exc))
+            return
+        self._pending_handled(pending, result)
+
+    def reject_pending(self, approval_id: str, reason: str) -> None:
+        if self._network_active():
+            self._submit(self._reject_async(approval_id, reason), f"reject:{approval_id}")
+            return
+        try:
+            pending, result = self.gateway.reject(approval_id, reason=reason)
+        except Exception as exc:
+            QMessageBox.warning(self, "Demande", str(exc))
+            return
+        self._pending_handled(pending, result)
+
+    def reroll_pending(self, approval_id: str, dice_key: str) -> None:
+        before = self._awaiting_dice(approval_id)
+        try:
+            pending = self.gateway.reroll(approval_id, dice_key)
+        except Exception as exc:
+            QMessageBox.warning(self, "Demande", str(exc))
+            return
+        self._close_player_dice(approval_id, before)
+        self.pending_panel.add_or_update(pending)
 
     def broadcast_runtime_sync(self) -> None:
         if self.server is not None and self.server.is_running and self.network_loop is not None:

@@ -10,7 +10,7 @@ the RPG Tabletop App.
 # import built-in modules
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Iterable, Optional, TYPE_CHECKING
+from typing import Callable, Iterable, Optional, TYPE_CHECKING
 from uuid import UUID, uuid4
 
 # import local modules
@@ -119,6 +119,7 @@ class SpellEvent:
         new_targets: list[str],
         user_dices: Optional[dict[str, int]]=None,
         targets_dices: Optional[dict[str, dict[str, int]]]=None,
+        pay: Optional[Callable[[Entity, int], bool]] = None,
     ) -> None:
         """
         Apply the spell event to the new targets.
@@ -129,7 +130,21 @@ class SpellEvent:
             user_dices (Optional[dict[str, int]]): The dice used by the user for the spell event.
             targets_dices (Optional[dict[str, dict[str, int]]]): The dice used by the targets for
                                                                  defense.
+            pay (Optional[Callable]): How the cost is paid, returning False when it cannot
+                                      be. Defaults to lowering the caster's stamina.
         """
+        self._payer = pay
+        try:
+            self._apply(new_targets, user_dices, targets_dices)
+        finally:
+            self._payer = None
+
+    def _apply(
+        self,
+        new_targets: list[str],
+        user_dices: Optional[dict[str, int]],
+        targets_dices: Optional[dict[str, dict[str, int]]],
+    ) -> None:
         self._tick_effects()
         if self.finished:
             self._try_cleanup()
@@ -357,6 +372,9 @@ class SpellEvent:
         Returns:
             bool: True if the cost was successfully paid, False otherwise.
         """
+        payer = getattr(self, "_payer", None)
+        if payer is not None:
+            return bool(payer(caster, cost))
         if caster.stamina < cost:
             return False
         caster.stats_modifier.stamina -= cost
@@ -448,7 +466,9 @@ class SpellEvent:
                     target_stat=target_stat,
                     delta=final_delta,
                     event_id=self.id,
-                    duration=self._get_effect_duration(spell)
+                    duration=self._get_effect_duration(spell),
+                    spell_id=spell.name,
+                    caster_id=self.caster_id,
                 )
                 self.effects.append(spell_effect)
                 destination.spell_effects.append(spell_effect)

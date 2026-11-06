@@ -11,6 +11,7 @@ from PySide6.QtGui import QColor, QBrush, QImage, QMouseEvent, QPainter, QPen, Q
 from PySide6.QtWidgets import QWidget
 
 from ...assets.map import MapElement, MediaCache, Vec2
+from ...runtime.geometry import GridGeometry, chebyshev, line_cells, square_area
 from ..widgets.token_overlay import draw_token_overlay
 
 def _number(value: Any) -> float | None:
@@ -53,6 +54,10 @@ class PlayerMapView(QWidget):
         self._has_pending = False
         self._selected_token_id: str | None = None
         self._targeting_mode: str | None = None
+        # Which projection["targeting"] list the picked tokens must come from
+        self._targeting_allowed: str | None = None
+        self._targeting_max: int | None = None
+        self._targeting_area = 0
         self._selected_target_ids: list[str] = []
         self._target_point: Vec2 | None = None
 
@@ -108,7 +113,11 @@ class PlayerMapView(QWidget):
                 except (TypeError, ValueError, KeyError):
                     continue
         visible_ids = {str(token.get("id", "")) for token in self._tokens() if token.get("id")}
-        self._selected_target_ids = [token_id for token_id in self._selected_target_ids if token_id in visible_ids]
+        allowed = self._allowed_ids()
+        self._selected_target_ids = [
+            token_id for token_id in self._selected_target_ids
+            if token_id in visible_ids and (allowed is None or token_id in allowed)
+        ]
         if self._selected_token_id not in visible_ids:
             self._selected_token_id = None
         if self._targeting_mode == "self":
@@ -135,10 +144,19 @@ class PlayerMapView(QWidget):
             self._drag_preview = None
         self.update()
 
-    def set_targeting_mode(self, mode: str | None) -> None:
+    def set_targeting_mode(self, mode: Any) -> None:
+        """
+        `mode` is None, a mode name, or a dict: {"mode", "allowed" (key of the
+        projection's targeting lists), "max" (multi), "area_size" (area)}.
+        """
+        spec = mode if isinstance(mode, dict) else {"mode": mode}
+        mode = spec.get("mode")
         self._targeting_mode = str(mode).lower() if mode else None
+        self._targeting_allowed = str(spec["allowed"]) if spec.get("allowed") else None
+        self._targeting_max = int(spec["max"]) if spec.get("max") else None
+        self._targeting_area = max(0, int(spec.get("area_size") or 0))
         self._selected_target_ids.clear()
-        if self._targeting_mode is None or self._targeting_mode == "area":
+        if self._targeting_mode is None or self._targeting_mode in {"area", "line"}:
             self._selected_token_id = None
         self._target_point = None
         if self._targeting_mode == "self":
@@ -146,14 +164,16 @@ class PlayerMapView(QWidget):
             if own is not None:
                 self._selected_target_ids = [str(own.get("id", ""))]
         elif self._targeting_mode in {"single", "multi"} and self._selected_token_id:
-            selected = next((t for t in self._tokens() if str(t.get("id", "")) == self._selected_token_id), None)
-            if selected is not None and not selected.get("self"):
+            allowed = self._allowed_ids()
+            if allowed is None or self._selected_token_id in allowed:
                 self._selected_target_ids = [self._selected_token_id]
         self._emit_target_selection()
         self.update()
 
     def clear_targeting(self) -> None:
         self._targeting_mode = None
+        self._targeting_allowed = None
+        self._targeting_max = None
         self._selected_target_ids.clear()
         self._target_point = None
         self._emit_target_selection()
@@ -345,6 +365,74 @@ class PlayerMapView(QWidget):
                 return token
         return None
 
+    # -------------------------------------------------------------- targeting
+    def _targeting(self) -> dict[str, Any]:
+        raw = self.projection.get("targeting")
+        return raw if isinstance(raw, dict) else {}
+
+    def _allowed_ids(self) -> set[str] | None:
+        """Tokens the current action may pick, None when any visible token goes."""
+        if not self._targeting_allowed:
+            return None
+        raw = self._targeting().get(self._targeting_allowed, [])
+        return {str(item) for item in raw} if isinstance(raw, list) else set()
+
+    def _grid_geometry(self) -> GridGeometry | None:
+        grid = self._grid()
+        if not grid.get("enabled", True):
+            return None
+        try:
+            offset = grid.get("offset", [0, 0])
+            return GridGeometry(float(grid.get("cell_size", 64) or 64), float(offset[0]), float(offset[1]))
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    def _own_cell(self, grid: GridGeometry) -> tuple[int, int] | None:
+        own = self._own_token()
+        if own is None:
+            return None
+        pos = self._token_pos(own)
+        return grid.cell_of(pos.x, pos.y)
+
+    def _preview_cells(self) -> list[tuple[int, int]]:
+        """Cells an area or a line would cover (walls are checked by the server)."""
+        grid = self._grid_geometry()
+        if grid is None or self._target_point is None:
+            return []
+        aim = grid.cell_of(self._target_point.x, self._target_point.y)
+        if self._targeting_mode == "area":
+            return square_area(aim, self._targeting_area)
+        if self._targeting_mode == "line":
+            origin = self._own_cell(grid)
+            if origin is None:
+                return []
+            return line_cells(grid, [], origin, aim, int(self._targeting().get("range", 0) or 0))
+        return []
+
+    def _draw_targeting_preview(self, painter: QPainter) -> None:
+        grid = self._grid_geometry()
+        if grid is None or self._targeting_mode not in {"area", "line"}:
+            return
+        size = grid.cell_size
+        fill = QColor("#fab387")
+        fill.setAlpha(70)
+        painter.setPen(QPen(QColor("#fab387"), max(1.0, 1.5 / self.zoom)))
+        painter.setBrush(QBrush(fill))
+        for column, row in self._preview_cells():
+            painter.drawRect(QRectF(grid.offset_x + column * size, grid.offset_y + row * size, size, size))
+        # How far the area center may be
+        origin = self._own_cell(grid)
+        reach = int(self._targeting().get("range", 0) or 0)
+        if self._targeting_mode == "area" and origin is not None and reach > 0:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#fab387"), max(1.0, 1.25 / self.zoom), Qt.PenStyle.DashLine))
+            painter.drawRect(QRectF(
+                grid.offset_x + (origin[0] - reach) * size,
+                grid.offset_y + (origin[1] - reach) * size,
+                (reach * 2 + 1) * size,
+                (reach * 2 + 1) * size,
+            ))
+
     def _emit_target_selection(self) -> None:
         self.target_selection_changed.emit({
             "token_ids": list(self._selected_target_ids),
@@ -393,6 +481,7 @@ class PlayerMapView(QWidget):
                     painter.setClipRect(play_rect)
                     self._draw_movement_range(painter)
                     self._draw_grid(painter, map_rect)
+                    self._draw_targeting_preview(painter)
                 finally:
                     painter.restore()
 
@@ -552,6 +641,9 @@ class PlayerMapView(QWidget):
             painter.setBrush(QBrush(QColor("#334155" if not token.get("self") else "#315b66")))
             outline = QColor("#89dceb") if token.get("self") else QColor("#64748b")
             token_id = str(token.get("id", ""))
+            allowed = self._allowed_ids() if self._targeting_mode in {"single", "multi"} else None
+            if allowed is not None and token_id in allowed:
+                outline = QColor("#a6e3a1")  # can be targeted by the current action
             if token_id in self._selected_target_ids or token_id == self._selected_token_id:
                 outline = QColor("#cba6f7")
             if token_id == self._drag_token_id:
@@ -630,16 +722,23 @@ class PlayerMapView(QWidget):
         # ... la suite (ciblage, sélection, drag) est inchangée
 
         if self._targeting_mode:
-            if self._targeting_mode == "area":
-                self._target_point = self._snap_world(world)
+            if self._targeting_mode in {"area", "line"}:
+                self._pick_cell(world)
             elif self._targeting_mode == "self":
                 pass
             elif token is not None:
                 token_id = str(token.get("id", ""))
-                if token_id:
+                allowed = self._allowed_ids()
+                if token_id and allowed is not None and token_id not in allowed:
+                    self.status_message.emit(
+                        "Cible impossible : hors de portée, hors de vue ou derrière un obstacle."
+                    )
+                elif token_id:
                     if self._targeting_mode == "multi":
                         if token_id in self._selected_target_ids:
                             self._selected_target_ids.remove(token_id)
+                        elif self._targeting_max and len(self._selected_target_ids) >= self._targeting_max:
+                            self.status_message.emit(f"Ce sort cible au plus {self._targeting_max} token(s).")
                         else:
                             self._selected_target_ids.append(token_id)
                     else:
@@ -722,6 +821,22 @@ class PlayerMapView(QWidget):
         self.viewport_changed.emit()
 
     # --------------------------------------------------------------- movement
+    def _pick_cell(self, world: Vec2) -> None:
+        """Area center or line direction, checked against the range."""
+        grid = self._grid_geometry()
+        point = self._snap_world(world)
+        if grid is not None:
+            origin = self._own_cell(grid)
+            cell = grid.cell_of(point.x, point.y)
+            reach = int(self._targeting().get("range", 0) or 0)
+            if origin is not None and self._targeting_mode == "line" and cell == origin:
+                self.status_message.emit("Choisis une autre case que la tienne pour donner la direction.")
+                return
+            if origin is not None and self._targeting_mode == "area" and chebyshev(origin, cell) > reach:
+                self.status_message.emit(f"Hors de portée : la zone doit être centrée à {reach} case(s) au plus.")
+                return
+        self._target_point = point
+
     def _snap_world(self, point: Vec2) -> Vec2:
         grid = self._grid()
         if not grid.get("enabled", True):

@@ -2,7 +2,6 @@
 """Player sheet, action controls and chat panels."""
 from __future__ import annotations
 
-from html import escape
 from typing import Any
 
 from PySide6.QtCore import Qt, Signal
@@ -13,6 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...net import ActionIntent, ActionKind, TargetSelection
+from ..widgets.chat_panel import ChatPanel as SharedChatPanel
 
 
 STAT_ORDER = (
@@ -291,11 +291,24 @@ class ActionPanel(QWidget):
             self.clear_action()
             self.stat_check_requested.emit(str(stat))
 
+    def _range(self) -> int:
+        targeting = self.projection.get("targeting", {})
+        try:
+            return int(targeting.get("range", 0)) if isinstance(targeting, dict) else 0
+        except (TypeError, ValueError):
+            return 0
+
     def begin_strike(self) -> None:
-        self._begin_action("strike", "", "single")
+        self._begin_action(
+            "strike", "", {"mode": "single", "allowed": "strike"},
+            "Clique sur un token au contact : une des huit cases autour de toi, sans mur entre vous.",
+        )
 
     def begin_shoot(self) -> None:
-        self._begin_action("shoot", "", "single")
+        self._begin_action(
+            "shoot", "", {"mode": "single", "allowed": "shoot"},
+            "Clique sur un token en ligne de vue : visible, sans mur ni autre token sur la trajectoire.",
+        )
 
     def begin_spell(self, spell_name: str) -> None:
         spell_name = str(spell_name or "")
@@ -304,30 +317,46 @@ class ActionPanel(QWidget):
         entity = self.projection.get("entity", {})
         spells = entity.get("spells", {}) if isinstance(entity, dict) else {}
         spell = spells.get(spell_name, {}) if isinstance(spells, dict) else {}
-        mode = str(spell.get("targeting", "single")).lower() if isinstance(spell, dict) else "single"
-        if mode not in {"single", "multi", "self", "area"}:
+        spell = spell if isinstance(spell, dict) else {}
+        mode = str(spell.get("targeting", "single")).lower()
+        if mode not in {"single", "multi", "self", "area", "line"}:
             mode = "single"
         self._current_action = {"kind": "spell", "action_id": spell_name, "mode": mode}
         self._selection = {"token_ids": [], "point": None}
+        spec: dict[str, Any] = {"mode": mode}
+        reach = self._range()
         if mode == "self":
             self._selection["token_ids"] = [self._own_token_id] if self._own_token_id else []
             self.targeting_hint.setText("Ce sort cible automatiquement ton Entity.")
         elif mode == "area":
-            self.targeting_hint.setText("Clique sur la carte pour choisir le centre de la zone. La forme et la portée seront arbitrées par le MJ.")
+            size = int(spell.get("area_size") or 0)
+            spec["area_size"] = size
+            self.targeting_hint.setText(
+                f"Clique sur la case centrale, à {reach} case(s) au plus. La zone couvre {size} case(s) "
+                "autour (toi compris si tu es dedans) ; les murs protègent ce qui est derrière."
+            )
+        elif mode == "line":
+            self.targeting_hint.setText(
+                f"Clique sur une case pour donner la direction : la ligne part de toi et porte à "
+                f"{reach} case(s), elle traverse les tokens et s'arrête au premier mur."
+            )
         elif mode == "multi":
-            self.targeting_hint.setText("Clique sur chaque token visible à inclure dans la sélection.")
+            spec["allowed"] = "spell_tokens"
+            maximum = spell.get("max_targets")
+            spec["max"] = int(maximum) if maximum else None
+            limit = f" ({int(maximum)} au plus)" if maximum else ""
+            self.targeting_hint.setText(f"Clique sur chaque token en ligne de vue à inclure{limit}.")
         else:
-            self.targeting_hint.setText("Clique sur le token visible à cibler.")
-        self.targeting_mode_changed.emit(mode)
+            spec["allowed"] = "spell_tokens"
+            self.targeting_hint.setText("Clique sur le token à cibler : en ligne de vue, toi compris.")
+        self.targeting_mode_changed.emit(spec)
         self.set_target_selection(self._selection)
 
-    def _begin_action(self, kind: str, action_id: str, mode: str) -> None:
-        self._current_action = {"kind": kind, "action_id": action_id, "mode": mode}
+    def _begin_action(self, kind: str, action_id: str, spec: dict[str, Any], hint: str) -> None:
+        self._current_action = {"kind": kind, "action_id": action_id, "mode": spec["mode"]}
         self._selection = {"token_ids": [], "point": None}
-        self.targeting_hint.setText(
-            "Clique sur un token visible pour le sélectionner. Portée et ligne de vue dépendent du resolver côté MJ."
-        )
-        self.targeting_mode_changed.emit(mode)
+        self.targeting_hint.setText(hint)
+        self.targeting_mode_changed.emit(spec)
         self.set_target_selection(self._selection)
 
     def _selection_is_complete(self) -> bool:
@@ -336,7 +365,7 @@ class ActionPanel(QWidget):
         mode = self._current_action.get("mode", "single")
         if mode == "self":
             return bool(self._selection.get("token_ids"))
-        if mode == "area":
+        if mode in {"area", "line"}:
             return self._selection.get("point") is not None
         return bool(self._selection.get("token_ids"))
 
@@ -371,51 +400,19 @@ class ActionPanel(QWidget):
             self.cancel_pending_requested.emit(self._pending_approval_id)
 
 
-class ChatPanel(QWidget):
-    send_requested = Signal(str)
+class ChatPanel(SharedChatPanel):
+    """Shared chat (with level filters) plus the list of connected players."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        root = QVBoxLayout(self)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(7)
+        super().__init__(parent, settings_scope="PlayerRuntime")
+        self.setObjectName("")
+        self.input.setPlaceholderText("Message…")
+        layout = self.layout()
         self.players = QListWidget()
         self.players.setMaximumHeight(110)
-        root.addWidget(QLabel("Joueurs connectés"))
-        root.addWidget(self.players)
-        root.addWidget(QLabel("Discussion"))
-        self.history = QTextBrowser()
-        self.history.setOpenExternalLinks(False)
-        root.addWidget(self.history, 1)
-        row = QHBoxLayout()
-        self.input = QLineEdit()
-        self.input.setPlaceholderText("Message…")
-        self.send_button = QPushButton("Envoyer")
-        self.input.returnPressed.connect(self._send)
-        self.send_button.clicked.connect(self._send)
-        self.input.setEnabled(False)
-        self.send_button.setEnabled(False)
-        row.addWidget(self.input, 1)
-        row.addWidget(self.send_button)
-        root.addLayout(row)
-
-    def set_connected(self, connected: bool) -> None:
-        self.input.setEnabled(bool(connected))
-        self.send_button.setEnabled(bool(connected))
-
-    def _send(self) -> None:
-        message = self.input.text().strip()
-        if not message:
-            return
-        self.input.clear()
-        self.send_requested.emit(message)
-
-    def append_message(self, sender: str, message: str, *, system: bool = False) -> None:
-        color = "#98a2b1" if system else ("#cba6f7" if sender else "#e5e9ef")
-        self.history.append(
-            f'<span style="color:{color};"><b>{escape(str(sender))}</b></span> '
-            f'<span style="color:#e5e9ef;">{escape(str(message))}</span>'
-        )
+        layout.insertWidget(0, QLabel("Joueurs connectés"))
+        layout.insertWidget(1, self.players)
+        layout.insertWidget(2, QLabel("Discussion"))
 
     def set_players(self, names: list[str]) -> None:
         self.players.clear()

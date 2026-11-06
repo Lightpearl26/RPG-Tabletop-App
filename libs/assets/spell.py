@@ -66,7 +66,9 @@ TargetStat = Literal[
     "mental_health",
     "drug_health"
 ]
-Targeting = Literal["single", "multi", "self", "area"]
+Targeting = Literal["single", "multi", "self", "area", "line"]
+# Radius, in cells, of an area spell when its file does not say
+DEFAULT_AREA_SIZE = 1
 Operator = Literal["bonus", "malus"]
 TARGET_SCOPES: tuple[str, ...] = get_args(TargetScope)
 TARGET_STATS: tuple[str, ...] = get_args(TargetStat)
@@ -636,6 +638,8 @@ class Spell:
         runtime_policy (RuntimePolicy): The runtime policy of the spell.
         effects (list[Effect]): The list of effects that the spell has.
         delay (float | int): The delay before the spell takes effect, if any.
+        area_size (int): Radius in cells of an "area" spell (square: diagonals count as 1).
+        max_targets (Optional[int]): Most targets of a "multi" spell, None for no limit.
     """
     name: str
     description: str
@@ -645,6 +649,8 @@ class Spell:
     effects: list[Effect]
     delay: float | int = float("inf")
     trigger_condition: Optional[Formula] = None
+    area_size: int = DEFAULT_AREA_SIZE
+    max_targets: Optional[int] = None
 
     def to_public_dict(self) -> dict[str, Any]:
         """
@@ -661,6 +667,8 @@ class Spell:
             "targeting": str(getattr(self.targeting, "value", self.targeting) or "single"),
             "policy": RuntimePolicy(self.runtime_policy).value,
             "delay": int(delay) if finite_delay else None,
+            "area_size": int(self.area_size),
+            "max_targets": int(self.max_targets) if self.max_targets else None,
             "effects": [
                 {
                     "target": ".".join(effect.target),
@@ -706,7 +714,9 @@ class Spell:
             effects=effects,
             delay=delay,
             trigger_condition=Formula(data.get("trigger_condition", ""))
-            if data.get("trigger_condition") else None
+            if data.get("trigger_condition") else None,
+            area_size=max(0, int(data.get("area_size", DEFAULT_AREA_SIZE) or 0)),
+            max_targets=int(data["max_targets"]) if data.get("max_targets") else None,
         )
 
     @classmethod

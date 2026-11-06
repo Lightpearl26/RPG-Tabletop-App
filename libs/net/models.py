@@ -16,6 +16,8 @@ class PendingKind(str, Enum):
     STAT_CHECK = "stat_check"
     ACTION = "action"
     END_TURN = "end_turn"
+    # Step 2 of a strike or a shot: the damage dice
+    DAMAGE = "damage"
 
 
 class PendingStatus(str, Enum):
@@ -31,6 +33,10 @@ class DiceProposal:
     expression: str
     values: list[int]
     label: str = ""
+    # Player who rolls this die ("" = rolled by the app, for GM-controlled entities)
+    owner: str = ""
+    # The owner was asked and has not answered: `values` is the app's stand-in
+    awaiting: bool = False
 
     @property
     def total(self) -> int:
@@ -44,6 +50,7 @@ class DiceProposal:
     def reroll(self) -> None:
         dice = Dice.roll(self.expression)
         self.values = list(dice.dice_values)
+        self.awaiting = False
 
     def to_dice(self) -> Dice:
         return Dice(self.expression, [int(v) for v in self.values])
@@ -55,6 +62,8 @@ class DiceProposal:
             "values": list(self.values),
             "total": self.total,
             "label": self.label,
+            "owner": self.owner,
+            "awaiting": self.awaiting,
         }
 
 
@@ -121,6 +130,7 @@ class PendingRequest:
             if len(checked) != expected or any(v < 1 or v > dice_type for v in checked):
                 raise ValueError("Dice values do not match the dice expression")
             proposal.values = checked
+            proposal.awaiting = False
         self.gm_modified = True
 
     def reroll(self, key: str) -> None:

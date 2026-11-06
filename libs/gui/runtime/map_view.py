@@ -13,6 +13,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QWidget
 
 from ...assets.map import DrawingElement, DrawTool, MapAsset, MediaCache, Rect, Vec2
+from ...runtime.geometry import GridGeometry, area_cells, chebyshev, line_cells
 from ...runtime.session import SessionRuntime, SessionToken
 from .tokens import TOKEN_ENTITY_MIME
 from ..widgets.token_overlay import draw_token_overlay
@@ -23,6 +24,9 @@ class RuntimeMapView(QWidget):
     token_selected = Signal(str)
     token_context_requested = Signal(str)
     status_message = Signal(str)
+    # Targets of an action the GM makes an entity do: {"token_ids", "point"}
+    action_targets_chosen = Signal(object)
+    targeting_cancelled = Signal()
 
     MIN_ZOOM = 0.05
     MAX_ZOOM = 6.0
@@ -46,6 +50,10 @@ class RuntimeMapView(QWidget):
         self._drawing_width = 3.0
         self._drawing_points: list[Vec2] = []
         self._drawing_active = False
+        # Action targeting (GM acting for an entity): see start_targeting
+        self._targeting: dict | None = None
+        self._target_ids: list[str] = []
+        self._hover_world: Vec2 | None = None
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAcceptDrops(True)
@@ -126,10 +134,14 @@ class RuntimeMapView(QWidget):
                         if getattr(element, "visible", True):
                             element.render(painter, self.media)
                 self._draw_grid(painter)
+                for wall in self.asset.walls():
+                    wall.render(painter, self.media)
                 self._draw_tokens(painter)
+                self._draw_targeting(painter)
                 self._draw_preview(painter)
             finally:
                 painter.restore()
+            self._draw_targeting_banner(painter)
         finally:
             painter.end()
 
@@ -243,6 +255,189 @@ class RuntimeMapView(QWidget):
         path.addEllipse(rect)
         return path
 
+    # ------------------------------------------------------------- targeting
+    @property
+    def is_targeting(self) -> bool:
+        return self._targeting is not None
+
+    def start_targeting(self, spec: dict) -> None:
+        """
+        Let the GM pick the targets of an action on the map.
+
+        `spec` comes from `targeting_spec` plus "entity_id" (who acts): valid
+        tokens are circled in green; a click picks one (Enter sends a multi
+        pick), a click on a cell sets an area or a line; Esc cancels.
+        """
+        self.set_drawing_tool(None)
+        self._targeting = dict(spec)
+        allowed = spec.get("allowed")
+        self._targeting["allowed"] = None if allowed is None else {str(item) for item in allowed}
+        self._target_ids = []
+        self._hover_world = None
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setFocus(Qt.FocusReason.OtherFocusReason)
+        self.update()
+
+    def cancel_targeting(self, *, notify: bool = True) -> None:
+        if self._targeting is None:
+            return
+        self._targeting = None
+        self._target_ids = []
+        self._hover_world = None
+        self.unsetCursor()
+        self.update()
+        if notify:
+            self.targeting_cancelled.emit()
+
+    def _finish_targeting(self, token_ids: list[str], point: Vec2 | None = None) -> None:
+        self._targeting = None
+        self._target_ids = []
+        self._hover_world = None
+        self.unsetCursor()
+        self.update()
+        self.action_targets_chosen.emit({
+            "token_ids": list(token_ids),
+            "point": [point.x, point.y] if point is not None else None,
+        })
+
+    def _grid_geometry(self) -> GridGeometry | None:
+        if self.asset is None or not self.asset.grid.enabled or self.asset.grid.cell_size <= 0:
+            return None
+        grid = self.asset.grid
+        return GridGeometry(float(grid.cell_size), float(grid.offset_x), float(grid.offset_y))
+
+    def _actor_cell(self, grid: GridGeometry) -> tuple[int, int] | None:
+        state = self.runtime.active_map
+        entity_id = str((self._targeting or {}).get("entity_id", ""))
+        token = state.token_for_entity(entity_id) if state is not None and entity_id else None
+        return grid.cell_of(token.pos.x, token.pos.y) if token is not None else None
+
+    def _targeting_cells(self) -> list[tuple[int, int]]:
+        """Cells the area or line under the cursor would cover."""
+        spec = self._targeting
+        grid = self._grid_geometry()
+        if spec is None or grid is None or self._hover_world is None or self.asset is None:
+            return []
+        aim = grid.cell_of(self._hover_world.x, self._hover_world.y)
+        walls = self.asset.wall_segments()
+        if spec.get("mode") == "area":
+            return area_cells(grid, walls, aim, int(spec.get("area_size", 0)))
+        if spec.get("mode") == "line":
+            origin = self._actor_cell(grid)
+            if origin is None or origin == aim:
+                return []
+            return line_cells(grid, walls, origin, aim, int(spec.get("range", 0)))
+        return []
+
+    def _draw_targeting(self, painter: QPainter) -> None:
+        spec = self._targeting
+        state = self.runtime.active_map
+        if spec is None or state is None:
+            return
+        width = max(1.5, 3.0 / self.zoom)
+        actor = state.token_for_entity(str(spec.get("entity_id", "")))
+        if actor is not None:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#fab387"), width))
+            painter.drawEllipse(self._token_rect(actor).adjusted(-4, -4, 4, 4))
+        allowed = spec.get("allowed")
+        if allowed is not None:
+            for token in state.tokens:
+                if token.id in self._target_ids:
+                    color = QColor("#a6e3a1")
+                    fill = QColor("#a6e3a1")
+                    fill.setAlpha(90)
+                    painter.setBrush(QBrush(fill))
+                elif token.id in allowed:
+                    color = QColor("#40c057")
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                else:
+                    continue
+                painter.setPen(QPen(color, width))
+                painter.drawEllipse(self._token_rect(token).adjusted(-2, -2, 2, 2))
+            return
+        grid = self._grid_geometry()
+        if grid is None:
+            return
+        size = grid.cell_size
+        fill = QColor("#fab387")
+        fill.setAlpha(70)
+        painter.setPen(QPen(QColor("#fab387"), max(1.0, 1.5 / self.zoom)))
+        painter.setBrush(QBrush(fill))
+        for column, row in self._targeting_cells():
+            painter.drawRect(QRectF(grid.offset_x + column * size, grid.offset_y + row * size, size, size))
+        origin = self._actor_cell(grid)
+        reach = int(spec.get("range", 0))
+        if spec.get("mode") == "area" and origin is not None and reach > 0:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#fab387"), max(1.0, 1.25 / self.zoom), Qt.PenStyle.DashLine))
+            painter.drawRect(QRectF(
+                grid.offset_x + (origin[0] - reach) * size,
+                grid.offset_y + (origin[1] - reach) * size,
+                (reach * 2 + 1) * size,
+                (reach * 2 + 1) * size,
+            ))
+
+    def _draw_targeting_banner(self, painter: QPainter) -> None:
+        """What the GM is picking, over the map (the status bar gets overwritten)."""
+        text = str((self._targeting or {}).get("label", ""))
+        if not text:
+            return
+        metrics = painter.fontMetrics()
+        width = metrics.horizontalAdvance(text) + 28
+        rect = QRectF((self.width() - width) / 2, 12, width, metrics.height() + 14)
+        background = QColor("#11141a")
+        background.setAlpha(225)
+        painter.setPen(QPen(QColor("#fab387"), 1.5))
+        painter.setBrush(QBrush(background))
+        painter.drawRoundedRect(rect, 8, 8)
+        painter.setPen(QColor("#eef2f7"))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+
+    def _targeting_click(self, world: Vec2) -> None:
+        spec = self._targeting
+        if spec is None:
+            return
+        mode = str(spec.get("mode", ""))
+        allowed = spec.get("allowed")
+        if allowed is None:  # area or line: a cell
+            grid = self._grid_geometry()
+            if grid is None:
+                self.status_message.emit("Cette action demande une grille active.")
+                return
+            cell = grid.cell_of(world.x, world.y)
+            origin = self._actor_cell(grid)
+            reach = int(spec.get("range", 0))
+            if origin is not None and mode == "line" and cell == origin:
+                self.status_message.emit("Choisis une autre case que celle du lanceur pour la direction.")
+                return
+            if origin is not None and mode == "area" and chebyshev(origin, cell) > reach:
+                self.status_message.emit(f"Hors de portée : la zone doit être centrée à {reach} case(s) au plus.")
+                return
+            center = grid.center(cell)
+            self._finish_targeting([], Vec2(center[0], center[1]))
+            return
+        token = self.token_at(world)
+        if token is None:
+            return
+        if token.id not in allowed:
+            self.status_message.emit(
+                "Cible impossible : hors de portée, hors de vue ou derrière un obstacle. "
+                "Tu pourras forcer la cible dans la demande, onglet Demandes."
+            )
+            return
+        if mode != "multi":
+            self._finish_targeting([token.id])
+            return
+        if token.id in self._target_ids:
+            self._target_ids.remove(token.id)
+        elif spec.get("max") and len(self._target_ids) >= int(spec["max"]):
+            self.status_message.emit(f"Ce sort cible au plus {int(spec['max'])} token(s).")
+        else:
+            self._target_ids.append(token.id)
+        self.status_message.emit(f"{len(self._target_ids)} cible(s) — Entrée pour valider, Échap pour annuler.")
+        self.update()
+
     def _draw_preview(self, painter: QPainter) -> None:
         if not self._drawing_active or not self._drawing_points or self.media is None:
             return
@@ -262,6 +457,8 @@ class RuntimeMapView(QWidget):
         preview.render(painter, self.media)
 
     def set_drawing_tool(self, tool: DrawTool | str | None) -> None:
+        if tool not in (None, "select", "selection"):
+            self.cancel_targeting()
         if tool in (None, "select", "selection"):
             self._drawing_tool = None
         elif str(tool).lower() == "eraser":
@@ -395,6 +592,10 @@ class RuntimeMapView(QWidget):
             return
 
         world = self.screen_to_world(event.position())
+        if self._targeting is not None and event.button() == Qt.MouseButton.LeftButton:
+            self._targeting_click(world)
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._drawing_tool == "eraser":
             self._erase_at(world)
             event.accept()
@@ -464,6 +665,11 @@ class RuntimeMapView(QWidget):
             return
 
         world = self.screen_to_world(event.position())
+        if self._targeting is not None:
+            if self._targeting.get("allowed") is None:
+                self._hover_world = world
+                self.update()
+            return
         self.status_message.emit(f"x={world.x:.1f}, y={world.y:.1f}  zoom={self.zoom:.2f}x")
         super().mouseMoveEvent(event)
 
@@ -525,6 +731,18 @@ class RuntimeMapView(QWidget):
         event.accept()
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if self._targeting is not None:
+            if event.key() == Qt.Key.Key_Escape:
+                self.cancel_targeting()
+                event.accept()
+                return
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self._targeting.get("mode") == "multi":
+                if not self._target_ids:
+                    self.status_message.emit("Choisis au moins une cible.")
+                else:
+                    self._finish_targeting(list(self._target_ids))
+                event.accept()
+                return
         if (
             event.key() == Qt.Key.Key_Delete
             and self.selected_token_id

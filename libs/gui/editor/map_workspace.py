@@ -179,6 +179,11 @@ class MapWorkspace(QWidget):
         add_tool("Rectangle", EditorTool.RECT, "R")
         add_tool("Ellipse", EditorTool.CIRCLE, "O")
         add_tool("Text", EditorTool.TEXT, "T")
+        wall = add_tool("Wall", EditorTool.WALL, "W")
+        wall.setToolTip(
+            "Wall (W): drag a segment, snapped to the grid corners. Walls block vision, "
+            "shots, spells and player moves; only the GM sees them."
+        )
         self._tool_actions[EditorTool.SELECT].setChecked(True)
 
         toolbar.addSeparator()
@@ -856,6 +861,12 @@ class MapWorkspace(QWidget):
 
         elif tool is EditorTool.LINE:
             painter.drawLine(QPointF(4.0, 19.0), QPointF(20.0, 5.0))
+
+        elif tool is EditorTool.WALL:
+            for row, offset in ((6.0, 0.0), (12.0, 4.0), (18.0, 0.0)):
+                painter.drawLine(QPointF(3.0, row), QPointF(21.0, row))
+                for x in range(int(3 + offset), 21, 8):
+                    painter.drawLine(QPointF(float(x), row - 6.0 if row > 6.0 else 3.0), QPointF(float(x), row))
             painter.drawEllipse(QPointF(4.0, 19.0), 1.2, 1.2)
             painter.drawEllipse(QPointF(20.0, 5.0), 1.2, 1.2)
 

@@ -18,8 +18,9 @@ from PySide6.QtWidgets import (
 from ...net import ClientSettings
 from ...net.protocol import ChatMessage, CommandMessage, ErrorMessage
 from .connection import PlayerNetworkController
-from .dialogs import InitiativeRollDialog, PlayerLoginDialog, TokenInspectDialog
+from .dialogs import DiceRollDialog, InitiativeRollDialog, PlayerLoginDialog, TokenInspectDialog
 from .map_view import PlayerMapView
+from ..widgets.chat_panel import DEBUG, ERROR, INFO, WARNING
 from .panels import ActionPanel, CharacterPanel, ChatPanel
 from ..widgets.combat_turn_widget import CombatTurnWidget
 from .style import PLAYER_RUNTIME_STYLESHEET
@@ -60,6 +61,8 @@ class PlayerRuntimeWindow(QMainWindow):
         self.setStyleSheet(PLAYER_RUNTIME_STYLESHEET)
         self._sheet: CharacterSheetWindow | None = None
         self._initiative_dialog: InitiativeRollDialog | None = None
+        # Dice the GM's app asked for: (approval id, key) -> dialog
+        self._dice_dialogs: dict[tuple[str, str], DiceRollDialog] = {}
         self._build_ui()
         self._connect_signals()
 
@@ -224,6 +227,7 @@ class PlayerRuntimeWindow(QMainWindow):
         self.map_view.set_has_pending(self._has_pending or not connected)
         if not connected:
             self._clear_pending()
+            self._close_all_dice_dialogs()
             if not self._closing:
                 self.statusBar().showMessage(message, 8000)
 
@@ -233,7 +237,7 @@ class PlayerRuntimeWindow(QMainWindow):
         if label == "connect":
             if error is not None:
                 self.connection_label.setText("Échec de connexion")
-                self.chat_panel.append_message("Système", str(error), system=True)
+                self.chat_panel.append_log(ERROR, str(error))
                 client = self.controller.client
                 if (
                     client is not None
@@ -279,7 +283,9 @@ class PlayerRuntimeWindow(QMainWindow):
         if error is not None:
             self.statusBar().showMessage(f"{label} : {error}", 8000)
             if label not in {"assets", "runtime_sync"}:
-                self.chat_panel.append_message("Système", str(error), system=True)
+                self.chat_panel.append_log(ERROR, str(error))
+            else:
+                self.chat_panel.append_log(DEBUG, f"{label} : {error}")
             return
         if label == "move":
             self.statusBar().showMessage("Déplacement envoyé", 4000)
@@ -313,7 +319,7 @@ class PlayerRuntimeWindow(QMainWindow):
             return
         if isinstance(message, ErrorMessage):
             self._forget_missing_asset_requests()
-            self.chat_panel.append_message("Réseau", message.reason, system=True)
+            self.chat_panel.append_log(ERROR, message.reason, "Réseau")
             self.statusBar().showMessage(message.reason, 8000)
             return
         if not isinstance(message, CommandMessage):
@@ -342,7 +348,7 @@ class PlayerRuntimeWindow(QMainWindow):
             if not self._pending_approval_id:
                 self._clear_pending()
             reason = str(args.get("reason", "Demande refusée par le serveur."))
-            self.chat_panel.append_message("Système", reason, system=True)
+            self.chat_panel.append_log(WARNING, reason)
             self.statusBar().showMessage(reason, 8000)
         elif command == "REQUEST_CANCELLED":
             self._clear_pending()
@@ -360,12 +366,12 @@ class PlayerRuntimeWindow(QMainWindow):
             name = str(args.get("username", ""))
             self._refresh_players_from_client()
             if name:
-                self.chat_panel.append_message("Système", f"{name} a rejoint la partie.", system=True)
+                self.chat_panel.append_log(INFO, f"[+] {name}")
         elif command == "PLAYER_LEFT":
             name = str(args.get("username", ""))
             self._refresh_players_from_client()
             if name:
-                self.chat_panel.append_message("Système", f"{name} a quitté la partie.", system=True)
+                self.chat_panel.append_log(INFO, f"[-] {name}")
         elif command == "INITIATIVE_REQUEST":
             self._ask_initiative(str(args.get("name", "")))
         elif command == "INITIATIVE_CANCELLED":
@@ -373,13 +379,61 @@ class PlayerRuntimeWindow(QMainWindow):
             self.chat_panel.append_message("Système", "Le MJ a annulé le jet d'initiative.", system=True)
         elif command == "INITIATIVE_RESULT":
             text = f"Initiative envoyée au MJ : {args.get('value', '?')}"
-            self.chat_panel.append_message("Système", text, system=True)
+            self.chat_panel.append_log(DEBUG, text)
+            self.statusBar().showMessage(text, 5000)
+        elif command == "DICE_ROLL_REQUEST":
+            self._ask_dice(args)
+        elif command == "DICE_ROLL_CANCELLED":
+            closed = self._close_dice_dialog(str(args.get("approval_id", "")), str(args.get("key", "")))
+            if closed and args.get("reason", "rolled") == "rolled":
+                self.chat_panel.append_message("Système", "Le MJ a fixé ce jet à ta place.", system=True)
+        elif command == "DICE_ROLL_ACCEPTED":
+            values = args.get("values", [])
+            shown = ", ".join(str(value) for value in values) if isinstance(values, list) else str(values)
+            text = f"Jet envoyé au MJ : {shown} (total {args.get('total', '?')})."
+            self.chat_panel.append_log(DEBUG, text)
             self.statusBar().showMessage(text, 5000)
         elif command == "ASSET_CHUNK":
             self.map_view.update()
         elif command == "ASSET_DONE":
             self.map_view.update()
             self.statusBar().showMessage("Synchronisation des ressources de carte terminée", 4000)
+
+    # --------------------------------------------------------------- dice
+    def _ask_dice(self, args: dict[str, Any]) -> None:
+        approval_id = str(args.get("approval_id", ""))
+        key = str(args.get("key", ""))
+        self._close_dice_dialog(approval_id, key)
+        try:
+            dialog = DiceRollDialog(
+                approval_id, key, str(args.get("expression", "1d100")), str(args.get("label", "")),
+                retry=bool(args.get("retry", False)), parent=self,
+            )
+        except ValueError:
+            return
+        dialog.roll_chosen.connect(self.controller.send_dice)
+        dialog.finished.connect(lambda _result, ident=(approval_id, key), dialog=dialog: self._forget_dice_dialog(ident, dialog))
+        self._dice_dialogs[(approval_id, key)] = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        label = str(args.get("label", "")) or "Le MJ te demande un jet."
+        self.chat_panel.append_message("Système", label, system=True)
+
+    def _forget_dice_dialog(self, ident: tuple[str, str], dialog: DiceRollDialog) -> None:
+        if self._dice_dialogs.get(ident) is dialog:
+            self._dice_dialogs.pop(ident, None)
+
+    def _close_dice_dialog(self, approval_id: str, key: str) -> bool:
+        dialog = self._dice_dialogs.pop((approval_id, key), None)
+        if dialog is None:
+            return False
+        dialog.close()
+        return True
+
+    def _close_all_dice_dialogs(self) -> None:
+        for ident in list(self._dice_dialogs):
+            self._close_dice_dialog(*ident)
 
     # --------------------------------------------------------------- initiative
     def _ask_initiative(self, entity_name: str) -> None:
@@ -404,9 +458,12 @@ class PlayerRuntimeWindow(QMainWindow):
 
     def _handle_action_result(self, command: str, args: dict[str, Any]) -> None:
         self._clear_pending()
+        if command == "ACTION_RESULT" and args.get("success") and args.get("stage") == "attack" and args.get("hit"):
+            # The damage step follows: the player rolls the damage dice, the GM checks them
+            self._set_pending(True, "", "Touché ! Lance tes dés de dégâts, puis le MJ valide.")
         if not bool(args.get("success", False)):
             reason = str(args.get("message") or args.get("reason") or "Action refusée.")
-            self.chat_panel.append_message("MJ", reason, system=True)
+            self.chat_panel.append_log(WARNING, reason, "MJ")
             self.statusBar().showMessage(reason, 8000)
             return
 
@@ -429,9 +486,11 @@ class PlayerRuntimeWindow(QMainWindow):
             text = "Déplacement effectué."
         elif command == "END_TURN_RESULT":
             text = "Ton tour est terminé."
+        elif command == "ACTION_RESULT" and args.get("stage") == "attack":
+            text = f"{str(args.get('message') or ('Touché.' if args.get('hit') else 'Raté.'))}"
         else:
             text = str(args.get("message") or "Action validée par le MJ.")
-        self.chat_panel.append_message("Système", text, system=True)
+        self.chat_panel.append_log(INFO, text)  # a resolution
         self.statusBar().showMessage(text, 5000)
 
     def _set_pending(self, pending: bool, approval_id: str = "", label: str = "") -> None:

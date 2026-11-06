@@ -519,6 +519,38 @@ class CombatPanel(QWidget):
         else:
             self.start_button.setText("Lancer l'initiative")
 
+    def _refresh_turn_actions(self, entity_id: str) -> None:
+        """Strike, shoot and spells of the entity whose turn it is: the GM makes it act."""
+        try:
+            actions = self.runtime.available_actions(entity_id)
+        except KeyError:
+            actions = {}
+        spells = [
+            {"id": name, "name": name, "cost": info.get("cost", 0), "available": info.get("available", False)}
+            for name, info in actions.get("spells", {}).items()
+        ]
+        strike = actions.get("strike", {})
+        shoot = actions.get("shoot", {})
+        self.turn_widget.set_action_options(
+            strike_cost=int(strike.get("cost", 60)),
+            strike_available=bool(strike.get("available", False)),
+            shoot_cost=int(shoot.get("cost", 60)),
+            shoot_available=bool(shoot.get("available", False)),
+            spells=spells,
+        )
+        player = self.player_lookup(entity_id) if self.player_lookup is not None else None
+        stamina = int(actions.get("stamina_remaining", 0))
+        if player:
+            hint = f"Tour de {player} : il agit depuis son client (tu peux aussi agir pour lui)."
+        else:
+            hint = f"Fais agir l'entité : choisis l'action puis la cible sur la carte. Budget : {stamina}."
+        self.turn_widget.set_permissions(
+            connected=True,
+            can_act=bool(actions.get("combat_actions_enabled", False)),
+            can_end_turn=True,
+            action_hint=hint,
+        )
+
     def refresh(self, *, reset_list: bool = False) -> None:
         combat = self.runtime.combat
         self.roster.keep_only(self.runtime.entities)
@@ -541,25 +573,7 @@ class CombatPanel(QWidget):
                 "own_turn": False,
                 "player_view": False,
             })
-            current_entity = self.runtime.entities.get(combat.current_entity_id or "")
-            spells = []
-            if current_entity is not None:
-                spells = [
-                    {
-                        "id": name,
-                        "name": name,
-                        "cost": int(getattr(spell, "cost", 0) or 0),
-                        "available": False,
-                    }
-                    for name, spell in current_entity.spells.items()
-                ]
-            self.turn_widget.set_action_options(spells=spells)
-            self.turn_widget.set_permissions(
-                connected=True,
-                can_act=False,
-                can_end_turn=True,
-                action_hint="Les actions directes MJ seront reliées au resolver de combat."
-            )
+            self._refresh_turn_actions(combat.current_entity_id or "")
             self.initiative_hint.setText(
                 "Combat en cours. Une entité ajoutée lance son d20 et prend sa place dans "
                 "l'ordre : après le tour actuel elle joue ce round, avant elle joue au suivant."

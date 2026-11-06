@@ -19,6 +19,8 @@ class ClientCommand(str, Enum):
     ASSET_MANIFEST_REQUEST = "ASSET_MANIFEST_REQUEST"
     ASSET_REQUEST = "ASSET_REQUEST"
     INITIATIVE_ROLL = "INITIATIVE_ROLL"
+    # A player's result for one die of a pending request
+    DICE_ROLL = "DICE_ROLL"
 
 
 class ServerCommand(str, Enum):
@@ -46,6 +48,10 @@ class ServerCommand(str, Enum):
     INITIATIVE_REQUEST = "INITIATIVE_REQUEST"
     INITIATIVE_CANCELLED = "INITIATIVE_CANCELLED"
     INITIATIVE_RESULT = "INITIATIVE_RESULT"
+    # The GM's server asks a player to roll one die of a pending request
+    DICE_ROLL_REQUEST = "DICE_ROLL_REQUEST"
+    DICE_ROLL_CANCELLED = "DICE_ROLL_CANCELLED"
+    DICE_ROLL_ACCEPTED = "DICE_ROLL_ACCEPTED"
 
 
 class ActionKind(str, Enum):

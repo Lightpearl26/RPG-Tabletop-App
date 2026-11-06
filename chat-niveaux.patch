@@ -1,0 +1,145 @@
+diff --git a/libs/gui/player_runtime/window.py b/libs/gui/player_runtime/window.py
+index db1a766..9c5cf81 100644
+--- a/libs/gui/player_runtime/window.py
++++ b/libs/gui/player_runtime/window.py
+@@ -20,7 +20,7 @@ from ...net.protocol import ChatMessage, CommandMessage, ErrorMessage
+ from .connection import PlayerNetworkController
+ from .dialogs import DiceRollDialog, InitiativeRollDialog, PlayerLoginDialog, TokenInspectDialog
+ from .map_view import PlayerMapView
+-from ..widgets.chat_panel import DEBUG, ERROR, WARNING
++from ..widgets.chat_panel import DEBUG, ERROR, INFO, WARNING
+ from .panels import ActionPanel, CharacterPanel, ChatPanel
+ from ..widgets.combat_turn_widget import CombatTurnWidget
+ from .style import PLAYER_RUNTIME_STYLESHEET
+@@ -490,7 +490,7 @@ class PlayerRuntimeWindow(QMainWindow):
+             text = f"{str(args.get('message') or ('Touché.' if args.get('hit') else 'Raté.'))}"
+         else:
+             text = str(args.get("message") or "Action validée par le MJ.")
+-        self.chat_panel.append_message("Système", text, system=True)
++        self.chat_panel.append_log(INFO, text)  # a resolution
+         self.statusBar().showMessage(text, 5000)
+ 
+     def _set_pending(self, pending: bool, approval_id: str = "", label: str = "") -> None:
+diff --git a/libs/gui/runtime/window.py b/libs/gui/runtime/window.py
+index f1c7e20..75ad597 100644
+--- a/libs/gui/runtime/window.py
++++ b/libs/gui/runtime/window.py
+@@ -879,14 +879,18 @@ class RuntimeWindow(QMainWindow):
+         else:
+             self.pending_panel.remove(pending.approval_id)
+         self.refresh_all(force=True)
+-        if pending.username == GM_USER:  # players get the result on their client
+-            entity = self.runtime.entities.get(pending.entity_id)
+-            for reply in result.replies:
+-                message = str(reply.args.get("message", ""))
+-                if message:
+-                    who = f"{entity.name} — " if entity is not None else ""
+-                    self.statusBar().showMessage(who + message, 10000)
+-                    self.chat_panel.append_log(INFO, who + message)
++        entity = self.runtime.entities.get(pending.entity_id)
++        for reply in result.replies:  # resolutions are Info lines in the GM chat
++            message = str(reply.args.get("message", ""))
++            if not message:
++                continue
++            who = f"{entity.name} — " if entity is not None else ""
++            if pending.username != GM_USER:
++                who = f"{pending.username} · {who}"
++            failed = reply.args.get("success") is False
++            self.chat_panel.append_log(WARNING if failed else INFO, who + message)
++            if pending.username == GM_USER:
++                self.statusBar().showMessage(who + message, 10000)
+ 
+     async def _approve_async(self, approval_id: str):
+         pending, result = self.gateway.approve(approval_id)
+diff --git a/libs/gui/widgets/chat_panel.py b/libs/gui/widgets/chat_panel.py
+index 58c3c3d..682c4a0 100644
+--- a/libs/gui/widgets/chat_panel.py
++++ b/libs/gui/widgets/chat_panel.py
+@@ -17,8 +17,8 @@ from PySide6.QtWidgets import (
+     QWidget,
+ )
+ 
+-# Chat messages between people are always shown; the other lines have a level.
+-CHAT = "chat"
++# Every line has a level: chat messages and action results are Info,
++# system lines are Debug, refusals Warning, failures Error.
+ DEBUG = "debug"
+ INFO = "info"
+ WARNING = "warning"
+@@ -42,9 +42,7 @@ def network_log_level(message: str) -> str:
+         return ERROR
+     if any(word in text for word in ("warning", "manual", "cgnat", "mismatch", "rate limit")):
+         return WARNING
+-    if text.startswith(("[auth]", "[session]", "[server]", "[relay]", "[upnp]", "[firewall]")):
+-        return INFO
+-    return DEBUG
++    return DEBUG  # the rest is a system line
+ 
+ 
+ @dataclass(frozen=True)
+@@ -52,12 +50,14 @@ class ChatLine:
+     level: str
+     sender: str
+     message: str
++    system: bool = False  # written by the app, not by a person
+ 
+ 
+ class ChatPanel(QWidget):
+     """
+     Chat history plus one checkbox per log level (Debug, Info, Avertissement,
+-    Erreur). Messages written by players or the GM are never hidden.
++    Erreur). Messages between people and action results are Info, system
++    lines are Debug.
+ 
+     Args:
+         settings_scope: QSettings application name used to remember the
+@@ -150,7 +150,7 @@ class ChatPanel(QWidget):
+         self._render_all()
+ 
+     def is_shown(self, line: ChatLine) -> bool:
+-        return line.level == CHAT or line.level in self._levels
++        return line.level in self._levels
+ 
+     def shown_lines(self) -> list[ChatLine]:
+         return [line for line in self._lines if self.is_shown(line)]
+@@ -170,12 +170,12 @@ class ChatPanel(QWidget):
+     # ------------------------------------------------------------ history
+     def append_message(self, sender: str, message: str, *, system: bool = False, level: str | None = None) -> None:
+         """
+-        Add a line. Without `level`, a system line is Info and any other line
+-        is a chat message (always shown).
++        Add a line. Without `level`, a system line is Debug and a message
++        written by a person is Info.
+         """
+         if level is None:
+-            level = INFO if system else CHAT
+-        line = ChatLine(str(level), str(sender), str(message))
++            level = DEBUG if system else INFO
++        line = ChatLine(str(level), str(sender), str(message), bool(system))
+         self._lines.append(line)
+         if len(self._lines) > MAX_LINES:
+             del self._lines[: len(self._lines) - MAX_LINES]
+@@ -183,7 +183,8 @@ class ChatPanel(QWidget):
+             self.history.append(self._html(line))
+ 
+     def append_log(self, level: str, message: str, sender: str = "Système") -> None:
+-        self.append_message(sender, message, level=level)
++        """A line written by the app (system, result, refusal or error)."""
++        self.append_message(sender, message, system=True, level=level)
+ 
+     def _render_all(self) -> None:
+         self.history.clear()
+@@ -192,9 +193,11 @@ class ChatPanel(QWidget):
+ 
+     @staticmethod
+     def _html(line: ChatLine) -> str:
+-        if line.level != CHAT:
++        if line.system:
+             color = LEVEL_COLORS.get(line.level, LEVEL_COLORS[INFO])
+-            text_color = color if line.level in (WARNING, ERROR) else "#c7ced8"
++            text_color = color if line.level in (WARNING, ERROR) else (
++                "#e5e9ef" if line.level == INFO else "#c7ced8"
++            )
+         elif line.sender.casefold() in {"mj", "gm"}:
+             color, text_color = "#cba6f7", "#e5e9ef"
+         else:

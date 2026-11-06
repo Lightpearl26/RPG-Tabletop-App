@@ -197,3 +197,105 @@ class InitiativeRollDialog(QDialog):
             return
         self.roll_chosen.emit(self.value.value())
         super().accept()
+
+
+class DiceRollDialog(QDialog):
+    """
+    The GM's app asks the player to roll dice of an action: the d100 of an
+    attack, a defense or a spell, or damage dice.
+
+    The player rolls here, or types the results of real dice, then sends them.
+    The GM still checks them before anything happens.
+    """
+
+    roll_chosen = Signal(str, str, list)
+
+    PER_ROW = 5
+
+    def __init__(
+        self,
+        approval_id: str,
+        key: str,
+        expression: str,
+        label: str,
+        *,
+        retry: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.approval_id = str(approval_id)
+        self.key = str(key)
+        count_text, _sep, size_text = str(expression).lower().partition("d")
+        self.count = max(1, int(count_text or 1))
+        self.size = max(2, int(size_text or 100))
+        self.setWindowTitle("Jet de dés")
+        self.setModal(False)
+        self.setMinimumWidth(360)
+        root = QVBoxLayout(self)
+        title = QLabel(label or f"Lance {expression}")
+        title.setObjectName("PlayerTitle")
+        title.setWordWrap(True)
+        root.addWidget(title)
+        hint_text = (
+            f"Lance {self.count}d{self.size} ici, ou saisis le résultat de tes vrais dés. "
+            "Le MJ vérifie ton jet avant qu'il compte."
+        )
+        if retry:
+            hint_text = "Le MJ a refusé ton jet : relance tes dés. " + hint_text
+        hint = QLabel(hint_text)
+        hint.setWordWrap(True)
+        hint.setObjectName("PlayerMuted")
+        root.addWidget(hint)
+
+        self.values: list[QSpinBox] = []
+        row: QHBoxLayout | None = None
+        for index in range(self.count):
+            if index % self.PER_ROW == 0:
+                row = QHBoxLayout()
+                root.addLayout(row)
+            box = QSpinBox()
+            box.setRange(0, self.size)
+            box.setSpecialValueText("—")
+            box.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            box.setMinimumHeight(44)
+            box.setStyleSheet("font-size: 20px; font-weight: 700;")
+            box.valueChanged.connect(self._sync)
+            self.values.append(box)
+            assert row is not None
+            row.addWidget(box)
+
+        footer = QHBoxLayout()
+        self.total_label = QLabel("")
+        self.total_label.setObjectName("PlayerMuted")
+        roll = QPushButton(f"Lancer {self.count}d{self.size}")
+        roll.clicked.connect(self._roll)
+        footer.addWidget(self.total_label, 1)
+        footer.addWidget(roll)
+        root.addLayout(footer)
+
+        buttons = QDialogButtonBox()
+        self.send_button = buttons.addButton("Envoyer au MJ", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.send_button.setObjectName("PrimaryButton")
+        buttons.accepted.connect(self.accept)
+        root.addWidget(buttons)
+        self._sync()
+
+    def _roll(self) -> None:
+        for box in self.values:
+            box.setValue(random.randint(1, self.size))
+
+    def chosen(self) -> list[int]:
+        return [box.value() for box in self.values]
+
+    def _sync(self, *_args) -> None:
+        values = self.chosen()
+        ready = all(value > 0 for value in values)
+        self.send_button.setEnabled(ready)
+        self.total_label.setText(f"Total : {sum(values)}" if ready and len(values) > 1 else "")
+
+    def accept(self) -> None:
+        values = self.chosen()
+        if not all(value > 0 for value in values):
+            return
+        self.roll_chosen.emit(self.approval_id, self.key, values)
+        super().accept()

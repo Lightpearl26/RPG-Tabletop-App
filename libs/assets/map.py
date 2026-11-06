@@ -367,6 +367,8 @@ class MapElement:
     """
 
     type_name: ClassVar[str] = ""
+    # False for GM-only elements (walls): never baked into the compiled tiles
+    flattened: ClassVar[bool] = True
 
     id: str = field(default_factory=lambda: uuid4().hex)
     visible: bool = True
@@ -684,8 +686,57 @@ class TextElement(MapElement):
         )
 
 
+WALL_COLOR = "#ff6b4a"
+WALL_WIDTH = 6.0
+
+
+@dataclass(slots=True)
+class WallElement(DrawingElement):
+    """
+    A wall segment: it blocks vision, shots, spells and player moves.
+
+    GM-only: it is never flattened into the tiles players download, and the
+    editor and the GM runtime draw it on top of the scene.
+    """
+
+    type_name: ClassVar[str] = "wall"
+    flattened: ClassVar[bool] = False
+
+    tool: DrawTool = DrawTool.LINE
+    stroke_color: str = WALL_COLOR
+    stroke_width: float = WALL_WIDTH
+
+    def bounds(self) -> Rect:
+        return Rect.from_points(self.points).inflate(WALL_WIDTH)
+
+    def render(self, painter: QPainter, media: MediaCache) -> None:
+        if len(self.points) < 2:
+            return
+        painter.save()
+        painter.setOpacity(1.0)
+        pen = QPen(QColor(WALL_COLOR), WALL_WIDTH)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPolyline(QPolygonF([QPointF(p.x, p.y) for p in self.points]))
+        painter.restore()
+
+    def issues(self) -> list[MapIssue]:
+        if len(self.points) < 2:
+            return [MapIssue(ERROR, "A wall needs two points.")]
+        return []
+
+    def segments(self) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+        return [
+            ((first.x, first.y), (second.x, second.y))
+            for first, second in zip(self.points, self.points[1:])
+            if (first.x, first.y) != (second.x, second.y)
+        ]
+
+
 ELEMENT_TYPES: dict[str, type[MapElement]] = {
-    kind.type_name: kind for kind in (ImageElement, DrawingElement, TextElement)
+    kind.type_name: kind for kind in (ImageElement, DrawingElement, TextElement, WallElement)
 }
 
 
@@ -1072,7 +1123,10 @@ class MapAsset:
         signature = {
             "size": [self.width, self.height],
             "background": self.background.to_dict(),
-            "elements": [element.to_dict() for element in self.elements if element.visible],
+            "elements": [
+                element.to_dict() for element in self.elements
+                if element.visible and element.flattened
+            ],
         }
         text = dumps(_canonical(signature), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         return sha256(text.encode("utf-8")).hexdigest()
@@ -1317,12 +1371,19 @@ class MapAsset:
         painter.setClipRect(map_rect.to_qrectf(), Qt.ClipOperation.IntersectClip)
         self.background.render(painter, media, map_rect)
         for element in self.elements:
-            if not element.visible:
+            if not element.visible or not element.flattened:
                 continue
             if view is not None and not element.bounds().intersects(view):
                 continue
             element.render(painter, media)
         painter.restore()
+
+    def walls(self) -> list[WallElement]:
+        """The walls of the map (hidden ones included: they still block)."""
+        return [element for element in self.elements if isinstance(element, WallElement)]
+
+    def wall_segments(self) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+        return [segment for wall in self.walls() for segment in wall.segments()]
 
     @staticmethod
     def _new_image(width: int, height: int) -> QImage:

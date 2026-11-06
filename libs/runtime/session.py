@@ -57,6 +57,9 @@ from .rules import (
 )
 from .live_sync import apply_asset_update, build_asset_update
 from .initiative import check_roll, insertion_index, initiative_order as sort_by_initiative
+from .geometry import wall_between
+from .targeting import map_context, sees
+from .actions import apply_runtime_states
 from .asset_writeback import plan_entity_writeback, write_planned_assets
 
 
@@ -309,6 +312,9 @@ class SessionEventType(str, Enum):
     ENTITY_EDITED = "entity_edited"
     # Entity changes written to the campaign files at session save
     ASSETS_SAVED = "assets_saved"
+    # Combat: d100 of a strike / shoot (journal only), then the resolved result
+    ATTACK_ROLLED = "attack_rolled"
+    ACTION_RESOLVED = "action_resolved"
 
 
 @dataclass(frozen=True, slots=True)
@@ -386,6 +392,9 @@ def _spell_to_dict(spell: Spell) -> dict[str, Any]:
         data["delay"] = spell.delay
     if spell.trigger_condition is not None:
         data["trigger_condition"] = spell.trigger_condition.expression
+    data["area_size"] = int(spell.area_size)
+    if spell.max_targets:
+        data["max_targets"] = int(spell.max_targets)
     return data
 
 
@@ -1043,6 +1052,13 @@ class SessionRuntime:
             self._apply_entity_edit(data)
             return
 
+        if event.type is SessionEventType.ACTION_RESOLVED:
+            apply_runtime_states(self, data)
+            return
+
+        if event.type is SessionEventType.ATTACK_ROLLED:
+            return  # the stamina is a separate ACTION_STAMINA_SPENT event
+
         if event.type is SessionEventType.ASSETS_SAVED:
             for entity_id, info in data.get("entities", {}).items():
                 entity = self.entities.get(str(entity_id))
@@ -1259,9 +1275,20 @@ class SessionRuntime:
         return vision_cells_from_per(entity.per)
 
     def _active_map_asset(self) -> MapAsset:
+        """The active map's asset, read again only when its file changed."""
         if self.active_map_id is None:
             raise RuntimeError("No map is currently active.")
-        return MapAsset.load(self.campaign.map_path(self.active_map_id))
+        map_dir = self.campaign.map_path(self.active_map_id)
+        try:
+            stamp = (self.active_map_id, (map_dir / "map.json").stat().st_mtime_ns)
+        except OSError:
+            stamp = None
+        cached = getattr(self, "_asset_cache", None)
+        if stamp is not None and cached is not None and cached[0] == stamp:
+            return cached[1]
+        asset = MapAsset.load(map_dir)
+        self._asset_cache = (stamp, asset)
+        return asset
 
     def _grid_cell_for_pos(self, pos: Vec2) -> tuple[int, int]:
         asset = self._active_map_asset()
@@ -1283,8 +1310,7 @@ class SessionRuntime:
         if observer is None:
             return []
 
-        origin = self._grid_cell_for_pos(observer.pos)
-        radius = self.vision_radius_cells(observer_entity_id)
+        context = map_context(self)
         visible: list[SessionToken] = []
         for token in state.tokens:
             if token.entity_id == observer_entity_id:
@@ -1292,7 +1318,8 @@ class SessionRuntime:
                 continue
             if token.hidden:
                 continue
-            if chebyshev_distance(origin, self._grid_cell_for_pos(token.pos)) <= radius:
+            # PER radius, and walls hide what is behind them
+            if sees(self, context, observer, token):
                 visible.append(token)
         return visible
 
@@ -1442,6 +1469,9 @@ class SessionRuntime:
         cost = chebyshev_distance(from_cell, to_cell)
         if cost <= 0:
             raise ValueError("The token is already in that grid cell.")
+        context = map_context(self)
+        if wall_between(context.grid, context.walls, from_cell, to_cell):
+            raise ValueError("A wall is in the way: move around it.")
 
         movement_before: Optional[int] = None
         movement_after: Optional[int] = None

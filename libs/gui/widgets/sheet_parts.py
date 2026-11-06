@@ -85,6 +85,7 @@ TARGETING_LABELS = {
     "multi": "Multicible",
     "self": "Soi-même",
     "area": "Zone",
+    "line": "Ligne",
 }
 
 # Same tabs and columns on both sides
@@ -357,6 +358,10 @@ class SpellTile(QFrame):
         tags.addStretch(1)
         targeting = str(spell.get("targeting") or "single")
         tags.addWidget(tag(TARGETING_LABELS.get(targeting, targeting).upper(), TARGETING_COLOR))
+        if targeting == "area":
+            tags.addWidget(tag(f"RAYON {int(spell.get('area_size') or 0)}", TARGETING_COLOR))
+        if targeting == "multi" and spell.get("max_targets"):
+            tags.addWidget(tag(f"{int(spell['max_targets'])} CIBLES MAX", TARGETING_COLOR))
         if spell.get("delay") is not None:
             tags.addWidget(tag(f"DÉLAI {spell['delay']}", DELAY_COLOR))
         policy = str(spell.get("policy") or "instant")

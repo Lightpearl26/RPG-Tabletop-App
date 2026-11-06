@@ -1,0 +1,2292 @@
+diff --git a/libs/gui/player_runtime/connection.py b/libs/gui/player_runtime/connection.py
+index 04349dd..1667057 100644
+--- a/libs/gui/player_runtime/connection.py
++++ b/libs/gui/player_runtime/connection.py
+@@ -123,6 +123,11 @@ class PlayerNetworkController(QObject):
+     def send_initiative(self, value: int) -> None:
+         self._send_command("initiative", ClientCommand.INITIATIVE_ROLL, {"value": int(value)})
+ 
++    def send_dice(self, approval_id: str, key: str, values: list[int]) -> None:
++        self._send_command("dice", ClientCommand.DICE_ROLL, {
++            "approval_id": str(approval_id), "key": str(key), "values": [int(value) for value in values],
++        })
++
+     def request_end_turn(self) -> None:
+         self._send_command("end_turn", ClientCommand.END_TURN_REQUEST)
+ 
+diff --git a/libs/gui/player_runtime/dialogs.py b/libs/gui/player_runtime/dialogs.py
+index cf69893..afe7915 100644
+--- a/libs/gui/player_runtime/dialogs.py
++++ b/libs/gui/player_runtime/dialogs.py
+@@ -197,3 +197,105 @@ class InitiativeRollDialog(QDialog):
+             return
+         self.roll_chosen.emit(self.value.value())
+         super().accept()
++
++
++class DiceRollDialog(QDialog):
++    """
++    The GM's app asks the player to roll dice of an action: the d100 of an
++    attack, a defense or a spell, or damage dice.
++
++    The player rolls here, or types the results of real dice, then sends them.
++    The GM still checks them before anything happens.
++    """
++
++    roll_chosen = Signal(str, str, list)
++
++    PER_ROW = 5
++
++    def __init__(
++        self,
++        approval_id: str,
++        key: str,
++        expression: str,
++        label: str,
++        *,
++        retry: bool = False,
++        parent: QWidget | None = None,
++    ) -> None:
++        super().__init__(parent)
++        self.approval_id = str(approval_id)
++        self.key = str(key)
++        count_text, _sep, size_text = str(expression).lower().partition("d")
++        self.count = max(1, int(count_text or 1))
++        self.size = max(2, int(size_text or 100))
++        self.setWindowTitle("Jet de dés")
++        self.setModal(False)
++        self.setMinimumWidth(360)
++        root = QVBoxLayout(self)
++        title = QLabel(label or f"Lance {expression}")
++        title.setObjectName("PlayerTitle")
++        title.setWordWrap(True)
++        root.addWidget(title)
++        hint_text = (
++            f"Lance {self.count}d{self.size} ici, ou saisis le résultat de tes vrais dés. "
++            "Le MJ vérifie ton jet avant qu'il compte."
++        )
++        if retry:
++            hint_text = "Le MJ a refusé ton jet : relance tes dés. " + hint_text
++        hint = QLabel(hint_text)
++        hint.setWordWrap(True)
++        hint.setObjectName("PlayerMuted")
++        root.addWidget(hint)
++
++        self.values: list[QSpinBox] = []
++        row: QHBoxLayout | None = None
++        for index in range(self.count):
++            if index % self.PER_ROW == 0:
++                row = QHBoxLayout()
++                root.addLayout(row)
++            box = QSpinBox()
++            box.setRange(0, self.size)
++            box.setSpecialValueText("—")
++            box.setAlignment(Qt.AlignmentFlag.AlignCenter)
++            box.setMinimumHeight(44)
++            box.setStyleSheet("font-size: 20px; font-weight: 700;")
++            box.valueChanged.connect(self._sync)
++            self.values.append(box)
++            assert row is not None
++            row.addWidget(box)
++
++        footer = QHBoxLayout()
++        self.total_label = QLabel("")
++        self.total_label.setObjectName("PlayerMuted")
++        roll = QPushButton(f"Lancer {self.count}d{self.size}")
++        roll.clicked.connect(self._roll)
++        footer.addWidget(self.total_label, 1)
++        footer.addWidget(roll)
++        root.addLayout(footer)
++
++        buttons = QDialogButtonBox()
++        self.send_button = buttons.addButton("Envoyer au MJ", QDialogButtonBox.ButtonRole.AcceptRole)
++        self.send_button.setObjectName("PrimaryButton")
++        buttons.accepted.connect(self.accept)
++        root.addWidget(buttons)
++        self._sync()
++
++    def _roll(self) -> None:
++        for box in self.values:
++            box.setValue(random.randint(1, self.size))
++
++    def chosen(self) -> list[int]:
++        return [box.value() for box in self.values]
++
++    def _sync(self, *_args) -> None:
++        values = self.chosen()
++        ready = all(value > 0 for value in values)
++        self.send_button.setEnabled(ready)
++        self.total_label.setText(f"Total : {sum(values)}" if ready and len(values) > 1 else "")
++
++    def accept(self) -> None:
++        values = self.chosen()
++        if not all(value > 0 for value in values):
++            return
++        self.roll_chosen.emit(self.approval_id, self.key, values)
++        super().accept()
+diff --git a/libs/gui/player_runtime/window.py b/libs/gui/player_runtime/window.py
+index 593c542..8eaca5e 100644
+--- a/libs/gui/player_runtime/window.py
++++ b/libs/gui/player_runtime/window.py
+@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
+ from ...net import ClientSettings
+ from ...net.protocol import ChatMessage, CommandMessage, ErrorMessage
+ from .connection import PlayerNetworkController
+-from .dialogs import InitiativeRollDialog, PlayerLoginDialog, TokenInspectDialog
++from .dialogs import DiceRollDialog, InitiativeRollDialog, PlayerLoginDialog, TokenInspectDialog
+ from .map_view import PlayerMapView
+ from .panels import ActionPanel, CharacterPanel, ChatPanel
+ from ..widgets.combat_turn_widget import CombatTurnWidget
+@@ -60,6 +60,8 @@ class PlayerRuntimeWindow(QMainWindow):
+         self.setStyleSheet(PLAYER_RUNTIME_STYLESHEET)
+         self._sheet: CharacterSheetWindow | None = None
+         self._initiative_dialog: InitiativeRollDialog | None = None
++        # Dice the GM's app asked for: (approval id, key) -> dialog
++        self._dice_dialogs: dict[tuple[str, str], DiceRollDialog] = {}
+         self._build_ui()
+         self._connect_signals()
+ 
+@@ -224,6 +226,7 @@ class PlayerRuntimeWindow(QMainWindow):
+         self.map_view.set_has_pending(self._has_pending or not connected)
+         if not connected:
+             self._clear_pending()
++            self._close_all_dice_dialogs()
+             if not self._closing:
+                 self.statusBar().showMessage(message, 8000)
+ 
+@@ -375,12 +378,60 @@ class PlayerRuntimeWindow(QMainWindow):
+             text = f"Initiative envoyée au MJ : {args.get('value', '?')}"
+             self.chat_panel.append_message("Système", text, system=True)
+             self.statusBar().showMessage(text, 5000)
++        elif command == "DICE_ROLL_REQUEST":
++            self._ask_dice(args)
++        elif command == "DICE_ROLL_CANCELLED":
++            closed = self._close_dice_dialog(str(args.get("approval_id", "")), str(args.get("key", "")))
++            if closed and args.get("reason", "rolled") == "rolled":
++                self.chat_panel.append_message("Système", "Le MJ a fixé ce jet à ta place.", system=True)
++        elif command == "DICE_ROLL_ACCEPTED":
++            values = args.get("values", [])
++            shown = ", ".join(str(value) for value in values) if isinstance(values, list) else str(values)
++            text = f"Jet envoyé au MJ : {shown} (total {args.get('total', '?')})."
++            self.chat_panel.append_message("Système", text, system=True)
++            self.statusBar().showMessage(text, 5000)
+         elif command == "ASSET_CHUNK":
+             self.map_view.update()
+         elif command == "ASSET_DONE":
+             self.map_view.update()
+             self.statusBar().showMessage("Synchronisation des ressources de carte terminée", 4000)
+ 
++    # --------------------------------------------------------------- dice
++    def _ask_dice(self, args: dict[str, Any]) -> None:
++        approval_id = str(args.get("approval_id", ""))
++        key = str(args.get("key", ""))
++        self._close_dice_dialog(approval_id, key)
++        try:
++            dialog = DiceRollDialog(
++                approval_id, key, str(args.get("expression", "1d100")), str(args.get("label", "")),
++                retry=bool(args.get("retry", False)), parent=self,
++            )
++        except ValueError:
++            return
++        dialog.roll_chosen.connect(self.controller.send_dice)
++        dialog.finished.connect(lambda _result, ident=(approval_id, key), dialog=dialog: self._forget_dice_dialog(ident, dialog))
++        self._dice_dialogs[(approval_id, key)] = dialog
++        dialog.show()
++        dialog.raise_()
++        dialog.activateWindow()
++        label = str(args.get("label", "")) or "Le MJ te demande un jet."
++        self.chat_panel.append_message("Système", label, system=True)
++
++    def _forget_dice_dialog(self, ident: tuple[str, str], dialog: DiceRollDialog) -> None:
++        if self._dice_dialogs.get(ident) is dialog:
++            self._dice_dialogs.pop(ident, None)
++
++    def _close_dice_dialog(self, approval_id: str, key: str) -> bool:
++        dialog = self._dice_dialogs.pop((approval_id, key), None)
++        if dialog is None:
++            return False
++        dialog.close()
++        return True
++
++    def _close_all_dice_dialogs(self) -> None:
++        for ident in list(self._dice_dialogs):
++            self._close_dice_dialog(*ident)
++
+     # --------------------------------------------------------------- initiative
+     def _ask_initiative(self, entity_name: str) -> None:
+         self._close_initiative_dialog()
+@@ -404,6 +455,9 @@ class PlayerRuntimeWindow(QMainWindow):
+ 
+     def _handle_action_result(self, command: str, args: dict[str, Any]) -> None:
+         self._clear_pending()
++        if command == "ACTION_RESULT" and args.get("success") and args.get("stage") == "attack" and args.get("hit"):
++            # The damage step follows: the player rolls the damage dice, the GM checks them
++            self._set_pending(True, "", "Touché ! Lance tes dés de dégâts, puis le MJ valide.")
+         if not bool(args.get("success", False)):
+             reason = str(args.get("message") or args.get("reason") or "Action refusée.")
+             self.chat_panel.append_message("MJ", reason, system=True)
+@@ -429,6 +483,8 @@ class PlayerRuntimeWindow(QMainWindow):
+             text = "Déplacement effectué."
+         elif command == "END_TURN_RESULT":
+             text = "Ton tour est terminé."
++        elif command == "ACTION_RESULT" and args.get("stage") == "attack":
++            text = f"{str(args.get('message') or ('Touché.' if args.get('hit') else 'Raté.'))}"
+         else:
+             text = str(args.get("message") or "Action validée par le MJ.")
+         self.chat_panel.append_message("Système", text, system=True)
+diff --git a/libs/gui/runtime/combat.py b/libs/gui/runtime/combat.py
+index b6bef42..f9808b8 100644
+--- a/libs/gui/runtime/combat.py
++++ b/libs/gui/runtime/combat.py
+@@ -519,6 +519,38 @@ class CombatPanel(QWidget):
+         else:
+             self.start_button.setText("Lancer l'initiative")
+ 
++    def _refresh_turn_actions(self, entity_id: str) -> None:
++        """Strike, shoot and spells of the entity whose turn it is: the GM makes it act."""
++        try:
++            actions = self.runtime.available_actions(entity_id)
++        except KeyError:
++            actions = {}
++        spells = [
++            {"id": name, "name": name, "cost": info.get("cost", 0), "available": info.get("available", False)}
++            for name, info in actions.get("spells", {}).items()
++        ]
++        strike = actions.get("strike", {})
++        shoot = actions.get("shoot", {})
++        self.turn_widget.set_action_options(
++            strike_cost=int(strike.get("cost", 60)),
++            strike_available=bool(strike.get("available", False)),
++            shoot_cost=int(shoot.get("cost", 60)),
++            shoot_available=bool(shoot.get("available", False)),
++            spells=spells,
++        )
++        player = self.player_lookup(entity_id) if self.player_lookup is not None else None
++        stamina = int(actions.get("stamina_remaining", 0))
++        if player:
++            hint = f"Tour de {player} : il agit depuis son client (tu peux aussi agir pour lui)."
++        else:
++            hint = f"Fais agir l'entité : choisis l'action puis la cible sur la carte. Budget : {stamina}."
++        self.turn_widget.set_permissions(
++            connected=True,
++            can_act=bool(actions.get("combat_actions_enabled", False)),
++            can_end_turn=True,
++            action_hint=hint,
++        )
++
+     def refresh(self, *, reset_list: bool = False) -> None:
+         combat = self.runtime.combat
+         self.roster.keep_only(self.runtime.entities)
+@@ -541,25 +573,7 @@ class CombatPanel(QWidget):
+                 "own_turn": False,
+                 "player_view": False,
+             })
+-            current_entity = self.runtime.entities.get(combat.current_entity_id or "")
+-            spells = []
+-            if current_entity is not None:
+-                spells = [
+-                    {
+-                        "id": name,
+-                        "name": name,
+-                        "cost": int(getattr(spell, "cost", 0) or 0),
+-                        "available": False,
+-                    }
+-                    for name, spell in current_entity.spells.items()
+-                ]
+-            self.turn_widget.set_action_options(spells=spells)
+-            self.turn_widget.set_permissions(
+-                connected=True,
+-                can_act=False,
+-                can_end_turn=True,
+-                action_hint="Les actions directes MJ seront reliées au resolver de combat."
+-            )
++            self._refresh_turn_actions(combat.current_entity_id or "")
+             self.initiative_hint.setText(
+                 "Combat en cours. Une entité ajoutée lance son d20 et prend sa place dans "
+                 "l'ordre : après le tour actuel elle joue ce round, avant elle joue au suivant."
+diff --git a/libs/gui/runtime/map_view.py b/libs/gui/runtime/map_view.py
+index df7982b..076b876 100644
+--- a/libs/gui/runtime/map_view.py
++++ b/libs/gui/runtime/map_view.py
+@@ -13,6 +13,7 @@ from PySide6.QtGui import (
+ from PySide6.QtWidgets import QWidget
+ 
+ from ...assets.map import DrawingElement, DrawTool, MapAsset, MediaCache, Rect, Vec2
++from ...runtime.geometry import GridGeometry, area_cells, chebyshev, line_cells
+ from ...runtime.session import SessionRuntime, SessionToken
+ from .tokens import TOKEN_ENTITY_MIME
+ from ..widgets.token_overlay import draw_token_overlay
+@@ -23,6 +24,9 @@ class RuntimeMapView(QWidget):
+     token_selected = Signal(str)
+     token_context_requested = Signal(str)
+     status_message = Signal(str)
++    # Targets of an action the GM makes an entity do: {"token_ids", "point"}
++    action_targets_chosen = Signal(object)
++    targeting_cancelled = Signal()
+ 
+     MIN_ZOOM = 0.05
+     MAX_ZOOM = 6.0
+@@ -46,6 +50,10 @@ class RuntimeMapView(QWidget):
+         self._drawing_width = 3.0
+         self._drawing_points: list[Vec2] = []
+         self._drawing_active = False
++        # Action targeting (GM acting for an entity): see start_targeting
++        self._targeting: dict | None = None
++        self._target_ids: list[str] = []
++        self._hover_world: Vec2 | None = None
+         self.setMouseTracking(True)
+         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+         self.setAcceptDrops(True)
+@@ -129,9 +137,11 @@ class RuntimeMapView(QWidget):
+                 for wall in self.asset.walls():
+                     wall.render(painter, self.media)
+                 self._draw_tokens(painter)
++                self._draw_targeting(painter)
+                 self._draw_preview(painter)
+             finally:
+                 painter.restore()
++            self._draw_targeting_banner(painter)
+         finally:
+             painter.end()
+ 
+@@ -245,6 +255,189 @@ class RuntimeMapView(QWidget):
+         path.addEllipse(rect)
+         return path
+ 
++    # ------------------------------------------------------------- targeting
++    @property
++    def is_targeting(self) -> bool:
++        return self._targeting is not None
++
++    def start_targeting(self, spec: dict) -> None:
++        """
++        Let the GM pick the targets of an action on the map.
++
++        `spec` comes from `targeting_spec` plus "entity_id" (who acts): valid
++        tokens are circled in green; a click picks one (Enter sends a multi
++        pick), a click on a cell sets an area or a line; Esc cancels.
++        """
++        self.set_drawing_tool(None)
++        self._targeting = dict(spec)
++        allowed = spec.get("allowed")
++        self._targeting["allowed"] = None if allowed is None else {str(item) for item in allowed}
++        self._target_ids = []
++        self._hover_world = None
++        self.setCursor(Qt.CursorShape.CrossCursor)
++        self.setFocus(Qt.FocusReason.OtherFocusReason)
++        self.update()
++
++    def cancel_targeting(self, *, notify: bool = True) -> None:
++        if self._targeting is None:
++            return
++        self._targeting = None
++        self._target_ids = []
++        self._hover_world = None
++        self.unsetCursor()
++        self.update()
++        if notify:
++            self.targeting_cancelled.emit()
++
++    def _finish_targeting(self, token_ids: list[str], point: Vec2 | None = None) -> None:
++        self._targeting = None
++        self._target_ids = []
++        self._hover_world = None
++        self.unsetCursor()
++        self.update()
++        self.action_targets_chosen.emit({
++            "token_ids": list(token_ids),
++            "point": [point.x, point.y] if point is not None else None,
++        })
++
++    def _grid_geometry(self) -> GridGeometry | None:
++        if self.asset is None or not self.asset.grid.enabled or self.asset.grid.cell_size <= 0:
++            return None
++        grid = self.asset.grid
++        return GridGeometry(float(grid.cell_size), float(grid.offset_x), float(grid.offset_y))
++
++    def _actor_cell(self, grid: GridGeometry) -> tuple[int, int] | None:
++        state = self.runtime.active_map
++        entity_id = str((self._targeting or {}).get("entity_id", ""))
++        token = state.token_for_entity(entity_id) if state is not None and entity_id else None
++        return grid.cell_of(token.pos.x, token.pos.y) if token is not None else None
++
++    def _targeting_cells(self) -> list[tuple[int, int]]:
++        """Cells the area or line under the cursor would cover."""
++        spec = self._targeting
++        grid = self._grid_geometry()
++        if spec is None or grid is None or self._hover_world is None or self.asset is None:
++            return []
++        aim = grid.cell_of(self._hover_world.x, self._hover_world.y)
++        walls = self.asset.wall_segments()
++        if spec.get("mode") == "area":
++            return area_cells(grid, walls, aim, int(spec.get("area_size", 0)))
++        if spec.get("mode") == "line":
++            origin = self._actor_cell(grid)
++            if origin is None or origin == aim:
++                return []
++            return line_cells(grid, walls, origin, aim, int(spec.get("range", 0)))
++        return []
++
++    def _draw_targeting(self, painter: QPainter) -> None:
++        spec = self._targeting
++        state = self.runtime.active_map
++        if spec is None or state is None:
++            return
++        width = max(1.5, 3.0 / self.zoom)
++        actor = state.token_for_entity(str(spec.get("entity_id", "")))
++        if actor is not None:
++            painter.setBrush(Qt.BrushStyle.NoBrush)
++            painter.setPen(QPen(QColor("#fab387"), width))
++            painter.drawEllipse(self._token_rect(actor).adjusted(-4, -4, 4, 4))
++        allowed = spec.get("allowed")
++        if allowed is not None:
++            for token in state.tokens:
++                if token.id in self._target_ids:
++                    color = QColor("#a6e3a1")
++                    fill = QColor("#a6e3a1")
++                    fill.setAlpha(90)
++                    painter.setBrush(QBrush(fill))
++                elif token.id in allowed:
++                    color = QColor("#40c057")
++                    painter.setBrush(Qt.BrushStyle.NoBrush)
++                else:
++                    continue
++                painter.setPen(QPen(color, width))
++                painter.drawEllipse(self._token_rect(token).adjusted(-2, -2, 2, 2))
++            return
++        grid = self._grid_geometry()
++        if grid is None:
++            return
++        size = grid.cell_size
++        fill = QColor("#fab387")
++        fill.setAlpha(70)
++        painter.setPen(QPen(QColor("#fab387"), max(1.0, 1.5 / self.zoom)))
++        painter.setBrush(QBrush(fill))
++        for column, row in self._targeting_cells():
++            painter.drawRect(QRectF(grid.offset_x + column * size, grid.offset_y + row * size, size, size))
++        origin = self._actor_cell(grid)
++        reach = int(spec.get("range", 0))
++        if spec.get("mode") == "area" and origin is not None and reach > 0:
++            painter.setBrush(Qt.BrushStyle.NoBrush)
++            painter.setPen(QPen(QColor("#fab387"), max(1.0, 1.25 / self.zoom), Qt.PenStyle.DashLine))
++            painter.drawRect(QRectF(
++                grid.offset_x + (origin[0] - reach) * size,
++                grid.offset_y + (origin[1] - reach) * size,
++                (reach * 2 + 1) * size,
++                (reach * 2 + 1) * size,
++            ))
++
++    def _draw_targeting_banner(self, painter: QPainter) -> None:
++        """What the GM is picking, over the map (the status bar gets overwritten)."""
++        text = str((self._targeting or {}).get("label", ""))
++        if not text:
++            return
++        metrics = painter.fontMetrics()
++        width = metrics.horizontalAdvance(text) + 28
++        rect = QRectF((self.width() - width) / 2, 12, width, metrics.height() + 14)
++        background = QColor("#11141a")
++        background.setAlpha(225)
++        painter.setPen(QPen(QColor("#fab387"), 1.5))
++        painter.setBrush(QBrush(background))
++        painter.drawRoundedRect(rect, 8, 8)
++        painter.setPen(QColor("#eef2f7"))
++        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
++
++    def _targeting_click(self, world: Vec2) -> None:
++        spec = self._targeting
++        if spec is None:
++            return
++        mode = str(spec.get("mode", ""))
++        allowed = spec.get("allowed")
++        if allowed is None:  # area or line: a cell
++            grid = self._grid_geometry()
++            if grid is None:
++                self.status_message.emit("Cette action demande une grille active.")
++                return
++            cell = grid.cell_of(world.x, world.y)
++            origin = self._actor_cell(grid)
++            reach = int(spec.get("range", 0))
++            if origin is not None and mode == "line" and cell == origin:
++                self.status_message.emit("Choisis une autre case que celle du lanceur pour la direction.")
++                return
++            if origin is not None and mode == "area" and chebyshev(origin, cell) > reach:
++                self.status_message.emit(f"Hors de portée : la zone doit être centrée à {reach} case(s) au plus.")
++                return
++            center = grid.center(cell)
++            self._finish_targeting([], Vec2(center[0], center[1]))
++            return
++        token = self.token_at(world)
++        if token is None:
++            return
++        if token.id not in allowed:
++            self.status_message.emit(
++                "Cible impossible : hors de portée, hors de vue ou derrière un obstacle. "
++                "Tu pourras forcer la cible dans la demande, onglet Demandes."
++            )
++            return
++        if mode != "multi":
++            self._finish_targeting([token.id])
++            return
++        if token.id in self._target_ids:
++            self._target_ids.remove(token.id)
++        elif spec.get("max") and len(self._target_ids) >= int(spec["max"]):
++            self.status_message.emit(f"Ce sort cible au plus {int(spec['max'])} token(s).")
++        else:
++            self._target_ids.append(token.id)
++        self.status_message.emit(f"{len(self._target_ids)} cible(s) — Entrée pour valider, Échap pour annuler.")
++        self.update()
++
+     def _draw_preview(self, painter: QPainter) -> None:
+         if not self._drawing_active or not self._drawing_points or self.media is None:
+             return
+@@ -264,6 +457,8 @@ class RuntimeMapView(QWidget):
+         preview.render(painter, self.media)
+ 
+     def set_drawing_tool(self, tool: DrawTool | str | None) -> None:
++        if tool not in (None, "select", "selection"):
++            self.cancel_targeting()
+         if tool in (None, "select", "selection"):
+             self._drawing_tool = None
+         elif str(tool).lower() == "eraser":
+@@ -397,6 +592,10 @@ class RuntimeMapView(QWidget):
+             return
+ 
+         world = self.screen_to_world(event.position())
++        if self._targeting is not None and event.button() == Qt.MouseButton.LeftButton:
++            self._targeting_click(world)
++            event.accept()
++            return
+         if event.button() == Qt.MouseButton.LeftButton and self._drawing_tool == "eraser":
+             self._erase_at(world)
+             event.accept()
+@@ -466,6 +665,11 @@ class RuntimeMapView(QWidget):
+             return
+ 
+         world = self.screen_to_world(event.position())
++        if self._targeting is not None:
++            if self._targeting.get("allowed") is None:
++                self._hover_world = world
++                self.update()
++            return
+         self.status_message.emit(f"x={world.x:.1f}, y={world.y:.1f}  zoom={self.zoom:.2f}x")
+         super().mouseMoveEvent(event)
+ 
+@@ -527,6 +731,18 @@ class RuntimeMapView(QWidget):
+         event.accept()
+ 
+     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt API
++        if self._targeting is not None:
++            if event.key() == Qt.Key.Key_Escape:
++                self.cancel_targeting()
++                event.accept()
++                return
++            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self._targeting.get("mode") == "multi":
++                if not self._target_ids:
++                    self.status_message.emit("Choisis au moins une cible.")
++                else:
++                    self._finish_targeting(list(self._target_ids))
++                event.accept()
++                return
+         if (
+             event.key() == Qt.Key.Key_Delete
+             and self.selected_token_id
+diff --git a/libs/gui/runtime/pending.py b/libs/gui/runtime/pending.py
+index af9dcc6..86065de 100644
+--- a/libs/gui/runtime/pending.py
++++ b/libs/gui/runtime/pending.py
+@@ -13,6 +13,27 @@ from ...net.models import PendingKind, PendingRequest
+ from ...runtime.session import SessionRuntime
+ 
+ 
++KIND_LABELS = {"strike": "Strike", "shoot": "Shoot"}
++
++
++def describe(pending: PendingRequest, runtime: SessionRuntime) -> str:
++    """One line for the request list: who does what."""
++    entity = runtime.entities.get(pending.entity_id)
++    actor = entity.name if entity is not None else pending.entity_id
++    kind = str(pending.preview.get("kind", ""))
++    if pending.kind is PendingKind.ACTION:
++        what = f"sort {pending.preview.get('spell')}" if kind == "spell" else KIND_LABELS.get(kind, kind)
++        text = f"{actor} — {what} (d100)"
++    elif pending.kind is PendingKind.DAMAGE:
++        text = f"{actor} — dégâts {pending.preview.get('damage', '')}"
++    else:
++        text = f"{actor} — {pending.kind.value}"
++    waiting = sorted({die.owner for die in pending.proposed_dice.values() if die.awaiting and die.owner})
++    if waiting:
++        text += f" · attend {', '.join(waiting)}"
++    return text
++
++
+ class PendingPanel(QWidget):
+     approve_requested = Signal(str, object, object)
+     reject_requested = Signal(str, str)
+@@ -26,7 +47,7 @@ class PendingPanel(QWidget):
+         self.setObjectName("RuntimePanel")
+         root = QVBoxLayout(self)
+         root.setContentsMargins(8, 8, 8, 8)
+-        title = QLabel("DEMANDES JOUEURS")
++        title = QLabel("DEMANDES À VALIDER")
+         title.setObjectName("RuntimeHeading")
+         root.addWidget(title)
+         self.list = QListWidget()
+@@ -38,8 +59,8 @@ class PendingPanel(QWidget):
+         self.targets = QListWidget()
+         self.targets.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+         root.addWidget(self.targets)
+-        self.dice = QTableWidget(0, 5)
+-        self.dice.setHorizontalHeaderLabels(["Clé", "Libellé", "Expression", "Valeurs", "Total"])
++        self.dice = QTableWidget(0, 6)
++        self.dice.setHorizontalHeaderLabels(["Clé", "Libellé", "Expression", "Valeurs", "Total", "Lancé par"])
+         self.dice.horizontalHeader().setStretchLastSection(True)
+         root.addWidget(self.dice)
+         self.resolver_note = QLabel("")
+@@ -70,14 +91,17 @@ class PendingPanel(QWidget):
+             if item.data(Qt.ItemDataRole.UserRole) == pending.approval_id:
+                 existing = item
+                 break
+-        label = f"{pending.username} — {pending.kind.value}"
++        label = describe(pending, self.runtime)
+         if existing is None:
+             existing = QListWidgetItem(label)
+             existing.setData(Qt.ItemDataRole.UserRole, pending.approval_id)
+             self.list.addItem(existing)
+         else:
+             existing.setText(label)
+-        self.list.setCurrentItem(existing)
++        if self.list.currentItem() is existing:
++            self._show_current()  # a player just sent a die: show it
++        else:
++            self.list.setCurrentItem(existing)
+ 
+     def remove(self, approval_id: str) -> None:
+         self._pending.pop(approval_id, None)
+@@ -108,21 +132,34 @@ class PendingPanel(QWidget):
+             self.resolver_note.setText("")
+             self._set_controls(False)
+             return
+-        entity = self.runtime.entities.get(pending.entity_id)
+-        name = entity.name if entity else pending.entity_id
+-        self.summary.setText(
+-            f"Joueur : {pending.username}\nEntity : {name}\nType : {pending.kind.value}\n"
+-            f"Aperçu : {pending.preview}"
+-        )
++        lines = [describe(pending, self.runtime), f"Demandé par : {pending.username}"]
++        names = [
++            self.runtime.entities[entity_id].name
++            for entity_id in pending.preview.get("target_entities", [])
++            if entity_id in self.runtime.entities
++        ]
++        if names:
++            lines.append(f"Touche : {', '.join(names)}")
++        if pending.preview.get("stamina_cost") is not None:
++            lines.append(
++                f"Coût : {pending.preview['stamina_cost']} STA "
++                f"(reste {pending.preview.get('stamina_remaining', '?')} ce tour)"
++            )
++        self.summary.setText("\n".join(lines))
+         self._populate_targets(pending)
+         self._populate_dice(pending)
+-        action_blocked = pending.kind is PendingKind.ACTION and not self.actions_executable
+-        self.resolver_note.setText(
+-            "Le resolver d’action n’est pas encore connecté : les cibles et les dés peuvent être vérifiés, mais l’approbation reste désactivée."
+-            if action_blocked else ""
+-        )
++        waiting = sorted({die.owner for die in pending.proposed_dice.values() if die.awaiting and die.owner})
++        if waiting:
++            self.resolver_note.setText(
++                f"En attente des dés de {', '.join(waiting)}. Approuver maintenant garde les "
++                "valeurs tirées par l'app à leur place."
++            )
++        elif pending.kind is PendingKind.DAMAGE and pending.proposed_dice.get("damage") and pending.proposed_dice["damage"].owner:
++            self.resolver_note.setText("Refuser demande au joueur de relancer ses dés de dégâts.")
++        else:
++            self.resolver_note.setText("")
+         self._set_controls(True)
+-        self.approve_button.setEnabled(not action_blocked)
++        self.approve_button.setEnabled(True)
+         self.reroll_button.setEnabled(bool(pending.proposed_dice))
+         self.targets.setEnabled(pending.kind is PendingKind.ACTION)
+         self.dice.setEnabled(bool(pending.proposed_dice))
+@@ -148,9 +185,12 @@ class PendingPanel(QWidget):
+         self.dice.setRowCount(len(entries))
+         for row, (key, die) in enumerate(entries):
+             vals = ",".join(str(v) for v in die.values)
+-            for col, value in enumerate((key, die.label, die.expression, vals, str(die.total))):
++            owner = die.owner or "App"
++            if die.awaiting:
++                owner += " (en attente)"
++            for col, value in enumerate((key, die.label, die.expression, vals, str(die.total), owner)):
+                 item = QTableWidgetItem(value)
+-                if col in (0, 1, 4):
++                if col in (0, 1, 4, 5):
+                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                 self.dice.setItem(row, col, item)
+         self.dice.resizeColumnsToContents()
+diff --git a/libs/gui/runtime/window.py b/libs/gui/runtime/window.py
+index be57abe..8c4b9b0 100644
+--- a/libs/gui/runtime/window.py
++++ b/libs/gui/runtime/window.py
+@@ -23,11 +23,15 @@ from PySide6.QtWidgets import (
+ 
+ from ...assets.map import DrawTool
+ from ...net.assets import AssetCatalog
++from ...net.commands import ActionIntent, ActionKind, TargetSelection
++from ...net.gateway import GM_USER, GatewayResult, RuntimeNetworkGateway
++from ...net.models import PendingRequest, PendingStatus
+ from ...net.config import RelaySettings, ServerSettings, TLSSettings
+ from ...net.protocol import ChatMessage
+ from ...net.runner import AsyncioLoopThread
+ from ...net.server import RPGNetworkServer, create_runtime_server
+ from ...runtime.session import Session, SessionRuntime
++from ...runtime.targeting import TargetingError, targeting_spec
+ from ..theme import CAMPAIGN_MANAGER_STYLESHEET
+ from ..widgets.chat_panel import ChatPanel
+ from .bridge import RuntimeNetworkBridge
+@@ -64,6 +68,19 @@ class RuntimeWindow(QMainWindow):
+         self.network_loop: AsyncioLoopThread | None = None
+         self.server: RPGNetworkServer | None = None
+         self.bridge = RuntimeNetworkBridge(self)
++        # One request list for the whole session: player requests (through the
++        # server) and the actions the GM makes entities do, server or not.
++        self.gateway = RuntimeNetworkGateway(
++            runtime,
++            action_preparer=action_preparer,
++            action_executor=action_executor,
++            require_gm_approval=True,
++        )
++        self.gateway.on_pending = self.bridge.on_pending
++        self.gateway.on_pending_updated = self.bridge.on_pending_updated
++        self.gateway.on_initiative = self.bridge.on_initiative
++        # Action waiting for its targets on the map: (entity id, kind, spell name)
++        self._gm_action: tuple[str, str, str] | None = None
+         self._last_seq = -1
+         self._closing = False
+         self._server_starting = False
+@@ -237,12 +254,13 @@ class RuntimeWindow(QMainWindow):
+ 
+         self.pending_panel = PendingPanel(
+             self.runtime,
+-            actions_executable=self.action_executor is not None,
++            actions_executable=True,
+             parent=self,
+         )
+         self.pending_dock = self._dock(
+             "Demandes joueurs", self.pending_panel, Qt.DockWidgetArea.RightDockWidgetArea
+         )
++        self.pending_dock.setWindowTitle("Demandes")  # players' and GM's (object name kept for layouts)
+         self.tabifyDockWidget(self.token_dock, self.pending_dock)
+ 
+         self.player_assignment_panel = PlayerAssignmentPanel(self.runtime, self)
+@@ -324,6 +342,8 @@ class RuntimeWindow(QMainWindow):
+         self.map_view.status_message.connect(self.statusBar().showMessage)
+         self.combat_panel.runtime_changed.connect(self._runtime_changed)
+         self.combat_panel.action_requested.connect(self._gm_action_requested)
++        self.map_view.action_targets_chosen.connect(self._gm_targets_chosen)
++        self.map_view.targeting_cancelled.connect(self._gm_targeting_cancelled)
+         self.combat_panel.player_lookup = self._player_for_entity
+         self.combat_panel.initiative_requested.connect(self._request_initiative)
+         self.combat_panel.initiative_cancelled.connect(self._cancel_initiative)
+@@ -408,6 +428,11 @@ class RuntimeWindow(QMainWindow):
+         seq = self.runtime.session.current_seq
+         if force or seq != self._last_seq:
+             self._last_seq = seq
++            combat = self.runtime.combat
++            if self._gm_action is not None and (
++                combat is None or combat.current_entity_id != self._gm_action[0]
++            ):
++                self.map_view.cancel_targeting()  # the turn moved on
+             self.map_view.reload_active_map(reset_camera=False)
+             self.token_panel.refresh()
+             self._refresh_sheets()
+@@ -530,12 +555,84 @@ class RuntimeWindow(QMainWindow):
+         for sheet in list(self._sheets.values()):
+             sheet.refresh()
+ 
++    # ------------------------------------------------------------- GM actions
+     def _gm_action_requested(self, kind: str, action_id: str) -> None:
+-        self.statusBar().showMessage(
+-            f"Action MJ {kind}{f' : {action_id}' if action_id else ''} : resolver direct à connecter.",
+-            6000,
++        """The GM makes the entity whose turn it is strike, shoot or cast."""
++        combat = self.runtime.combat
++        entity_id = combat.current_entity_id if combat is not None else None
++        entity_id = str(entity_id or "")
++        entity = self.runtime.entities.get(entity_id)
++        if entity is None:
++            return
++        spell = None
++        if kind == "spell":
++            spell = entity.get_spell(action_id)
++            if spell is None:
++                QMessageBox.warning(self, "Action", f"{entity.name} ne connaît pas le sort {action_id}.")
++                return
++        if spell is not None and str(spell.targeting) == "self":
++            self._submit_gm_action(entity_id, kind, action_id, TargetSelection())
++            return
++        try:
++            spec = targeting_spec(self.runtime, entity_id, kind, spell, gm=True)
++        except TargetingError as exc:
++            QMessageBox.warning(self, "Action", str(exc))
++            return
++        what = {"strike": "Strike", "shoot": "Shoot"}.get(kind, action_id)
++        if spec["mode"] == "multi":
++            how = "clique les cibles en vert puis Entrée"
++        elif spec["allowed"] is None:
++            how = "clique la case visée"
++        else:
++            how = "clique une cible en vert"
++        if spec["allowed"] is not None and not spec["allowed"]:
++            how = "aucune cible valide en vue"
++        spec["entity_id"] = entity_id
++        spec["label"] = f"{entity.name} · {what} — {how} · Échap pour annuler"
++        self._gm_action = (entity_id, kind, action_id)
++        self._map_tool_actions["Sélection"].setChecked(True)
++        self.map_view.start_targeting(spec)
++        self.statusBar().showMessage(spec["label"], 8000)
++
++    def _gm_targets_chosen(self, selection: dict) -> None:
++        action, self._gm_action = self._gm_action, None
++        if action is None:
++            return
++        point = selection.get("point")
++        self._submit_gm_action(
++            action[0], action[1], action[2],
++            TargetSelection(
++                token_ids=tuple(str(item) for item in selection.get("token_ids", [])),
++                point=(float(point[0]), float(point[1])) if point is not None else None,
++            ),
+         )
+ 
++    def _gm_targeting_cancelled(self) -> None:
++        self._gm_action = None
++        self.statusBar().showMessage("Action annulée.", 3000)
++
++    def _submit_gm_action(self, entity_id: str, kind: str, action_id: str, selection: TargetSelection) -> None:
++        intent = ActionIntent(ActionKind(kind), action_id if kind == "spell" else "", selection)
++        self.statusBar().clearMessage()
++        if self._network_active():
++            self._submit(self._gm_action_async(entity_id, intent), "gm_action")
++            return
++        try:
++            self.gateway.submit_gm_action(entity_id, intent)
++        except (ValueError, KeyError, PermissionError, RuntimeError) as exc:
++            QMessageBox.warning(self, "Action impossible", str(exc))
++            return
++        self._show_requests()
++
++    async def _gm_action_async(self, entity_id: str, intent: ActionIntent) -> PendingRequest:
++        pending, result = self.gateway.submit_gm_action(entity_id, intent)
++        await self.server.deliver(result)
++        return pending
++
++    def _show_requests(self) -> None:
++        self.pending_dock.show()
++        self.pending_dock.raise_()
++
+     # ------------------------------------------------------------- network
+     def _server_settings(self) -> ServerSettings:
+         self.network_panel.save_settings()
+@@ -588,11 +685,9 @@ class RuntimeWindow(QMainWindow):
+             self.server = create_runtime_server(
+                 self.runtime,
+                 settings,
+-                action_preparer=self.action_preparer,
+-                action_executor=self.action_executor,
++                gateway=self.gateway,
+                 asset_catalog=self._asset_catalog(),
+                 on_log=self.bridge.on_log,
+-                on_pending=self.bridge.on_pending,
+                 on_pending_updated=self.bridge.on_pending_updated,
+                 on_client_connected=self.bridge.on_client_connected,
+                 on_client_disconnected=self.bridge.on_client_disconnected,
+@@ -652,11 +747,16 @@ class RuntimeWindow(QMainWindow):
+         if error is not None:
+             if label == "gm_chat":
+                 self.chat_panel.append_message("Système", str(error), system=True)
++            elif label == "gm_action" or label.startswith(("approve:", "reject:")):
++                QMessageBox.warning(self, "Action impossible", str(error))
++            elif label == "cancel_die":
++                pass
+             else:
+                 QMessageBox.critical(self, "Runtime réseau", str(error))
+             if label == "server_started":
+                 self._server_starting = False
+                 self._server_stopping = False
++                self._detach_gateway()
+                 self.network_panel.set_running(False)
+                 self.player_assignment_panel.set_server_running(False)
+                 self.chat_panel.set_connected(False)
+@@ -690,16 +790,18 @@ class RuntimeWindow(QMainWindow):
+         elif label == "server_stopped":
+             self._server_stopping = False
+             self._server_starting = False
++            self._detach_gateway()
+             self.network_panel.set_running(False)
+             self.player_assignment_panel.set_server_running(False)
+             self.chat_panel.set_connected(False)
+             self.server = None
+             self._shutdown_network_runner()
+             self.refresh_all(force=True)
++        elif label == "gm_action":
++            self._show_requests()
+         elif label.startswith("approve:") or label.startswith("reject:"):
+-            approval_id = label.split(":", 1)[1]
+-            self.pending_panel.remove(approval_id)
+-            self.refresh_all(force=True)
++            pending, result = result
++            self._pending_handled(pending, result)
+         elif label.startswith("bind:"):
+             self.refresh_all(force=True)
+ 
+@@ -744,30 +846,94 @@ class RuntimeWindow(QMainWindow):
+             return
+         self._submit(self.server.bind_player(username, entity_id), f"bind:{username}")
+ 
++    # ------------------------------------------------------------- requests
++    def _network_active(self) -> bool:
++        return self.server is not None and self.server.is_running and self.network_loop is not None
++
++    def _detach_gateway(self) -> None:
++        """No server any more: nobody is connected, requests are handled here."""
++        self.gateway.on_pending = self.bridge.on_pending
++        self.gateway.is_connected = lambda _username: False
++
++    def _awaiting_dice(self, approval_id: str) -> dict[str, str]:
++        """Dice of a request still waiting for a player: key -> player."""
++        try:
++            pending = self.gateway.pending(approval_id)
++        except KeyError:
++            return {}
++        return {key: die.owner for key, die in pending.proposed_dice.items() if die.awaiting and die.owner}
++
++    def _close_player_dice(self, approval_id: str, before: dict[str, str]) -> None:
++        """The GM set dice a player was asked to roll: close the player's dialog."""
++        still = self._awaiting_dice(approval_id)
++        for key, owner in before.items():
++            if key not in still and self._network_active():
++                self._submit(self.server.cancel_die(owner, approval_id, key), "cancel_die")
++
++    def _pending_handled(self, pending: PendingRequest, result: GatewayResult) -> None:
++        if pending.status is PendingStatus.WAITING:  # damage dice asked again
++            self.pending_panel.add_or_update(pending)
++        else:
++            self.pending_panel.remove(pending.approval_id)
++        self.refresh_all(force=True)
++        if pending.username == GM_USER:  # players get the result on their client
++            entity = self.runtime.entities.get(pending.entity_id)
++            for reply in result.replies:
++                message = str(reply.args.get("message", ""))
++                if message:
++                    who = f"{entity.name} — " if entity is not None else ""
++                    self.statusBar().showMessage(who + message, 10000)
++
++    async def _approve_async(self, approval_id: str):
++        pending, result = self.gateway.approve(approval_id)
++        await self.server.deliver(result, pending.username)
++        return pending, result
++
++    async def _reject_async(self, approval_id: str, reason: str):
++        pending, result = self.gateway.reject(approval_id, reason=reason)
++        await self.server.deliver(result, pending.username)
++        return pending, result
++
+     def approve_pending(self, approval_id: str, targets, dice) -> None:
+-        if self.server is None:
+-            return
++        before = self._awaiting_dice(approval_id)
+         try:
+             if targets is not None or dice is not None:
+-                self.server.edit_pending_action(approval_id, targets=targets, dice=dice)
++                pending = self.gateway.edit_action(approval_id, targets=targets, dice=dice)
++                self.pending_panel.add_or_update(pending)
++        except Exception as exc:
++            QMessageBox.warning(self, "Demande", str(exc))
++            return
++        self._close_player_dice(approval_id, before)
++        if self._network_active():
++            self._submit(self._approve_async(approval_id), f"approve:{approval_id}")
++            return
++        try:
++            pending, result = self.gateway.approve(approval_id)
+         except Exception as exc:
+-            QMessageBox.warning(self, "Demande joueur", str(exc))
++            QMessageBox.warning(self, "Action impossible", str(exc))
+             return
+-        self._submit(self.server.approve_pending(approval_id), f"approve:{approval_id}")
++        self._pending_handled(pending, result)
+ 
+     def reject_pending(self, approval_id: str, reason: str) -> None:
+-        if self.server is None:
++        if self._network_active():
++            self._submit(self._reject_async(approval_id, reason), f"reject:{approval_id}")
++            return
++        try:
++            pending, result = self.gateway.reject(approval_id, reason=reason)
++        except Exception as exc:
++            QMessageBox.warning(self, "Demande", str(exc))
+             return
+-        self._submit(self.server.reject_pending(approval_id, reason=reason), f"reject:{approval_id}")
++        self._pending_handled(pending, result)
+ 
+     def reroll_pending(self, approval_id: str, dice_key: str) -> None:
+-        if self.server is None:
+-            return
++        before = self._awaiting_dice(approval_id)
+         try:
+-            pending = self.server.reroll_pending_die(approval_id, dice_key)
+-            self.pending_panel.add_or_update(pending)
++            pending = self.gateway.reroll(approval_id, dice_key)
+         except Exception as exc:
+-            QMessageBox.warning(self, "Demande joueur", str(exc))
++            QMessageBox.warning(self, "Demande", str(exc))
++            return
++        self._close_player_dice(approval_id, before)
++        self.pending_panel.add_or_update(pending)
+ 
+     def broadcast_runtime_sync(self) -> None:
+         if self.server is not None and self.server.is_running and self.network_loop is not None:
+diff --git a/libs/net/commands.py b/libs/net/commands.py
+index 9ece9be..487525a 100644
+--- a/libs/net/commands.py
++++ b/libs/net/commands.py
+@@ -19,6 +19,8 @@ class ClientCommand(str, Enum):
+     ASSET_MANIFEST_REQUEST = "ASSET_MANIFEST_REQUEST"
+     ASSET_REQUEST = "ASSET_REQUEST"
+     INITIATIVE_ROLL = "INITIATIVE_ROLL"
++    # A player's result for one die of a pending request
++    DICE_ROLL = "DICE_ROLL"
+ 
+ 
+ class ServerCommand(str, Enum):
+@@ -46,6 +48,10 @@ class ServerCommand(str, Enum):
+     INITIATIVE_REQUEST = "INITIATIVE_REQUEST"
+     INITIATIVE_CANCELLED = "INITIATIVE_CANCELLED"
+     INITIATIVE_RESULT = "INITIATIVE_RESULT"
++    # The GM's server asks a player to roll one die of a pending request
++    DICE_ROLL_REQUEST = "DICE_ROLL_REQUEST"
++    DICE_ROLL_CANCELLED = "DICE_ROLL_CANCELLED"
++    DICE_ROLL_ACCEPTED = "DICE_ROLL_ACCEPTED"
+ 
+ 
+ class ActionKind(str, Enum):
+diff --git a/libs/net/gateway.py b/libs/net/gateway.py
+index ac68192..1e0fbcb 100644
+--- a/libs/net/gateway.py
++++ b/libs/net/gateway.py
+@@ -6,6 +6,7 @@ from typing import Any, Callable
+ 
+ from ..assets.map import MapAsset, Vec2
+ from ..dice import DiceCheck
++from ..runtime.actions import ActionError, CombatResolver, check_dice_values, spell_dice_keys
+ from ..runtime.initiative import check_roll
+ from ..runtime.targeting import TargetingError, resolve_targets
+ from ..runtime.rules import (
+@@ -24,12 +25,17 @@ PendingCallback = Callable[[PendingRequest], None]
+ # username, entity id, d20 result
+ InitiativeCallback = Callable[[str, str, int], None]
+ 
++# Requester name of the actions the GM starts for the entities it controls
++GM_USER = "MJ"
++
+ 
+ @dataclass(slots=True)
+ class GatewayResult:
+     replies: list[NetworkMessage] = field(default_factory=list)
+     pending: PendingRequest | None = None
+     broadcast_sync: bool = False
++    # Messages for other players than the requester: (username, message)
++    outbox: list[tuple[str, NetworkMessage]] = field(default_factory=list)
+ 
+ 
+ class RuntimeNetworkGateway:
+@@ -60,6 +66,12 @@ class RuntimeNetworkGateway:
+         # Initiative asked to a player and not answered yet: username -> entity id
+         self._initiative_requests: dict[str, str] = {}
+         self.on_initiative: InitiativeCallback | None = None
++        # Built-in resolution of strike, shoot and spells
++        self.resolver = CombatResolver(runtime)
++        # Set by the server: whether a player is connected right now
++        self.is_connected: Callable[[str], bool] = lambda _username: False
++        # Called when a player sent a die of a pending request
++        self.on_pending_updated: PendingCallback | None = None
+ 
+     # ---------------------------------------------------------------- binding
+     def bind(self, username: str, entity_id: str) -> None:
+@@ -113,7 +125,7 @@ class RuntimeNetworkGateway:
+             raise PermissionError("No Entity is bound to this player.")
+         projection = build_player_runtime_projection(self.runtime, entity_id)
+         actions = projection.setdefault("actions", {})
+-        actions["resolver_enabled"] = self.action_executor is not None
++        actions["resolver_enabled"] = True  # built-in resolver, or the custom executor
+         return projection
+ 
+     # ------------------------------------------------------------ pending API
+@@ -151,6 +163,110 @@ class RuntimeNetworkGateway:
+             pending=pending,
+         )
+ 
++    # ------------------------------------------------------------ player dice
++    def _player_of(self, entity_id: str | None) -> str:
++        """Connected player who controls an entity, "" when the app rolls for it."""
++        if not entity_id:
++            return ""
++        username = self.username_for(entity_id)
++        return username if username and self.is_connected(username) else ""
++
++    def _token_entity(self, token_id: str) -> str | None:
++        state = self.runtime.active_map
++        token = state.token_by_id(str(token_id)) if state is not None else None
++        return token.entity_id if token is not None else None
++
++    def _player_label(self, pending: PendingRequest, die: DiceProposal) -> str:
++        """What the player is asked to roll, without naming hidden attackers."""
++        kind = str(pending.preview.get("kind", ""))
++        action = {"strike": "un strike", "shoot": "un shoot"}.get(kind, "un sort")
++        if die.key == "attacker":
++            return f"Ton d100 d'attaque ({kind})"
++        if die.key.startswith("defender:"):
++            return f"Tu es visé par {action} : ton d100 de défense"
++        if die.key == "damage":
++            return f"Tes dés de dégâts ({kind}) : {die.expression}"
++        parts = die.key.split(":")
++        stat = parts[-1].upper()
++        if parts[0] == "user":
++            return f"{pending.preview.get('spell', 'Sort')} : ton d100 de {stat}"
++        return f"Tu es visé par un sort : ton d100 de {stat}"
++
++    def _ask_owners(self, pending: PendingRequest, result: GatewayResult, *, retry: bool = False) -> None:
++        """Ask every player who owns a die of `pending` to roll it."""
++        for die in pending.proposed_dice.values():
++            if not die.owner or die.owner == GM_USER:
++                continue
++            die.awaiting = True
++            result.outbox.append((die.owner, CommandMessage(
++                ServerCommand.DICE_ROLL_REQUEST.value,
++                {
++                    "approval_id": pending.approval_id,
++                    "key": die.key,
++                    "expression": die.expression,
++                    "label": self._player_label(pending, die),
++                    "retry": retry,
++                },
++            )))
++
++    def _cancel_awaiting(self, pending: PendingRequest, result: GatewayResult, *, reason: str = "rolled") -> None:
++        """
++        Close the dice dialogs still open: the GM went on without these dice
++        ("rolled": the app's values count) or refused the request ("rejected").
++        """
++        for die in pending.proposed_dice.values():
++            if die.awaiting and die.owner:
++                die.awaiting = False
++                result.outbox.append((die.owner, CommandMessage(
++                    ServerCommand.DICE_ROLL_CANCELLED.value,
++                    {"approval_id": pending.approval_id, "key": die.key, "reason": reason},
++                )))
++
++    def _receive_dice(self, username: str, request: CommandMessage) -> GatewayResult:
++        pending = self.pending(str(request.args.get("approval_id", "")))
++        key = str(request.args.get("key", ""))
++        die = pending.proposed_dice.get(key)
++        if die is None or die.owner != username or not die.awaiting:
++            raise RuntimeError("This die is not waiting for you.")
++        try:
++            die.values = check_dice_values(die.expression, request.args.get("values", []))
++        except ActionError as error:
++            raise ValueError(str(error)) from error
++        die.awaiting = False
++        if self.on_pending_updated is not None:
++            self.on_pending_updated(pending)
++        return GatewayResult(replies=[CommandMessage(
++            ServerCommand.DICE_ROLL_ACCEPTED.value,
++            {"approval_id": pending.approval_id, "key": key, "values": list(die.values), "total": die.total},
++            reply_to=request.message_id,
++        )])
++
++    def _attack_dice(self, pending: PendingRequest, attacker_id: str) -> None:
++        """d100 of the attacker and of the first target, each rolled by its player."""
++        existing = pending.proposed_dice
++        dice: dict[str, DiceProposal] = {}
++        attacker = existing.get("attacker") or DiceProposal.roll("attacker", "1d100", label="Attaque")
++        attacker.owner = self._player_of(attacker_id)
++        dice["attacker"] = attacker
++        for token_id in pending.proposed_targets[:1]:
++            key = f"defender:{token_id}"
++            defender = existing.get(key) or DiceProposal.roll(key, "1d100", label="Défense")
++            defender.owner = self._player_of(self._token_entity(token_id))
++            dice[key] = defender
++        pending.proposed_dice = dice
++
++    def _spell_dice(self, pending: PendingRequest, caster_id: str, spell, target_ids: list[str]) -> None:
++        """d100 of the spell formulas: the caster's and each target's, rolled by their player."""
++        existing = pending.proposed_dice
++        dice: dict[str, DiceProposal] = {}
++        for key, entity_id, stat in spell_dice_keys(spell, caster_id, target_ids):
++            entity = self.runtime.entities.get(entity_id)
++            label = f"{entity.name if entity else entity_id} · {stat.upper()}"
++            die = existing.get(key) or DiceProposal.roll(key, "1d100", label=label)
++            die.owner = self._player_of(entity_id)
++            dice[key] = die
++        pending.proposed_dice = dice
++
+     def _remove_pending(self, pending: PendingRequest) -> None:
+         self._pending.pop(pending.approval_id, None)
+         if self._pending_by_user.get(pending.username) == pending.approval_id:
+@@ -160,19 +276,33 @@ class RuntimeNetworkGateway:
+         pending = self.pending(approval_id)
+         if pending.username != username:
+             raise PermissionError("Cannot cancel another player's request")
++        if pending.kind is PendingKind.DAMAGE:
++            raise RuntimeError("The attack already hit: its damage cannot be cancelled.")
+         pending.status = PendingStatus.CANCELLED
+         self._remove_pending(pending)
+         return pending
+ 
+-    def reject(self, approval_id: str, *, reason: str = "") -> tuple[PendingRequest, NetworkMessage]:
++    def reject(self, approval_id: str, *, reason: str = "") -> tuple[PendingRequest, GatewayResult]:
++        """
++        Refuse a request. Damage dice a player rolled are asked again instead:
++        the request then stays waiting.
++        """
+         pending = self.pending(approval_id)
++        result = GatewayResult()
++        damage = pending.proposed_dice.get("damage")
++        if pending.kind is PendingKind.DAMAGE and damage is not None and damage.owner:
++            damage.reroll()  # the app's stand-in until the player answers
++            self._ask_owners(pending, result, retry=True)
++            return pending, result
++        self._cancel_awaiting(pending, result, reason="rejected")
+         pending.status = PendingStatus.REJECTED
+         self._remove_pending(pending)
+-        return pending, CommandMessage(
++        result.replies.append(CommandMessage(
+             self._result_command(pending),
+             {"success": False, "reason": "GM_REJECTED", "message": str(reason)},
+             reply_to=pending.request_message_id,
+-        )
++        ))
++        return pending, result
+ 
+     def reroll(self, approval_id: str, dice_key: str) -> PendingRequest:
+         pending = self.pending(approval_id)
+@@ -187,18 +317,41 @@ class RuntimeNetworkGateway:
+         dice: dict[str, dict[str, Any]] | None = None,
+     ) -> PendingRequest:
+         pending = self.pending(approval_id)
+-        if pending.kind not in {PendingKind.ACTION, PendingKind.STAT_CHECK}:
++        if pending.kind not in {PendingKind.ACTION, PendingKind.STAT_CHECK, PendingKind.DAMAGE}:
+             raise ValueError("This pending request has no editable action parameters")
+-        if targets is not None:
++        if targets is not None and pending.kind is not PendingKind.ACTION:
++            targets = None
++        if targets is not None and list(targets) != list(pending.proposed_targets):
+             pending.replace_targets(targets)
++            self._retarget(pending)
+         for key, change in (dice or {}).items():
+-            pending.set_die(
+-                str(key),
+-                expression=change.get("expression") if isinstance(change, dict) else None,
+-                values=change.get("values") if isinstance(change, dict) else None,
++            die = pending.proposed_dice.get(str(key))
++            if die is None or not isinstance(change, dict):
++                continue
++            expression, values = change.get("expression"), change.get("values")
++            unchanged = (expression is None or str(expression) == die.expression) and (
++                values is None or [int(value) for value in values] == die.values
+             )
++            if not unchanged:
++                pending.set_die(str(key), expression=expression, values=values)
+         return pending
+ 
++    def _retarget(self, pending: PendingRequest) -> None:
++        """The GM changed the targets: follow with the target list and the dice."""
++        entity_ids = [
++            entity_id for entity_id in (self._token_entity(t) for t in pending.proposed_targets) if entity_id
++        ]
++        pending.preview["target_entities"] = list(dict.fromkeys(entity_ids))
++        intent = pending.action_intent
++        if intent is not None and intent.kind is ActionKind.SPELL:
++            caster = self.runtime.entities.get(pending.entity_id)
++            spell = caster.get_spell(intent.action_id) if caster else None
++            if spell is not None:
++                self._spell_dice(pending, pending.entity_id, spell, pending.preview["target_entities"])
++                for die in pending.proposed_dice.values():
++                    die.owner = ""  # new targets chosen by the GM: the app rolls
++                    die.awaiting = False
++
+     def approve(self, approval_id: str) -> tuple[PendingRequest, GatewayResult]:
+         pending = self.pending(approval_id)
+         # Revalidation happens inside the actual runtime operation.
+@@ -260,9 +413,11 @@ class RuntimeNetworkGateway:
+                     reply_to=pending.request_message_id,
+                 )]
+             )
++        elif pending.kind is PendingKind.ACTION and self.action_executor is None:
++            result = self._resolve_action(pending)
++        elif pending.kind is PendingKind.DAMAGE:
++            result = self._resolve_damage(pending)
+         elif pending.kind is PendingKind.ACTION:
+-            if self.action_executor is None:
+-                raise RuntimeError("No action_executor is connected to the network gateway")
+             payload = dict(self.action_executor(self.runtime, pending.entity_id, pending))
+             payload.setdefault("success", True)
+             result = GatewayResult(
+@@ -286,6 +441,7 @@ class RuntimeNetworkGateway:
+             PendingKind.STAT_CHECK: ServerCommand.STAT_CHECK_RESULT.value,
+             PendingKind.ACTION: ServerCommand.ACTION_RESULT.value,
+             PendingKind.END_TURN: ServerCommand.END_TURN_RESULT.value,
++            PendingKind.DAMAGE: ServerCommand.ACTION_RESULT.value,
+         }[pending.kind]
+ 
+     # --------------------------------------------------------------- prepare
+@@ -330,9 +486,21 @@ class RuntimeNetworkGateway:
+ 
+     def _prepare_action(self, username: str, entity_id: str, request: CommandMessage) -> PendingRequest:
+         intent = ActionIntent.from_dict(request.args)
++        return self._build_action_pending(username, entity_id, intent, request.message_id, dict(request.args))
++
++    def _build_action_pending(
++        self,
++        username: str,
++        entity_id: str,
++        intent: ActionIntent,
++        message_id: str,
++        payload: dict[str, Any],
++        *,
++        gm: bool = False,
++    ) -> PendingRequest:
+         permissions = self.runtime.player_permissions(entity_id)
+         if not permissions.can_combat_actions:
+-            raise PermissionError("Combat actions are only available during the player's turn")
++            raise PermissionError("Combat actions are only available during the entity's turn")
+         entity = self.runtime.entities[entity_id]
+         stamina = self.runtime.action_stamina_remaining(entity_id)
+         spell = None
+@@ -352,31 +520,137 @@ class RuntimeNetworkGateway:
+         try:
+             targets = resolve_targets(
+                 self.runtime, entity_id, intent.kind.value, spell=spell,
+-                token_ids=intent.selection.token_ids, point=intent.selection.point,
++                token_ids=intent.selection.token_ids, point=intent.selection.point, gm=gm,
+             )
+         except TargetingError as error:
+             raise ValueError(str(error)) from error
+         pending = PendingRequest(
+-            PendingKind.ACTION, username, entity_id, request.message_id,
+-            dict(request.args),
++            PendingKind.ACTION, username, entity_id, message_id,
++            payload,
+             preview={
++                "kind": intent.kind.value,
++                "spell": spell.name if spell is not None else "",
+                 "stamina_cost": cost,
+                 "stamina_remaining": stamina,
+                 "cells": [list(cell) for cell in targets.cells],
++                "target_entities": list(targets.entity_ids),
+             },
+             proposed_targets=list(targets.token_ids),
+             action_intent=intent,
+         )
+         if intent.kind in {ActionKind.STRIKE, ActionKind.SHOOT}:
+-            pending.proposed_dice["attacker"] = DiceProposal.roll("attacker", "1d100", label="Attacker")
+-            for token_id in pending.proposed_targets[:1]:
+-                pending.proposed_dice[f"defender:{token_id}"] = DiceProposal.roll(
+-                    f"defender:{token_id}", "1d100", label="Defender"
+-                )
++            self._attack_dice(pending, entity_id)
++        elif spell is not None:
++            self._spell_dice(pending, entity_id, spell, list(targets.entity_ids))
+         if self.action_preparer is not None:
+             self.action_preparer(self.runtime, entity_id, intent, pending)
+         return pending
+ 
++    def submit_gm_action(self, entity_id: str, intent: ActionIntent) -> tuple[PendingRequest, GatewayResult]:
++        """
++        The GM makes the entity whose turn it is act. The request waits in the
++        GM's list like a player's; players whose entity defends roll their dice.
++
++        Raises:
++            ValueError / KeyError / PermissionError: If the action is not possible now.
++        """
++        pending = self._build_action_pending(GM_USER, str(entity_id), intent, "", intent.to_dict(), gm=True)
++        result = GatewayResult(pending=pending)
++        self._ask_owners(pending, result)
++        self._pending[pending.approval_id] = pending
++        if self.on_pending is not None:
++            self.on_pending(pending)
++        return pending, result
++
++    def _action_reply(self, pending: PendingRequest, payload: dict[str, Any]) -> CommandMessage:
++        return CommandMessage(
++            ServerCommand.ACTION_RESULT.value,
++            {"success": True, **payload},
++            reply_to=pending.request_message_id,
++        )
++
++    def _resolve_action(self, pending: PendingRequest) -> GatewayResult:
++        """Step 1 of an attack (then the damage request), or a whole spell."""
++        intent = pending.action_intent
++        if intent is None:
++            raise ValueError("This request has no action.")
++        result = GatewayResult(broadcast_sync=True)
++        if intent.kind in {ActionKind.STRIKE, ActionKind.SHOOT}:
++            if not pending.proposed_targets:
++                raise ValueError("Choose a target.")
++            token_id = pending.proposed_targets[0]
++            target_id = self._token_entity(token_id)
++            if target_id is None:
++                raise ValueError("The target is no longer on the map.")
++            attack = pending.proposed_dice["attacker"].total
++            defense_die = pending.proposed_dice.get(f"defender:{token_id}")
++            defense = defense_die.total if defense_die else DiceProposal.roll("defender", "1d100").total
++            outcome = self.resolver.roll_attack(
++                pending.entity_id, intent.kind.value, target_id, attack, defense
++            )
++            self._cancel_awaiting(pending, result)  # the GM rolled in their place
++            text = f"d100 {attack} contre {defense} : " + (
++                f"touché, {outcome.expression} de dégâts" if outcome.hit else "raté"
++            )
++            result.replies.append(self._action_reply(pending, {
++                "stage": "attack", "hit": outcome.hit, "damage": outcome.expression, "message": text,
++            }))
++            if outcome.hit:
++                self._start_damage(pending, target_id, outcome.expression, result)
++            return result
++
++        caster = self.runtime.entities[pending.entity_id]
++        spell = caster.get_spell(intent.action_id)
++        if spell is None:
++            raise KeyError(f"Unknown spell: {intent.action_id}")
++        targets = [
++            entity_id for entity_id in (self._token_entity(t) for t in pending.proposed_targets) if entity_id
++        ] or list(pending.preview.get("target_entities", []))
++        dice = {
++            key: die.total for key, die in pending.proposed_dice.items()
++            if key.startswith(("user:", "target:"))
++        }
++        self.resolver.cast_spell(pending.entity_id, spell.name, targets, dice)
++        self._cancel_awaiting(pending, result)
++        result.replies.append(self._action_reply(pending, {"stage": "spell", "message": f"{spell.name} lancé."}))
++        return result
++
++    def _start_damage(self, action: PendingRequest, target_id: str, expression: str, result: GatewayResult) -> None:
++        """Step 2: the attacker's player rolls the damage dice, then the GM checks them."""
++        kind = str(action.preview.get("kind", ""))
++        damage = PendingRequest(
++            PendingKind.DAMAGE, action.username, action.entity_id, action.request_message_id,
++            {"kind": kind, "target_id": target_id, "expression": expression},
++            preview={"kind": kind, "target_entities": [target_id], "damage": expression},
++        )
++        die = DiceProposal.roll("damage", expression, label=f"Dégâts ({expression})")
++        die.owner = self._player_of(action.entity_id)
++        damage.proposed_dice["damage"] = die
++        self._pending[damage.approval_id] = damage
++        if damage.username != GM_USER:
++            self._pending_by_user[damage.username] = damage.approval_id
++        self._ask_owners(damage, result)
++        if self.on_pending is not None:
++            self.on_pending(damage)
++        result.pending = damage
++
++    def _resolve_damage(self, pending: PendingRequest) -> GatewayResult:
++        result = GatewayResult(broadcast_sync=True)
++        die = pending.proposed_dice["damage"]
++        event = self.resolver.apply_attack_damage(
++            pending.entity_id,
++            str(pending.payload.get("kind", "")),
++            str(pending.payload["target_id"]),
++            die.expression,
++            die.values,
++        )
++        self._cancel_awaiting(pending, result)
++        dealt = event.data.get("action", {}).get("dealt", 0)
++        result.replies.append(self._action_reply(pending, {
++            "stage": "damage", "dealt": dealt, "message": f"Dégâts infligés : {dealt}.",
++        }))
++        return result
++
+     # --------------------------------------------------------------- dispatch
+     def handle(self, username: str, request: CommandMessage) -> GatewayResult:
+         try:
+@@ -393,11 +667,15 @@ class RuntimeNetworkGateway:
+             if command is ClientCommand.ACTION_CANCEL_REQUEST:
+                 approval_id = str(request.args.get("approval_id", ""))
+                 pending = self.cancel(username, approval_id)
+-                return GatewayResult(replies=[CommandMessage(
++                cancelled = GatewayResult(replies=[CommandMessage(
+                     ServerCommand.REQUEST_CANCELLED.value,
+                     {"approval_id": pending.approval_id},
+                     reply_to=request.message_id,
+                 )])
++                self._cancel_awaiting(pending, cancelled)
++                return cancelled
++            if command is ClientCommand.DICE_ROLL:
++                return self._receive_dice(username, request)
+ 
+             entity_id = self.entity_for(username)
+             if entity_id is None:
+@@ -432,7 +710,13 @@ class RuntimeNetworkGateway:
+                 return self._queue(pending) if self.require_gm_approval else self._execute_immediate(pending)
+             if command is ClientCommand.ACTION_REQUEST:
+                 pending = self._prepare_action(username, entity_id, request)
+-                return self._queue(pending) if self.require_gm_approval else self._execute_immediate(pending)
++                if not self.require_gm_approval:
++                    return self._execute_immediate(pending)
++                asked = GatewayResult()
++                self._ask_owners(pending, asked)
++                queued = self._queue(pending)
++                queued.outbox.extend(asked.outbox)
++                return queued
+             raise ValueError(f"Command {command.value} belongs to the server/transport layer")
+         except RuntimeError as exc:
+             if str(exc) == "REQUEST_ALREADY_PENDING":
+diff --git a/libs/net/models.py b/libs/net/models.py
+index 7fdbfba..842fa3f 100644
+--- a/libs/net/models.py
++++ b/libs/net/models.py
+@@ -16,6 +16,8 @@ class PendingKind(str, Enum):
+     STAT_CHECK = "stat_check"
+     ACTION = "action"
+     END_TURN = "end_turn"
++    # Step 2 of a strike or a shot: the damage dice
++    DAMAGE = "damage"
+ 
+ 
+ class PendingStatus(str, Enum):
+@@ -31,6 +33,10 @@ class DiceProposal:
+     expression: str
+     values: list[int]
+     label: str = ""
++    # Player who rolls this die ("" = rolled by the app, for GM-controlled entities)
++    owner: str = ""
++    # The owner was asked and has not answered: `values` is the app's stand-in
++    awaiting: bool = False
+ 
+     @property
+     def total(self) -> int:
+@@ -44,6 +50,7 @@ class DiceProposal:
+     def reroll(self) -> None:
+         dice = Dice.roll(self.expression)
+         self.values = list(dice.dice_values)
++        self.awaiting = False
+ 
+     def to_dice(self) -> Dice:
+         return Dice(self.expression, [int(v) for v in self.values])
+@@ -55,6 +62,8 @@ class DiceProposal:
+             "values": list(self.values),
+             "total": self.total,
+             "label": self.label,
++            "owner": self.owner,
++            "awaiting": self.awaiting,
+         }
+ 
+ 
+@@ -121,6 +130,7 @@ class PendingRequest:
+             if len(checked) != expected or any(v < 1 or v > dice_type for v in checked):
+                 raise ValueError("Dice values do not match the dice expression")
+             proposal.values = checked
++            proposal.awaiting = False
+         self.gm_modified = True
+ 
+     def reroll(self, key: str) -> None:
+diff --git a/libs/net/server.py b/libs/net/server.py
+index 4354c23..869844e 100644
+--- a/libs/net/server.py
++++ b/libs/net/server.py
+@@ -100,6 +100,10 @@ class RPGNetworkServer:
+             self.gateway.on_pending = pending_hook
+             if on_initiative is not None:
+                 self.gateway.on_initiative = on_initiative
++            if on_pending_updated is not None:
++                self.gateway.on_pending_updated = on_pending_updated
++            # Dice go to the players who are here; the app rolls for the others
++            self.gateway.is_connected = lambda username: username in self.clients
+ 
+     def _log(self, message: str) -> None:
+         self.on_log(str(message))
+@@ -417,14 +421,38 @@ class RPGNetworkServer:
+         ))
+ 
+     async def _apply_gateway_result(self, username: str, result: GatewayResult) -> None:
++        """Replies to the requester (absent for GM requests), messages to other players, sync."""
+         session = self.clients.get(username)
+-        if session is None:
+-            return
+-        for reply in result.replies:
+-            await session.connection.send(reply)
++        if session is not None:
++            for reply in result.replies:
++                await session.connection.send(reply)
++        for recipient, message in result.outbox:
++            target = self.clients.get(recipient)
++            if target is None:
++                continue
++            try:
++                await target.connection.send(message)
++            except (ConnectionError, OSError, RuntimeError):
++                pass
+         if result.broadcast_sync:
+             await self.broadcast_runtime_sync()
+ 
++    async def deliver(self, result: GatewayResult, username: str = "") -> None:
++        """
++        Send what the GM's handling of a request produced: replies to `username`
++        (none for the GM's own requests), dice asked to players, sync.
++        """
++        await self._apply_gateway_result(username, result)
++
++    async def cancel_die(self, owner: str, approval_id: str, key: str) -> None:
++        """The GM rolled a die in a player's place: close the player's dialog."""
++        session = self.clients.get(owner)
++        if session is not None:
++            await session.connection.send(CommandMessage(
++                ServerCommand.DICE_ROLL_CANCELLED.value,
++                {"approval_id": approval_id, "key": key, "reason": "rolled"},
++            ))
++
+     async def approve_pending(self, approval_id: str) -> PendingRequest:
+         if self.gateway is None:
+             raise RuntimeError("No RuntimeNetworkGateway is connected")
+@@ -435,10 +463,8 @@ class RPGNetworkServer:
+     async def reject_pending(self, approval_id: str, *, reason: str = "") -> PendingRequest:
+         if self.gateway is None:
+             raise RuntimeError("No RuntimeNetworkGateway is connected")
+-        pending, message = self.gateway.reject(approval_id, reason=reason)
+-        session = self.clients.get(pending.username)
+-        if session is not None:
+-            await session.connection.send(message)
++        pending, result = self.gateway.reject(approval_id, reason=reason)
++        await self._apply_gateway_result(pending.username, result)
+         return pending
+ 
+     def edit_pending_action(
+@@ -535,16 +561,22 @@ def create_runtime_server(
+     action_executor=None,
+     asset_catalog: AssetCatalog | None = None,
+     player_bindings: dict[str, str] | None = None,
++    gateway: RuntimeNetworkGateway | None = None,
+     **server_callbacks,
+ ) -> RPGNetworkServer:
+-    """Convenience factory used by the GM application."""
+-    pending_callback = server_callbacks.get("on_pending")
+-    gateway = RuntimeNetworkGateway(
+-        runtime,
+-        action_preparer=action_preparer,
+-        action_executor=action_executor,
+-        require_gm_approval=True,
+-    )
++    """
++    Convenience factory used by the GM application.
++
++    Pass the GM window's `gateway` so that requests started without a server
++    (NPC actions) and the ones from players share one list.
++    """
++    if gateway is None:
++        gateway = RuntimeNetworkGateway(
++            runtime,
++            action_preparer=action_preparer,
++            action_executor=action_executor,
++            require_gm_approval=True,
++        )
+     server = RPGNetworkServer(
+         settings,
+         gateway=gateway,
+diff --git a/libs/runtime/actions.py b/libs/runtime/actions.py
+new file mode 100644
+index 0000000..779f91b
+--- /dev/null
++++ b/libs/runtime/actions.py
+@@ -0,0 +1,412 @@
++# -*- coding: utf-8 -*-
++
++"""
++Resolution of combat actions, once the GM validated the dice.
++
++Strike and shoot take two steps:
++    1. `roll_attack`: the attacker's and the defender's d100 decide how many
++       damage dice the attack deals (Entity.strike / Entity.shoot rules); the
++       turn stamina is spent, hit or miss.
++    2. `apply_attack_damage`: the damage dice are added up, increased by the
++       attacker's damage amplification, then reduced by the target's damage
++       reduction and absorbed by its shields; what is left becomes a permanent
++       "Damage" effect on the target's HP.
++
++A spell takes one step, `cast_spell`: its turn cost is spent and a spell event
++is applied with the d100 the GM validated for its formulas.
++
++Replay never rolls nor evaluates a formula again: each resolution records the
++resulting runtime state of the entities it changed (ACTION_RESOLVED).
++"""
++
++from __future__ import annotations
++
++import json
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Any, Iterable, Optional
++
++from ..assets.spell import DiceAttack, DiceRatio, Formula, Spell
++from ..dice import Dice
++from .entity import Entity, StatsModifier
++from .spell_effect import EffectType, SpellEffect
++from .spell_event import SpellEvent, share_effects
++
++if TYPE_CHECKING:
++    from .session import SessionEvent, SessionRuntime
++
++
++ATTACK_KINDS = ("strike", "shoot")
++KIND_LABELS = {"strike": "Strike", "shoot": "Shoot"}
++
++
++class ActionError(ValueError):
++    """The action cannot be resolved as asked."""
++
++
++# =============================================================================
++# Dice
++# =============================================================================
++
++
++def parse_expression(expression: str) -> tuple[int, int]:
++    """'3d8' -> (3, 8)."""
++    try:
++        count, _d, size = str(expression).lower().partition("d")
++        return max(0, int(count)), max(0, int(size))
++    except ValueError as error:
++        raise ActionError(f"Invalid dice expression: {expression}") from error
++
++
++def check_dice_values(expression: str, values: Iterable[Any]) -> list[int]:
++    """
++    Validate the result of `expression`: one value per die, each from 1 to its size.
++
++    Raises:
++        ActionError: If the values do not match.
++    """
++    count, size = parse_expression(expression)
++    try:
++        checked = [int(value) for value in values]
++    except (TypeError, ValueError) as error:
++        raise ActionError("Dice values must be whole numbers.") from error
++    if len(checked) != count or any(not 1 <= value <= size for value in checked):
++        raise ActionError(f"{expression} needs {count} value(s) from 1 to {size}.")
++    return checked
++
++
++def damage_expression(attacker: Entity, target: Entity, kind: str, attack: int, defense: int) -> str:
++    """Damage dice of a strike or a shot ("0d4" when it misses)."""
++    attack_die = Dice("1d100", [int(attack)])
++    defense_die = Dice("1d100", [int(defense)])
++    if kind == "strike":
++        return attacker.strike(target, attack_die, defense_die)
++    if kind == "shoot":
++        return attacker.shoot(target, attack_die, defense_die)
++    raise ActionError(f"Unknown attack: {kind}")
++
++
++def is_hit(expression: str) -> bool:
++    count, size = parse_expression(expression)
++    return count > 0 and size > 0
++
++
++def _formula_terms(formula: Optional[Formula], found: set[tuple[str, str]]) -> None:
++    if formula is None:
++        return
++    if not formula.compilated:
++        try:
++            formula.compile()
++        except (ValueError, SyntaxError):
++            return
++    for kind, args in formula.placeholders:
++        if kind is Formula:
++            _formula_terms(args, found)
++        elif kind is DiceRatio:
++            who, _dot, stat = str(args[0]).partition(".")
++            found.add((who, stat))
++        elif kind is DiceAttack:
++            for reference in (args[0], args[2]):
++                who, _dot, stat = str(reference).partition(".")
++                found.add((who, stat))
++
++
++def spell_dice_terms(spell: Spell) -> list[tuple[str, str]]:
++    """(who, stat) of every d100 the spell's formulas roll: who is "user" or "target"."""
++    found: set[tuple[str, str]] = set()
++    for effect in spell.effects:
++        _formula_terms(effect.formula, found)
++    _formula_terms(spell.trigger_condition, found)
++    return sorted(term for term in found if term[0] in ("user", "target") and term[1])
++
++
++def spell_dice_keys(spell: Spell, caster_id: str, target_ids: Iterable[str]) -> list[tuple[str, str, str]]:
++    """
++    (key, who, stat) of the d100 to propose for a cast: "user:<stat>" for the
++    caster, "target:<entity id>:<stat>" for each target.
++    """
++    keys: list[tuple[str, str, str]] = []
++    for who, stat in spell_dice_terms(spell):
++        if who == "user":
++            keys.append((f"user:{stat}", caster_id, stat))
++        else:
++            for target_id in dict.fromkeys(target_ids):
++                keys.append((f"target:{target_id}:{stat}", target_id, stat))
++    return keys
++
++
++def spell_dice_from_keys(values: dict[str, int]) -> tuple[dict[str, int], dict[str, dict[str, int]]]:
++    """Turn {"user:str": 40, "target:<id>:con": 12} into the dicts SpellEvent.apply reads."""
++    user: dict[str, int] = {}
++    targets: dict[str, dict[str, int]] = {}
++    for key, value in values.items():
++        parts = str(key).split(":")
++        if len(parts) == 2 and parts[0] == "user":
++            user[parts[1]] = int(value)
++        elif len(parts) == 3 and parts[0] == "target":
++            targets.setdefault(parts[1], {})[parts[2]] = int(value)
++    return user, targets
++
++
++# =============================================================================
++# State recording
++# =============================================================================
++
++
++def runtime_state(entity: Entity) -> dict[str, Any]:
++    """The part of an entity that combat changes."""
++    return {
++        "stats_modifier": entity.stats_modifier.to_dict(),
++        "spell_effects": [effect.to_dict() for effect in entity.spell_effects],
++        "spell_events": [event.to_dict() for event in entity.spell_events],
++    }
++
++
++def apply_runtime_states(runtime: SessionRuntime, data: dict[str, Any]) -> None:
++    """Replay an ACTION_RESOLVED event: put back the recorded states."""
++    states: dict[str, dict[str, Any]] = data.get("states", {})
++    cache: dict[str, SpellEffect] = {}
++    for entity_id, state in states.items():
++        entity = runtime.entities.get(str(entity_id))
++        if entity is None:
++            continue
++        entity.stats_modifier = StatsModifier.from_dict(state.get("stats_modifier", {}))
++        effects = []
++        for raw in state.get("spell_effects", []):
++            effect = cache.get(str(raw.get("id"))) or SpellEffect.from_dict(raw)
++            cache[str(effect.id)] = effect
++            effects.append(effect)
++        entity.spell_effects = effects
++    for entity_id, state in states.items():
++        entity = runtime.entities.get(str(entity_id))
++        if entity is not None:
++            entity.spell_events = [
++                SpellEvent.from_dict(raw, cache) for raw in state.get("spell_events", [])
++            ]
++    runtime._remove_effects_everywhere(data.get("removed_effect_ids", ()))
++    share_effects(runtime.entities.values())
++
++
++@dataclass(frozen=True)
++class AttackOutcome:
++    hit: bool
++    expression: str
++    event: Any  # the ATTACK_ROLLED SessionEvent
++
++
++class CombatResolver:
++    """Applies validated combat actions to a SessionRuntime, as journal events."""
++
++    def __init__(self, runtime: SessionRuntime) -> None:
++        self.runtime = runtime
++
++    # -------------------------------------------------------------- helpers
++    def _entity(self, entity_id: str) -> Entity:
++        entity = self.runtime.entities.get(str(entity_id))
++        if entity is None:
++            raise ActionError(f"Unknown entity: {entity_id}")
++        return entity
++
++    def _snapshot(self) -> tuple[dict[str, str], set[str]]:
++        states = {
++            entity_id: json.dumps(runtime_state(entity), sort_keys=True)
++            for entity_id, entity in self.runtime.entities.items()
++        }
++        effect_ids = {
++            str(effect.id)
++            for entity in self.runtime.entities.values()
++            for effect in entity.spell_effects
++        }
++        return states, effect_ids
++
++    def _record(
++        self,
++        before: tuple[dict[str, str], set[str]],
++        action: dict[str, Any],
++        message: str,
++        *,
++        source_id: str,
++        target_ids: Iterable[str],
++    ) -> SessionEvent:
++        from .session import SessionEventType
++
++        states_before, effects_before = before
++        changed = {}
++        for entity_id, entity in self.runtime.entities.items():
++            state = runtime_state(entity)
++            if json.dumps(state, sort_keys=True) != states_before.get(entity_id):
++                changed[entity_id] = state
++        effects_after = {
++            str(effect.id)
++            for entity in self.runtime.entities.values()
++            for effect in entity.spell_effects
++        }
++        removed = sorted(effects_before - effects_after)
++        return self.runtime._dispatch(
++            SessionEventType.ACTION_RESOLVED,
++            {"action": action, "states": changed, "removed_effect_ids": removed},
++            message=message,
++            source_id=source_id,
++            target_ids=tuple(target_ids),
++        )
++
++    # -------------------------------------------------------------- attacks
++    def roll_attack(
++        self,
++        attacker_id: str,
++        kind: str,
++        target_id: str,
++        attack: int,
++        defense: int,
++    ) -> AttackOutcome:
++        """
++        Step 1 of a strike or a shot: spend the turn stamina and find the damage dice.
++        """
++        from .session import SessionEventType
++
++        if kind not in ATTACK_KINDS:
++            raise ActionError(f"Unknown attack: {kind}")
++        if not self.runtime.recording:
++            raise RuntimeError("Historical runtimes are read-only.")
++        attacker, target = self._entity(attacker_id), self._entity(target_id)
++        check_dice_values("1d100", [attack])
++        check_dice_values("1d100", [defense])
++        expression = damage_expression(attacker, target, kind, attack, defense)
++        hit = is_hit(expression)
++        if kind == "strike":
++            self.runtime.spend_strike_stamina(attacker_id)
++        else:
++            self.runtime.spend_shoot_stamina(attacker_id)
++        verb = "strikes" if kind == "strike" else "shoots"
++        event = self.runtime._dispatch(
++            SessionEventType.ATTACK_ROLLED,
++            {
++                "kind": kind,
++                "attacker_id": str(attacker_id),
++                "target_id": str(target_id),
++                "attack": int(attack),
++                "defense": int(defense),
++                "damage": expression,
++                "hit": hit,
++            },
++            message=(
++                f"{attacker.name} {verb} {target.name}: d100 {attack} vs {defense} -> "
++                + (f"hit, {expression} damage" if hit else "miss")
++            ),
++            source_id=str(attacker_id),
++            target_ids=(str(target_id),),
++        )
++        return AttackOutcome(hit, expression, event)
++
++    def apply_attack_damage(
++        self,
++        attacker_id: str,
++        kind: str,
++        target_id: str,
++        expression: str,
++        values: Iterable[Any],
++    ) -> SessionEvent:
++        """Step 2 of a strike or a shot: deal the rolled damage."""
++        attacker, target = self._entity(attacker_id), self._entity(target_id)
++        rolled = check_dice_values(expression, values)
++        before = self._snapshot()
++        total = sum(rolled)
++        amplified = total * (100 + int(attacker.damage_amplification)) // 100
++        residual, consumed = target.apply_damage("hp", amplified)
++        label = KIND_LABELS.get(kind, kind.title())
++        if residual > 0:
++            target.spell_effects.append(SpellEffect(
++                effect_type=EffectType.DAMAGE,
++                effect_def=None,
++                target_id=str(target.id),
++                target_stat="hp",
++                delta=-int(residual),
++                duration=-1,
++                event_id=None,
++                origin=f"{label} — {attacker.name}",
++                caster_id=str(attacker.id),
++            ))
++        absorbed = amplified - residual
++        details = f"{expression} [{', '.join(map(str, rolled))}] = {total}"
++        if amplified != total:
++            details += f", amplified to {amplified}"
++        if absorbed:
++            details += f", {absorbed} reduced or absorbed"
++        return self._record(
++            before,
++            {
++                "kind": kind,
++                "attacker_id": str(attacker_id),
++                "target_id": str(target_id),
++                "damage": expression,
++                "values": rolled,
++                "total": total,
++                "dealt": int(residual),
++                "consumed_shields": [str(effect.id) for effect in consumed],
++            },
++            f"{target.name} takes {residual} damage from {attacker.name}'s {kind} ({details})",
++            source_id=str(attacker_id),
++            target_ids=(str(target_id),),
++        )
++
++    # --------------------------------------------------------------- spells
++    def cast_spell(
++        self,
++        caster_id: str,
++        spell_name: str,
++        target_ids: Iterable[str],
++        dice: dict[str, int],
++    ) -> SessionEvent:
++        """
++        Cast a spell on its targets with the validated d100 of its formulas.
++
++        The cost comes out of the turn stamina only.
++        """
++        if not self.runtime.recording:
++            raise RuntimeError("Historical runtimes are read-only.")
++        caster = self._entity(caster_id)
++        spell = caster.get_spell(spell_name)
++        if spell is None:
++            raise ActionError(f"{caster.name} does not know {spell_name}.")
++        targets = [self._entity(target_id) for target_id in dict.fromkeys(target_ids)]
++        if not targets:
++            raise ActionError("The spell has no target.")
++
++        self.runtime.spend_spell_stamina(caster_id, spell_name)
++        before = self._snapshot()
++        campaign = self.runtime.campaign
++        campaign.spells.register(spell.name, spell)
++        for entity_id, entity in self.runtime.entities.items():
++            campaign.entities.register(entity_id, entity)
++
++        user_dice, target_dice = spell_dice_from_keys(dice)
++        spell_event = SpellEvent(
++            spell_id=spell.name,
++            caster_id=str(caster.id),
++            targets_id=[str(target.id) for target in targets],
++            effects=[],
++            runtime_policy=spell.runtime_policy,
++        )
++        # Registered before applying, so that a finished instant spell can clean
++        # itself up; the turn stamina was already spent above.
++        caster.spell_events.append(spell_event)
++        spell_event.apply(
++            [str(target.id) for target in targets],
++            user_dices=user_dice or None,
++            targets_dices=target_dice or None,
++            pay=lambda _caster, _cost: True,
++        )
++        names = ", ".join(target.name for target in targets)
++        return self._record(
++            before,
++            {
++                "kind": "spell",
++                "caster_id": str(caster_id),
++                "spell": spell.name,
++                "target_ids": [str(target.id) for target in targets],
++                "dice": {str(key): int(value) for key, value in dice.items()},
++                "effects": len(spell_event.effects),
++            },
++            f"{caster.name} casts {spell.name} on {names} ({len(spell_event.effects)} effect(s))",
++            source_id=str(caster_id),
++            target_ids=[str(target.id) for target in targets],
++        )
+diff --git a/libs/runtime/session.py b/libs/runtime/session.py
+index b2d9158..d094c1b 100644
+--- a/libs/runtime/session.py
++++ b/libs/runtime/session.py
+@@ -59,6 +59,7 @@ from .live_sync import apply_asset_update, build_asset_update
+ from .initiative import check_roll, insertion_index, initiative_order as sort_by_initiative
+ from .geometry import wall_between
+ from .targeting import map_context, sees
++from .actions import apply_runtime_states
+ from .asset_writeback import plan_entity_writeback, write_planned_assets
+ 
+ 
+@@ -311,6 +312,9 @@ class SessionEventType(str, Enum):
+     ENTITY_EDITED = "entity_edited"
+     # Entity changes written to the campaign files at session save
+     ASSETS_SAVED = "assets_saved"
++    # Combat: d100 of a strike / shoot (journal only), then the resolved result
++    ATTACK_ROLLED = "attack_rolled"
++    ACTION_RESOLVED = "action_resolved"
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -1048,6 +1052,13 @@ class SessionRuntime:
+             self._apply_entity_edit(data)
+             return
+ 
++        if event.type is SessionEventType.ACTION_RESOLVED:
++            apply_runtime_states(self, data)
++            return
++
++        if event.type is SessionEventType.ATTACK_ROLLED:
++            return  # the stamina is a separate ACTION_STAMINA_SPENT event
++
+         if event.type is SessionEventType.ASSETS_SAVED:
+             for entity_id, info in data.get("entities", {}).items():
+                 entity = self.entities.get(str(entity_id))
+diff --git a/libs/runtime/spell_effect.py b/libs/runtime/spell_effect.py
+index 70161b4..bfd6334 100644
+--- a/libs/runtime/spell_effect.py
++++ b/libs/runtime/spell_effect.py
+@@ -74,6 +74,11 @@ class SpellEffect:
+     # Free description of the cause, written by the GM
+     origin: str = ""
+ 
++    # Spell and caster that created the effect ("" for a GM or weapon effect);
++    # kept when the spell event itself is gone
++    spell_id: str = ""
++    caster_id: str = ""
++
+     def to_dict(self) -> dict[str, Any]:
+         """
+         Convert the instance to a JSON-serializable dictionary.
+@@ -88,6 +93,8 @@ class SpellEffect:
+             "duration": int(self.duration),
+             "event_id": str(self.event_id) if self.event_id is not None else None,
+             "origin": str(self.origin),
++            "spell_id": str(self.spell_id),
++            "caster_id": str(self.caster_id),
+         }
+ 
+     @classmethod
+@@ -114,6 +121,8 @@ class SpellEffect:
+             event_id=_uuid_or_none(data.get("event_id")),
+             id=_uuid_or_none(data.get("id")) or uuid4(),
+             origin=str(data.get("origin") or ""),
++            spell_id=str(data.get("spell_id") or ""),
++            caster_id=str(data.get("caster_id") or ""),
+         )
+ 
+     def is_expired(self) -> bool:
+diff --git a/libs/runtime/spell_event.py b/libs/runtime/spell_event.py
+index 3139232..a1eaa2c 100644
+--- a/libs/runtime/spell_event.py
++++ b/libs/runtime/spell_event.py
+@@ -10,7 +10,7 @@ the RPG Tabletop App.
+ # import built-in modules
+ from __future__ import annotations
+ from dataclasses import dataclass, field
+-from typing import Iterable, Optional, TYPE_CHECKING
++from typing import Callable, Iterable, Optional, TYPE_CHECKING
+ from uuid import UUID, uuid4
+ 
+ # import local modules
+@@ -119,6 +119,7 @@ class SpellEvent:
+         new_targets: list[str],
+         user_dices: Optional[dict[str, int]]=None,
+         targets_dices: Optional[dict[str, dict[str, int]]]=None,
++        pay: Optional[Callable[[Entity, int], bool]] = None,
+     ) -> None:
+         """
+         Apply the spell event to the new targets.
+@@ -129,7 +130,21 @@ class SpellEvent:
+             user_dices (Optional[dict[str, int]]): The dice used by the user for the spell event.
+             targets_dices (Optional[dict[str, dict[str, int]]]): The dice used by the targets for
+                                                                  defense.
++            pay (Optional[Callable]): How the cost is paid, returning False when it cannot
++                                      be. Defaults to lowering the caster's stamina.
+         """
++        self._payer = pay
++        try:
++            self._apply(new_targets, user_dices, targets_dices)
++        finally:
++            self._payer = None
++
++    def _apply(
++        self,
++        new_targets: list[str],
++        user_dices: Optional[dict[str, int]],
++        targets_dices: Optional[dict[str, dict[str, int]]],
++    ) -> None:
+         self._tick_effects()
+         if self.finished:
+             self._try_cleanup()
+@@ -357,6 +372,9 @@ class SpellEvent:
+         Returns:
+             bool: True if the cost was successfully paid, False otherwise.
+         """
++        payer = getattr(self, "_payer", None)
++        if payer is not None:
++            return bool(payer(caster, cost))
+         if caster.stamina < cost:
+             return False
+         caster.stats_modifier.stamina -= cost
+@@ -448,7 +466,9 @@ class SpellEvent:
+                     target_stat=target_stat,
+                     delta=final_delta,
+                     event_id=self.id,
+-                    duration=self._get_effect_duration(spell)
++                    duration=self._get_effect_duration(spell),
++                    spell_id=spell.name,
++                    caster_id=self.caster_id,
+                 )
+                 self.effects.append(spell_effect)
+                 destination.spell_effects.append(spell_effect)
+diff --git a/libs/runtime/targeting.py b/libs/runtime/targeting.py
+index e237367..ef282ef 100644
+--- a/libs/runtime/targeting.py
++++ b/libs/runtime/targeting.py
+@@ -342,3 +342,40 @@ def resolve_targets(
+         return _result(hit, cells)
+ 
+     raise TargetingError(f"Unknown targeting: {spell.targeting}")
++
++
++def targeting_spec(
++    runtime: SessionRuntime,
++    entity_id: str,
++    kind: str,
++    spell: Optional[Spell] = None,
++    *,
++    gm: bool = False,
++) -> dict:
++    """
++    How a map view lets someone pick the targets of an action.
++
++    Returns:
++        dict: {"mode": strike | shoot | self | single | multi | area | line,
++               "allowed": token ids that may be picked (None for a cell pick),
++               "max": most tokens picked (0 = no limit), "area_size", "range"}.
++    """
++    options = targeting_options(runtime, entity_id, gm=gm)
++    spec: dict = {"mode": kind, "allowed": None, "max": 1, "area_size": 0, "range": options.range}
++    if kind == "strike":
++        spec["allowed"] = list(options.strike)
++    elif kind == "shoot":
++        spec["allowed"] = list(options.shoot)
++    elif spell is None:
++        raise TargetingError(f"Unknown action: {kind}")
++    else:
++        targeting = str(spell.targeting)
++        spec["mode"] = targeting
++        if targeting in ("single", "multi"):
++            spec["allowed"] = list(options.spell_tokens)
++            spec["max"] = 1 if targeting == "single" else int(spell.max_targets or 0)
++        else:
++            spec["max"] = 0
++            if targeting == "area":
++                spec["area_size"] = int(spell.area_size)
++    return spec

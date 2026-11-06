@@ -13,6 +13,27 @@ from ...net.models import PendingKind, PendingRequest
 from ...runtime.session import SessionRuntime
 
 
+KIND_LABELS = {"strike": "Strike", "shoot": "Shoot"}
+
+
+def describe(pending: PendingRequest, runtime: SessionRuntime) -> str:
+    """One line for the request list: who does what."""
+    entity = runtime.entities.get(pending.entity_id)
+    actor = entity.name if entity is not None else pending.entity_id
+    kind = str(pending.preview.get("kind", ""))
+    if pending.kind is PendingKind.ACTION:
+        what = f"sort {pending.preview.get('spell')}" if kind == "spell" else KIND_LABELS.get(kind, kind)
+        text = f"{actor} — {what} (d100)"
+    elif pending.kind is PendingKind.DAMAGE:
+        text = f"{actor} — dégâts {pending.preview.get('damage', '')}"
+    else:
+        text = f"{actor} — {pending.kind.value}"
+    waiting = sorted({die.owner for die in pending.proposed_dice.values() if die.awaiting and die.owner})
+    if waiting:
+        text += f" · attend {', '.join(waiting)}"
+    return text
+
+
 class PendingPanel(QWidget):
     approve_requested = Signal(str, object, object)
     reject_requested = Signal(str, str)
@@ -26,7 +47,7 @@ class PendingPanel(QWidget):
         self.setObjectName("RuntimePanel")
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
-        title = QLabel("DEMANDES JOUEURS")
+        title = QLabel("DEMANDES À VALIDER")
         title.setObjectName("RuntimeHeading")
         root.addWidget(title)
         self.list = QListWidget()
@@ -38,8 +59,8 @@ class PendingPanel(QWidget):
         self.targets = QListWidget()
         self.targets.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         root.addWidget(self.targets)
-        self.dice = QTableWidget(0, 5)
-        self.dice.setHorizontalHeaderLabels(["Clé", "Libellé", "Expression", "Valeurs", "Total"])
+        self.dice = QTableWidget(0, 6)
+        self.dice.setHorizontalHeaderLabels(["Clé", "Libellé", "Expression", "Valeurs", "Total", "Lancé par"])
         self.dice.horizontalHeader().setStretchLastSection(True)
         root.addWidget(self.dice)
         self.resolver_note = QLabel("")
@@ -70,14 +91,17 @@ class PendingPanel(QWidget):
             if item.data(Qt.ItemDataRole.UserRole) == pending.approval_id:
                 existing = item
                 break
-        label = f"{pending.username} — {pending.kind.value}"
+        label = describe(pending, self.runtime)
         if existing is None:
             existing = QListWidgetItem(label)
             existing.setData(Qt.ItemDataRole.UserRole, pending.approval_id)
             self.list.addItem(existing)
         else:
             existing.setText(label)
-        self.list.setCurrentItem(existing)
+        if self.list.currentItem() is existing:
+            self._show_current()  # a player just sent a die: show it
+        else:
+            self.list.setCurrentItem(existing)
 
     def remove(self, approval_id: str) -> None:
         self._pending.pop(approval_id, None)
@@ -108,21 +132,34 @@ class PendingPanel(QWidget):
             self.resolver_note.setText("")
             self._set_controls(False)
             return
-        entity = self.runtime.entities.get(pending.entity_id)
-        name = entity.name if entity else pending.entity_id
-        self.summary.setText(
-            f"Joueur : {pending.username}\nEntity : {name}\nType : {pending.kind.value}\n"
-            f"Aperçu : {pending.preview}"
-        )
+        lines = [describe(pending, self.runtime), f"Demandé par : {pending.username}"]
+        names = [
+            self.runtime.entities[entity_id].name
+            for entity_id in pending.preview.get("target_entities", [])
+            if entity_id in self.runtime.entities
+        ]
+        if names:
+            lines.append(f"Touche : {', '.join(names)}")
+        if pending.preview.get("stamina_cost") is not None:
+            lines.append(
+                f"Coût : {pending.preview['stamina_cost']} STA "
+                f"(reste {pending.preview.get('stamina_remaining', '?')} ce tour)"
+            )
+        self.summary.setText("\n".join(lines))
         self._populate_targets(pending)
         self._populate_dice(pending)
-        action_blocked = pending.kind is PendingKind.ACTION and not self.actions_executable
-        self.resolver_note.setText(
-            "Le resolver d’action n’est pas encore connecté : les cibles et les dés peuvent être vérifiés, mais l’approbation reste désactivée."
-            if action_blocked else ""
-        )
+        waiting = sorted({die.owner for die in pending.proposed_dice.values() if die.awaiting and die.owner})
+        if waiting:
+            self.resolver_note.setText(
+                f"En attente des dés de {', '.join(waiting)}. Approuver maintenant garde les "
+                "valeurs tirées par l'app à leur place."
+            )
+        elif pending.kind is PendingKind.DAMAGE and pending.proposed_dice.get("damage") and pending.proposed_dice["damage"].owner:
+            self.resolver_note.setText("Refuser demande au joueur de relancer ses dés de dégâts.")
+        else:
+            self.resolver_note.setText("")
         self._set_controls(True)
-        self.approve_button.setEnabled(not action_blocked)
+        self.approve_button.setEnabled(True)
         self.reroll_button.setEnabled(bool(pending.proposed_dice))
         self.targets.setEnabled(pending.kind is PendingKind.ACTION)
         self.dice.setEnabled(bool(pending.proposed_dice))
@@ -148,9 +185,12 @@ class PendingPanel(QWidget):
         self.dice.setRowCount(len(entries))
         for row, (key, die) in enumerate(entries):
             vals = ",".join(str(v) for v in die.values)
-            for col, value in enumerate((key, die.label, die.expression, vals, str(die.total))):
+            owner = die.owner or "App"
+            if die.awaiting:
+                owner += " (en attente)"
+            for col, value in enumerate((key, die.label, die.expression, vals, str(die.total), owner)):
                 item = QTableWidgetItem(value)
-                if col in (0, 1, 4):
+                if col in (0, 1, 4, 5):
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self.dice.setItem(row, col, item)
         self.dice.resizeColumnsToContents()

@@ -1,0 +1,425 @@
+diff --git a/libs/gui/player_runtime/panels.py b/libs/gui/player_runtime/panels.py
+index d3ec036..848d5b8 100644
+--- a/libs/gui/player_runtime/panels.py
++++ b/libs/gui/player_runtime/panels.py
+@@ -2,7 +2,6 @@
+ """Player sheet, action controls and chat panels."""
+ from __future__ import annotations
+ 
+-from html import escape
+ from typing import Any
+ 
+ from PySide6.QtCore import Qt, Signal
+@@ -13,6 +12,7 @@ from PySide6.QtWidgets import (
+ )
+ 
+ from ...net import ActionIntent, ActionKind, TargetSelection
++from ..widgets.chat_panel import ChatPanel as SharedChatPanel
+ 
+ 
+ STAT_ORDER = (
+@@ -400,51 +400,19 @@ class ActionPanel(QWidget):
+             self.cancel_pending_requested.emit(self._pending_approval_id)
+ 
+ 
+-class ChatPanel(QWidget):
+-    send_requested = Signal(str)
++class ChatPanel(SharedChatPanel):
++    """Shared chat (with level filters) plus the list of connected players."""
+ 
+     def __init__(self, parent: QWidget | None = None) -> None:
+-        super().__init__(parent)
+-        root = QVBoxLayout(self)
+-        root.setContentsMargins(8, 8, 8, 8)
+-        root.setSpacing(7)
++        super().__init__(parent, settings_scope="PlayerRuntime")
++        self.setObjectName("")
++        self.input.setPlaceholderText("Message…")
++        layout = self.layout()
+         self.players = QListWidget()
+         self.players.setMaximumHeight(110)
+-        root.addWidget(QLabel("Joueurs connectés"))
+-        root.addWidget(self.players)
+-        root.addWidget(QLabel("Discussion"))
+-        self.history = QTextBrowser()
+-        self.history.setOpenExternalLinks(False)
+-        root.addWidget(self.history, 1)
+-        row = QHBoxLayout()
+-        self.input = QLineEdit()
+-        self.input.setPlaceholderText("Message…")
+-        self.send_button = QPushButton("Envoyer")
+-        self.input.returnPressed.connect(self._send)
+-        self.send_button.clicked.connect(self._send)
+-        self.input.setEnabled(False)
+-        self.send_button.setEnabled(False)
+-        row.addWidget(self.input, 1)
+-        row.addWidget(self.send_button)
+-        root.addLayout(row)
+-
+-    def set_connected(self, connected: bool) -> None:
+-        self.input.setEnabled(bool(connected))
+-        self.send_button.setEnabled(bool(connected))
+-
+-    def _send(self) -> None:
+-        message = self.input.text().strip()
+-        if not message:
+-            return
+-        self.input.clear()
+-        self.send_requested.emit(message)
+-
+-    def append_message(self, sender: str, message: str, *, system: bool = False) -> None:
+-        color = "#98a2b1" if system else ("#cba6f7" if sender else "#e5e9ef")
+-        self.history.append(
+-            f'<span style="color:{color};"><b>{escape(str(sender))}</b></span> '
+-            f'<span style="color:#e5e9ef;">{escape(str(message))}</span>'
+-        )
++        layout.insertWidget(0, QLabel("Joueurs connectés"))
++        layout.insertWidget(1, self.players)
++        layout.insertWidget(2, QLabel("Discussion"))
+ 
+     def set_players(self, names: list[str]) -> None:
+         self.players.clear()
+diff --git a/libs/gui/player_runtime/window.py b/libs/gui/player_runtime/window.py
+index 8eaca5e..db1a766 100644
+--- a/libs/gui/player_runtime/window.py
++++ b/libs/gui/player_runtime/window.py
+@@ -20,6 +20,7 @@ from ...net.protocol import ChatMessage, CommandMessage, ErrorMessage
+ from .connection import PlayerNetworkController
+ from .dialogs import DiceRollDialog, InitiativeRollDialog, PlayerLoginDialog, TokenInspectDialog
+ from .map_view import PlayerMapView
++from ..widgets.chat_panel import DEBUG, ERROR, WARNING
+ from .panels import ActionPanel, CharacterPanel, ChatPanel
+ from ..widgets.combat_turn_widget import CombatTurnWidget
+ from .style import PLAYER_RUNTIME_STYLESHEET
+@@ -236,7 +237,7 @@ class PlayerRuntimeWindow(QMainWindow):
+         if label == "connect":
+             if error is not None:
+                 self.connection_label.setText("Échec de connexion")
+-                self.chat_panel.append_message("Système", str(error), system=True)
++                self.chat_panel.append_log(ERROR, str(error))
+                 client = self.controller.client
+                 if (
+                     client is not None
+@@ -282,7 +283,9 @@ class PlayerRuntimeWindow(QMainWindow):
+         if error is not None:
+             self.statusBar().showMessage(f"{label} : {error}", 8000)
+             if label not in {"assets", "runtime_sync"}:
+-                self.chat_panel.append_message("Système", str(error), system=True)
++                self.chat_panel.append_log(ERROR, str(error))
++            else:
++                self.chat_panel.append_log(DEBUG, f"{label} : {error}")
+             return
+         if label == "move":
+             self.statusBar().showMessage("Déplacement envoyé", 4000)
+@@ -316,7 +319,7 @@ class PlayerRuntimeWindow(QMainWindow):
+             return
+         if isinstance(message, ErrorMessage):
+             self._forget_missing_asset_requests()
+-            self.chat_panel.append_message("Réseau", message.reason, system=True)
++            self.chat_panel.append_log(ERROR, message.reason, "Réseau")
+             self.statusBar().showMessage(message.reason, 8000)
+             return
+         if not isinstance(message, CommandMessage):
+@@ -345,7 +348,7 @@ class PlayerRuntimeWindow(QMainWindow):
+             if not self._pending_approval_id:
+                 self._clear_pending()
+             reason = str(args.get("reason", "Demande refusée par le serveur."))
+-            self.chat_panel.append_message("Système", reason, system=True)
++            self.chat_panel.append_log(WARNING, reason)
+             self.statusBar().showMessage(reason, 8000)
+         elif command == "REQUEST_CANCELLED":
+             self._clear_pending()
+@@ -376,7 +379,7 @@ class PlayerRuntimeWindow(QMainWindow):
+             self.chat_panel.append_message("Système", "Le MJ a annulé le jet d'initiative.", system=True)
+         elif command == "INITIATIVE_RESULT":
+             text = f"Initiative envoyée au MJ : {args.get('value', '?')}"
+-            self.chat_panel.append_message("Système", text, system=True)
++            self.chat_panel.append_log(DEBUG, text)
+             self.statusBar().showMessage(text, 5000)
+         elif command == "DICE_ROLL_REQUEST":
+             self._ask_dice(args)
+@@ -388,7 +391,7 @@ class PlayerRuntimeWindow(QMainWindow):
+             values = args.get("values", [])
+             shown = ", ".join(str(value) for value in values) if isinstance(values, list) else str(values)
+             text = f"Jet envoyé au MJ : {shown} (total {args.get('total', '?')})."
+-            self.chat_panel.append_message("Système", text, system=True)
++            self.chat_panel.append_log(DEBUG, text)
+             self.statusBar().showMessage(text, 5000)
+         elif command == "ASSET_CHUNK":
+             self.map_view.update()
+@@ -460,7 +463,7 @@ class PlayerRuntimeWindow(QMainWindow):
+             self._set_pending(True, "", "Touché ! Lance tes dés de dégâts, puis le MJ valide.")
+         if not bool(args.get("success", False)):
+             reason = str(args.get("message") or args.get("reason") or "Action refusée.")
+-            self.chat_panel.append_message("MJ", reason, system=True)
++            self.chat_panel.append_log(WARNING, reason, "MJ")
+             self.statusBar().showMessage(reason, 8000)
+             return
+ 
+diff --git a/libs/gui/runtime/window.py b/libs/gui/runtime/window.py
+index 8c4b9b0..f1c7e20 100644
+--- a/libs/gui/runtime/window.py
++++ b/libs/gui/runtime/window.py
+@@ -33,7 +33,7 @@ from ...net.server import RPGNetworkServer, create_runtime_server
+ from ...runtime.session import Session, SessionRuntime
+ from ...runtime.targeting import TargetingError, targeting_spec
+ from ..theme import CAMPAIGN_MANAGER_STYLESHEET
+-from ..widgets.chat_panel import ChatPanel
++from ..widgets.chat_panel import DEBUG, ERROR, INFO, WARNING, ChatPanel, network_log_level
+ from .bridge import RuntimeNetworkBridge
+ from .combat import CombatPanel
+ from .journal import JournalPanel
+@@ -273,7 +273,7 @@ class RuntimeWindow(QMainWindow):
+         self.combat_dock.raise_()
+ 
+         self.bottom_tabs = QTabWidget()
+-        self.chat_panel = ChatPanel(self.bottom_tabs)
++        self.chat_panel = ChatPanel(self.bottom_tabs, settings_scope="GMRuntime")
+         self.journal_panel = JournalPanel(self.runtime, self.bottom_tabs)
+         self.bottom_tabs.addTab(self.chat_panel, "Chat")
+         self.bottom_tabs.addTab(self.journal_panel, "Journal")
+@@ -746,12 +746,14 @@ class RuntimeWindow(QMainWindow):
+     def _async_done(self, label: str, result, error) -> None:
+         if error is not None:
+             if label == "gm_chat":
+-                self.chat_panel.append_message("Système", str(error), system=True)
++                self.chat_panel.append_log(ERROR, str(error))
+             elif label == "gm_action" or label.startswith(("approve:", "reject:")):
++                self.chat_panel.append_log(WARNING, f"Action impossible : {error}")
+                 QMessageBox.warning(self, "Action impossible", str(error))
+             elif label == "cancel_die":
+-                pass
++                self.chat_panel.append_log(DEBUG, f"Fermeture du dé côté joueur impossible : {error}")
+             else:
++                self.chat_panel.append_log(ERROR, f"Réseau : {error}")
+                 QMessageBox.critical(self, "Runtime réseau", str(error))
+             if label == "server_started":
+                 self._server_starting = False
+@@ -812,6 +814,7 @@ class RuntimeWindow(QMainWindow):
+ 
+     def _network_log(self, message: str) -> None:
+         self.statusBar().showMessage(message, 5000)
++        self.chat_panel.append_log(network_log_level(message), str(message), "Serveur")
+ 
+     # ------------------------------------------------------------- initiative
+     def _player_for_entity(self, entity_id: str) -> str | None:
+@@ -883,6 +886,7 @@ class RuntimeWindow(QMainWindow):
+                 if message:
+                     who = f"{entity.name} — " if entity is not None else ""
+                     self.statusBar().showMessage(who + message, 10000)
++                    self.chat_panel.append_log(INFO, who + message)
+ 
+     async def _approve_async(self, approval_id: str):
+         pending, result = self.gateway.approve(approval_id)
+diff --git a/libs/gui/widgets/chat_panel.py b/libs/gui/widgets/chat_panel.py
+index e4ab908..58c3c3d 100644
+--- a/libs/gui/widgets/chat_panel.py
++++ b/libs/gui/widgets/chat_panel.py
+@@ -1,22 +1,97 @@
+ # -*- coding: utf-8 -*-
+-"""Small shared text chat panel for runtime windows."""
++"""Small shared text chat panel for runtime windows, with log-level filters."""
+ from __future__ import annotations
+ 
++from dataclasses import dataclass
+ from html import escape
+ 
+-from PySide6.QtCore import Signal
+-from PySide6.QtWidgets import QHBoxLayout, QLineEdit, QPushButton, QTextBrowser, QVBoxLayout, QWidget
++from PySide6.QtCore import QSettings, Signal
++from PySide6.QtWidgets import (
++    QCheckBox,
++    QHBoxLayout,
++    QLabel,
++    QLineEdit,
++    QPushButton,
++    QTextBrowser,
++    QVBoxLayout,
++    QWidget,
++)
++
++# Chat messages between people are always shown; the other lines have a level.
++CHAT = "chat"
++DEBUG = "debug"
++INFO = "info"
++WARNING = "warning"
++ERROR = "error"
++
++LEVELS: tuple[tuple[str, str], ...] = (
++    (DEBUG, "Debug"),
++    (INFO, "Info"),
++    (WARNING, "Avertissement"),
++    (ERROR, "Erreur"),
++)
++DEFAULT_LEVELS = frozenset({INFO, WARNING, ERROR})
++LEVEL_COLORS = {DEBUG: "#6c7480", INFO: "#98a2b1", WARNING: "#f9c74f", ERROR: "#ff6b6b"}
++MAX_LINES = 2000
++
++
++def network_log_level(message: str) -> str:
++    """Level of a line of the server log, which carries none of its own."""
++    text = str(message).casefold()
++    if any(word in text for word in ("error", "erreur", "failed", "unavailable", "refused", "denied")):
++        return ERROR
++    if any(word in text for word in ("warning", "manual", "cgnat", "mismatch", "rate limit")):
++        return WARNING
++    if text.startswith(("[auth]", "[session]", "[server]", "[relay]", "[upnp]", "[firewall]")):
++        return INFO
++    return DEBUG
++
++
++@dataclass(frozen=True)
++class ChatLine:
++    level: str
++    sender: str
++    message: str
+ 
+ 
+ class ChatPanel(QWidget):
++    """
++    Chat history plus one checkbox per log level (Debug, Info, Avertissement,
++    Erreur). Messages written by players or the GM are never hidden.
++
++    Args:
++        settings_scope: QSettings application name used to remember the
++                        checked levels ("" to not remember them).
++    """
++
+     send_requested = Signal(str)
+ 
+-    def __init__(self, parent: QWidget | None = None) -> None:
++    def __init__(self, parent: QWidget | None = None, *, settings_scope: str = "") -> None:
+         super().__init__(parent)
+         self.setObjectName("RuntimePanel")
++        self._settings_scope = settings_scope
++        self._lines: list[ChatLine] = []
++        self._levels = set(self._load_levels())
+         root = QVBoxLayout(self)
+         root.setContentsMargins(8, 8, 8, 8)
+         root.setSpacing(7)
++
++        filters = QHBoxLayout()
++        filters.setSpacing(10)
++        title = QLabel("Afficher :")
++        title.setObjectName("Muted")
++        filters.addWidget(title)
++        self.level_boxes: dict[str, QCheckBox] = {}
++        for level, label in LEVELS:
++            box = QCheckBox(label)
++            box.setChecked(level in self._levels)
++            box.setStyleSheet(f"QCheckBox {{ color: {LEVEL_COLORS[level]}; }}")
++            box.toggled.connect(lambda checked, level=level: self.set_level_visible(level, checked))
++            self.level_boxes[level] = box
++            filters.addWidget(box)
++        filters.addStretch(1)
++        root.addLayout(filters)
++
+         self.history = QTextBrowser()
+         self.history.setOpenExternalLinks(False)
+         root.addWidget(self.history, 1)
+@@ -31,6 +106,56 @@ class ChatPanel(QWidget):
+         root.addLayout(row)
+         self.set_connected(False)
+ 
++    # ------------------------------------------------------------ settings
++    def _load_levels(self) -> set[str]:
++        if not self._settings_scope:
++            return set(DEFAULT_LEVELS)
++        try:
++            stored = QSettings("RPGTabletop", self._settings_scope).value("chat/levels")
++        except Exception:
++            return set(DEFAULT_LEVELS)
++        if stored is None:
++            return set(DEFAULT_LEVELS)
++        if isinstance(stored, str):
++            stored = [item for item in stored.split(",") if item]
++        known = {level for level, _label in LEVELS}
++        try:
++            return {str(item) for item in stored} & known
++        except TypeError:
++            return set(DEFAULT_LEVELS)
++
++    def _save_levels(self) -> None:
++        if not self._settings_scope:
++            return
++        try:
++            QSettings("RPGTabletop", self._settings_scope).setValue("chat/levels", ",".join(sorted(self._levels)))
++        except Exception:
++            pass
++
++    # ------------------------------------------------------------ filters
++    def visible_levels(self) -> set[str]:
++        return set(self._levels)
++
++    def set_level_visible(self, level: str, visible: bool) -> None:
++        if (level in self._levels) == bool(visible):
++            return
++        if visible:
++            self._levels.add(level)
++        else:
++            self._levels.discard(level)
++        box = self.level_boxes.get(level)
++        if box is not None and box.isChecked() != bool(visible):
++            box.setChecked(bool(visible))
++        self._save_levels()
++        self._render_all()
++
++    def is_shown(self, line: ChatLine) -> bool:
++        return line.level == CHAT or line.level in self._levels
++
++    def shown_lines(self) -> list[ChatLine]:
++        return [line for line in self._lines if self.is_shown(line)]
++
++    # ------------------------------------------------------------ input
+     def set_connected(self, connected: bool) -> None:
+         self.input.setEnabled(bool(connected))
+         self.send_button.setEnabled(bool(connected))
+@@ -42,14 +167,39 @@ class ChatPanel(QWidget):
+         self.input.clear()
+         self.send_requested.emit(message)
+ 
+-    def append_message(self, sender: str, message: str, *, system: bool = False) -> None:
+-        if system:
+-            color = "#98a2b1"
+-        elif sender.casefold() in {"mj", "gm"}:
+-            color = "#cba6f7"
++    # ------------------------------------------------------------ history
++    def append_message(self, sender: str, message: str, *, system: bool = False, level: str | None = None) -> None:
++        """
++        Add a line. Without `level`, a system line is Info and any other line
++        is a chat message (always shown).
++        """
++        if level is None:
++            level = INFO if system else CHAT
++        line = ChatLine(str(level), str(sender), str(message))
++        self._lines.append(line)
++        if len(self._lines) > MAX_LINES:
++            del self._lines[: len(self._lines) - MAX_LINES]
++        if self.is_shown(line):
++            self.history.append(self._html(line))
++
++    def append_log(self, level: str, message: str, sender: str = "Système") -> None:
++        self.append_message(sender, message, level=level)
++
++    def _render_all(self) -> None:
++        self.history.clear()
++        for line in self.shown_lines():
++            self.history.append(self._html(line))
++
++    @staticmethod
++    def _html(line: ChatLine) -> str:
++        if line.level != CHAT:
++            color = LEVEL_COLORS.get(line.level, LEVEL_COLORS[INFO])
++            text_color = color if line.level in (WARNING, ERROR) else "#c7ced8"
++        elif line.sender.casefold() in {"mj", "gm"}:
++            color, text_color = "#cba6f7", "#e5e9ef"
+         else:
+-            color = "#8ec5ff"
+-        self.history.append(
+-            f'<span style="color:{color};"><b>{escape(str(sender))}</b></span> '
+-            f'<span style="color:#e5e9ef;">{escape(str(message))}</span>'
++            color, text_color = "#8ec5ff", "#e5e9ef"
++        return (
++            f'<span style="color:{color};"><b>{escape(line.sender)}</b></span> '
++            f'<span style="color:{text_color};">{escape(line.message)}</span>'
+         )

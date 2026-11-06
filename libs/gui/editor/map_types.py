@@ -69,6 +69,7 @@ class EditorTool(Enum):
     RECT = auto()
     CIRCLE = auto()
     TEXT = auto()
+    WALL = auto()
 
 
 DRAW_TOOLS: dict[EditorTool, DrawTool] = {

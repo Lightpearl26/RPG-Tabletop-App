@@ -38,6 +38,7 @@ from ...assets.map import (
     MediaCache,
     Rect,
     TextElement,
+    WallElement,
     Vec2,
 )
 
@@ -1424,7 +1425,25 @@ class MapCanvas(QWidget):
                     self._creation_points.append(Vec2(world.x, world.y))
         self.update()
 
+    def _snap_wall_point(self, point: Vec2) -> Vec2:
+        """Walls follow cell edges: their ends go to the nearest grid corner."""
+        grid = self.asset.grid
+        if not grid.enabled or grid.cell_size <= 0:
+            return Vec2(point.x, point.y)
+        size = float(grid.cell_size)
+        return Vec2(
+            grid.offset_x + round((point.x - grid.offset_x) / size) * size,
+            grid.offset_y + round((point.y - grid.offset_y) / size) * size,
+        )
+
     def _drawing_preview(self) -> Optional[DrawingElement]:
+        if self.active_tool is EditorTool.WALL:
+            if self._creation_start is None:
+                return None
+            end = self._creation_current or self._creation_start
+            return WallElement(
+                points=[self._snap_wall_point(self._creation_start), self._snap_wall_point(end)]
+            )
         draw_tool = DRAW_TOOLS.get(self.active_tool)
         if draw_tool is None or self._creation_start is None:
             return None
@@ -1463,6 +1482,8 @@ class MapCanvas(QWidget):
         self._cancel_creation()
         if element is None or not element.points:
             return
+        if isinstance(element, WallElement) and not element.segments():
+            return  # a click without a drag: no zero-length wall
         self._append_element(element, select=True)
 
     def _place_image(self, world: Vec2) -> None:
@@ -3497,6 +3518,9 @@ class MapCanvas(QWidget):
                     self._render_error = str(error)
 
                 self._draw_grid(painter, view)
+                for wall in self.asset.walls():
+                    if wall.visible:
+                        wall.render(painter, self.media)
                 self._draw_initial_camera_overlay(painter)
                 self._draw_tokens(painter, view)
                 self._draw_map_border(painter)
@@ -3534,7 +3558,7 @@ class MapCanvas(QWidget):
                 event.accept()
                 return
 
-            if self.active_tool in DRAW_TOOLS:
+            if self.active_tool in DRAW_TOOLS or self.active_tool is EditorTool.WALL:
                 self._start_drawing_creation(world)
                 event.accept()
                 return

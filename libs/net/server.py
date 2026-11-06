@@ -100,6 +100,10 @@ class RPGNetworkServer:
             self.gateway.on_pending = pending_hook
             if on_initiative is not None:
                 self.gateway.on_initiative = on_initiative
+            if on_pending_updated is not None:
+                self.gateway.on_pending_updated = on_pending_updated
+            # Dice go to the players who are here; the app rolls for the others
+            self.gateway.is_connected = lambda username: username in self.clients
 
     def _log(self, message: str) -> None:
         self.on_log(str(message))
@@ -417,13 +421,37 @@ class RPGNetworkServer:
         ))
 
     async def _apply_gateway_result(self, username: str, result: GatewayResult) -> None:
+        """Replies to the requester (absent for GM requests), messages to other players, sync."""
         session = self.clients.get(username)
-        if session is None:
-            return
-        for reply in result.replies:
-            await session.connection.send(reply)
+        if session is not None:
+            for reply in result.replies:
+                await session.connection.send(reply)
+        for recipient, message in result.outbox:
+            target = self.clients.get(recipient)
+            if target is None:
+                continue
+            try:
+                await target.connection.send(message)
+            except (ConnectionError, OSError, RuntimeError):
+                pass
         if result.broadcast_sync:
             await self.broadcast_runtime_sync()
+
+    async def deliver(self, result: GatewayResult, username: str = "") -> None:
+        """
+        Send what the GM's handling of a request produced: replies to `username`
+        (none for the GM's own requests), dice asked to players, sync.
+        """
+        await self._apply_gateway_result(username, result)
+
+    async def cancel_die(self, owner: str, approval_id: str, key: str) -> None:
+        """The GM rolled a die in a player's place: close the player's dialog."""
+        session = self.clients.get(owner)
+        if session is not None:
+            await session.connection.send(CommandMessage(
+                ServerCommand.DICE_ROLL_CANCELLED.value,
+                {"approval_id": approval_id, "key": key, "reason": "rolled"},
+            ))
 
     async def approve_pending(self, approval_id: str) -> PendingRequest:
         if self.gateway is None:
@@ -435,10 +463,8 @@ class RPGNetworkServer:
     async def reject_pending(self, approval_id: str, *, reason: str = "") -> PendingRequest:
         if self.gateway is None:
             raise RuntimeError("No RuntimeNetworkGateway is connected")
-        pending, message = self.gateway.reject(approval_id, reason=reason)
-        session = self.clients.get(pending.username)
-        if session is not None:
-            await session.connection.send(message)
+        pending, result = self.gateway.reject(approval_id, reason=reason)
+        await self._apply_gateway_result(pending.username, result)
         return pending
 
     def edit_pending_action(
@@ -535,16 +561,22 @@ def create_runtime_server(
     action_executor=None,
     asset_catalog: AssetCatalog | None = None,
     player_bindings: dict[str, str] | None = None,
+    gateway: RuntimeNetworkGateway | None = None,
     **server_callbacks,
 ) -> RPGNetworkServer:
-    """Convenience factory used by the GM application."""
-    pending_callback = server_callbacks.get("on_pending")
-    gateway = RuntimeNetworkGateway(
-        runtime,
-        action_preparer=action_preparer,
-        action_executor=action_executor,
-        require_gm_approval=True,
-    )
+    """
+    Convenience factory used by the GM application.
+
+    Pass the GM window's `gateway` so that requests started without a server
+    (NPC actions) and the ones from players share one list.
+    """
+    if gateway is None:
+        gateway = RuntimeNetworkGateway(
+            runtime,
+            action_preparer=action_preparer,
+            action_executor=action_executor,
+            require_gm_approval=True,
+        )
     server = RPGNetworkServer(
         settings,
         gateway=gateway,

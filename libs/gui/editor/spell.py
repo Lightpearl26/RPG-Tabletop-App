@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 from shiboken6 import isValid
 
 from ...assets.campaign import Campaign
-from ...assets.spell import Formula, RuntimePolicy, Spell, Targeting
+from ...assets.spell import DEFAULT_AREA_SIZE, Formula, RuntimePolicy, Spell, Targeting
 from .base import INVALID_FILENAME_CHARACTERS, ResourceEditor
 from .formula_tester import FormulaTester, describe
 from .spell_effect import ERROR, WARNING, EffectEditor, Issue, issues_html
@@ -154,6 +154,15 @@ class SpellEditor(ResourceEditor):
         self.description_input.setMaximumHeight(160)
 
         self.targeting_input = ValueComboBox(TARGETING_VALUES)
+        self.area_label = QLabel("Area size")
+        self.area_input = self._make_spin_box(" cells")
+        self.area_input.setToolTip(
+            "Radius around the chosen cell: every cell at that distance or closer, "
+            "diagonals counting as one."
+        )
+        self.max_targets_label = QLabel("Max targets")
+        self.max_targets_input = self._make_spin_box("")
+        self.max_targets_input.setSpecialValueText("No limit")
         self.policy_input = ValueComboBox(POLICIES)
         self.policy_hint = QLabel()
         self.policy_hint.setObjectName("SpellEditorHint")
@@ -229,7 +238,9 @@ class SpellEditor(ResourceEditor):
         self.name_input.textChanged.connect(self._on_edited)
         self.cost_input.valueChanged.connect(self._on_edited)
         self.description_input.textChanged.connect(self._on_edited)
-        self.targeting_input.currentIndexChanged.connect(self._on_edited)
+        self.targeting_input.currentIndexChanged.connect(self._on_targeting_changed)
+        self.area_input.valueChanged.connect(self._on_edited)
+        self.max_targets_input.valueChanged.connect(self._on_edited)
         self.policy_input.currentIndexChanged.connect(self._on_policy_changed)
         self.delay_input.valueChanged.connect(self._on_edited)
         self.trigger_input.textChanged.connect(self._on_edited)
@@ -247,12 +258,16 @@ class SpellEditor(ResourceEditor):
         grid.addWidget(self.targeting_input, 0, 1)
         grid.addWidget(QLabel("Policy"), 0, 2)
         grid.addWidget(self.policy_input, 0, 3)
-        grid.addWidget(self.policy_hint, 1, 0, 1, 4)
-        grid.addWidget(self.delay_label, 2, 0)
-        grid.addWidget(self.delay_input, 2, 1)
-        grid.addWidget(self.trigger_label, 3, 0, Qt.AlignmentFlag.AlignTop)
-        grid.addWidget(self.trigger_input, 3, 1, 1, 3)
-        grid.addWidget(self.casting_issues_label, 4, 0, 1, 4)
+        grid.addWidget(self.area_label, 1, 0)
+        grid.addWidget(self.area_input, 1, 1)
+        grid.addWidget(self.max_targets_label, 1, 2)
+        grid.addWidget(self.max_targets_input, 1, 3)
+        grid.addWidget(self.policy_hint, 2, 0, 1, 4)
+        grid.addWidget(self.delay_label, 3, 0)
+        grid.addWidget(self.delay_input, 3, 1)
+        grid.addWidget(self.trigger_label, 4, 0, Qt.AlignmentFlag.AlignTop)
+        grid.addWidget(self.trigger_input, 4, 1, 1, 3)
+        grid.addWidget(self.casting_issues_label, 5, 0, 1, 4)
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(3, 1)
         return group
@@ -292,6 +307,8 @@ class SpellEditor(ResourceEditor):
             self.description_input.setPlainText(str(data.get("description") or ""))
             self.cost_input.setValue(_as_int(data.get("cost"), 0))
             self.targeting_input.set_value(str(data.get("targeting") or "single"))
+            self.area_input.setValue(_as_int(data.get("area_size"), DEFAULT_AREA_SIZE))
+            self.max_targets_input.setValue(_as_int(data.get("max_targets"), 0))
             self.policy_input.set_value(str(data.get("runtime_policy") or "instant"))
             self.delay_input.setValue(_as_int(data.get("delay"), 1))
             self.trigger_input.set_text(str(data.get("trigger_condition") or ""))
@@ -300,6 +317,7 @@ class SpellEditor(ResourceEditor):
         finally:
             self._loading = False
         self._sync_policy_widgets()
+        self._sync_targeting_widgets()
         self._update_issues()
         self._refresh_test_results()
 
@@ -311,6 +329,13 @@ class SpellEditor(ResourceEditor):
         data["effects"] = [row.data() for row in self.effect_rows]
         data["targeting"] = self.targeting_input.value
         data["runtime_policy"] = self.policy_input.value
+        # Like the delay, a stored value is kept when the targeting does not read it
+        if self.targeting_input.value == "area" or "area_size" in self._data:
+            data["area_size"] = self.area_input.value()
+        if self.max_targets_input.value() > 0:
+            data["max_targets"] = self.max_targets_input.value()
+        else:
+            data.pop("max_targets", None)
 
         # A stored delay is kept even when the policy does not read it
         if self.policy_input.value in DELAY_POLICIES or "delay" in self._data:
@@ -348,6 +373,20 @@ class SpellEditor(ResourceEditor):
             return
         self._sync_policy_widgets()
         self._on_edited()
+
+    def _on_targeting_changed(self, *_args: object) -> None:
+        if self._loading:
+            return
+        self._sync_targeting_widgets()
+        self._on_edited()
+
+    def _sync_targeting_widgets(self) -> None:
+        """Area size for area spells, max targets for multi-target spells."""
+        targeting = self.targeting_input.value
+        for widget in (self.area_label, self.area_input):
+            widget.setEnabled(targeting == "area")
+        for widget in (self.max_targets_label, self.max_targets_input):
+            widget.setEnabled(targeting == "multi")
 
     def _sync_policy_widgets(self) -> None:
         """Show what the selected policy uses and grey out the rest."""

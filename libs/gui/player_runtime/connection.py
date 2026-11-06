@@ -123,6 +123,11 @@ class PlayerNetworkController(QObject):
     def send_initiative(self, value: int) -> None:
         self._send_command("initiative", ClientCommand.INITIATIVE_ROLL, {"value": int(value)})
 
+    def send_dice(self, approval_id: str, key: str, values: list[int]) -> None:
+        self._send_command("dice", ClientCommand.DICE_ROLL, {
+            "approval_id": str(approval_id), "key": str(key), "values": [int(value) for value in values],
+        })
+
     def request_end_turn(self) -> None:
         self._send_command("end_turn", ClientCommand.END_TURN_REQUEST)
 

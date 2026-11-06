@@ -12,6 +12,7 @@ from typing import Any
 
 from ..runtime.rules import PLAYER_STAT_NAMES, PRIVATE_STATS, RESOURCE_BAR_STATS
 from ..runtime.session import SessionRuntime, SessionToken
+from ..runtime.targeting import targeting_options
 from ..assets.item import Item
 
 
@@ -274,4 +275,6 @@ def build_player_runtime_projection(
         "combat": _combat_view(runtime, entity_id),
         "actions": runtime.available_actions(entity_id),
         "map": _map_view(runtime, entity_id),
+        # Tokens each action may target now (only tokens this player sees)
+        "targeting": targeting_options(runtime, entity_id).to_dict(),
     }
