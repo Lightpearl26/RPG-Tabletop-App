@@ -7,7 +7,7 @@ import os
 ROOT = os.path.abspath(os.path.join(SPECPATH, os.pardir))
 
 a = Analysis(
-    [os.path.join(ROOT, "app.py")],
+    [os.path.join(ROOT, "rpg_tabletop", "apps", "gm.py")],
     pathex=[ROOT],
     binaries=[],
     datas=[],
