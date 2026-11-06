@@ -7,7 +7,6 @@ campaign menus.
 
 from __future__ import annotations
 
-import json
 import shutil
 from pathlib import Path
 
@@ -38,11 +37,19 @@ from PySide6.QtWidgets import (
 
 from rpg_tabletop.assets import resources
 from rpg_tabletop.assets.campaign import (
+    DEFAULT_CAMPAIGN_NAME,
     Campaign,
     get_current_campaign,
+    open_campaign,
     set_current_campaign,
 )
+from rpg_tabletop.assets.campaign_library import (
+    forget_campaign,
+    is_campaign_dir,
+    recent_campaigns,
+)
 from rpg_tabletop.assets.references import ReferenceUpdate
+from rpg_tabletop.core.paths import default_campaign_dir
 from rpg_tabletop.session import store as session_store
 from rpg_tabletop.ui.campaign_manager.editors.base import ResourceEditor
 from rpg_tabletop.ui.campaign_manager.editors.character import CharacterEditor
@@ -327,6 +334,8 @@ class CampaignManagerWindow(QMainWindow):
             self._on_open_campaign,
             QKeySequence.StandardKey.Open,
         )
+        self.recent_menu = file_menu.addMenu("Open Recent")
+        self.recent_menu.aboutToShow.connect(self._fill_recent_menu)
         self._add_action(file_menu, "Reload Campaign", self._on_reload_campaign, "F5")
         file_menu.addSeparator()
 
@@ -448,6 +457,48 @@ class CampaignManagerWindow(QMainWindow):
         if self._confirm_close(self._open_editors()):
             self.load_campaign(self.campaign)
 
+    def _campaign_dialog_dir(self) -> str:
+        """Starting folder of the New/Open campaign dialogs."""
+        if self.campaign.root.absolute() == default_campaign_dir().absolute():
+            documents = Path.home() / "Documents"
+            return str(documents if documents.is_dir() else Path.home())
+        return str(self.campaign.root.parent)
+
+    def _fill_recent_menu(self) -> None:
+        self.recent_menu.clear()
+        current = self.campaign.root.absolute()
+        for root in recent_campaigns():
+            if root.absolute() == current:
+                continue
+            action = self.recent_menu.addAction(str(root))
+            action.triggered.connect(lambda _checked=False, r=root: self._open_campaign_at(r))
+        if not self.recent_menu.isEmpty():
+            self.recent_menu.addSeparator()
+        default_action = self.recent_menu.addAction("Default Campaign")
+        default_action.setEnabled(default_campaign_dir().absolute() != current)
+        default_action.triggered.connect(
+            lambda _checked=False: self._open_campaign_at(default_campaign_dir())
+        )
+
+    def _open_campaign_at(self, root: Path) -> None:
+        """Open the campaign stored in `root` (the default campaign is created if needed)."""
+        root = Path(root)
+        is_default = root.absolute() == default_campaign_dir().absolute()
+        if not is_default and not is_campaign_dir(root):
+            forget_campaign(root)
+            QMessageBox.warning(self, "Open Campaign", f"No campaign found in {root}.")
+            return
+        if not self._confirm_close(self._open_editors()):
+            return
+        try:
+            if is_campaign_dir(root):
+                campaign = open_campaign(root)
+            else:
+                campaign = Campaign(DEFAULT_CAMPAIGN_NAME, root)
+            self.load_campaign(set_current_campaign(campaign))
+        except OSError as error:
+            QMessageBox.warning(self, "Open Campaign", f"Could not open campaign: {error}")
+
     def _on_new_campaign(self) -> None:
         name, accepted = QInputDialog.getText(self, "New Campaign", "Campaign name:")
         name = name.strip()
@@ -457,7 +508,7 @@ class CampaignManagerWindow(QMainWindow):
             QMessageBox.warning(self, "New Campaign", "Invalid campaign name.")
             return
         parent = QFileDialog.getExistingDirectory(
-            self, "Choose the parent folder", str(self.campaign.root.parent)
+            self, "Choose the parent folder", self._campaign_dialog_dir()
         )
         if not parent:
             return
@@ -474,21 +525,19 @@ class CampaignManagerWindow(QMainWindow):
 
     def _on_open_campaign(self) -> None:
         directory = QFileDialog.getExistingDirectory(
-            self, "Open Campaign", str(self.campaign.root.parent)
+            self, "Open Campaign", self._campaign_dialog_dir()
         )
         if not directory:
             return
         root = Path(directory)
-        manifest = root / "campaign.json"
-        if not manifest.is_file():
+        if not is_campaign_dir(root):
             QMessageBox.warning(self, "Open Campaign", "No campaign.json found in this folder.")
             return
         if not self._confirm_close(self._open_editors()):
             return
         try:
-            name = json.loads(manifest.read_text(encoding="utf-8")).get("name") or root.name
-            self.load_campaign(set_current_campaign(Campaign(str(name), root)))
-        except (OSError, ValueError, AttributeError) as error:
+            self.load_campaign(set_current_campaign(open_campaign(root)))
+        except OSError as error:
             QMessageBox.warning(self, "Open Campaign", f"Could not open campaign: {error}")
 
     def _on_import_resources(self, resource_type: str) -> None:

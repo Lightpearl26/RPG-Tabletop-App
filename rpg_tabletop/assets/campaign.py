@@ -20,8 +20,18 @@ A save state is called a "Session".
 from __future__ import annotations
 from typing import TYPE_CHECKING, Generic, TypeVar
 from typing import Optional
-from json import dump
+import logging
+from json import dumps, loads
 from pathlib import Path
+
+from rpg_tabletop.core.paths import default_campaign_dir
+from .campaign_library import (
+    is_campaign_dir,
+    last_campaign,
+    migrate_legacy_default_campaign,
+    read_campaign_name,
+    remember_campaign,
+)
 
 
 if TYPE_CHECKING:
@@ -31,6 +41,7 @@ if TYPE_CHECKING:
 # Define types and constants
 T = TypeVar("T")
 _CURRENT_CAMPAIGN: Optional[Campaign] = None
+DEFAULT_CAMPAIGN_NAME = "Unnamed Campaign"
 
 
 # Create registries
@@ -281,27 +292,67 @@ class Campaign:
 
 
 # create functions for managing campaigns
+def open_campaign(root: Path) -> Campaign:
+    """
+    Return the campaign stored in `root`, named after its `campaign.json`.
+    """
+    return Campaign(read_campaign_name(root), Path(root))
+
+
+def startup_campaign() -> Campaign:
+    """
+    Campaign to open when the application starts: the one opened last, or the
+    default campaign of this computer.
+
+    The `default_campaign` folder of older versions is migrated first (once). If
+    that copy fails, it is retried at the next start and the old folder is kept.
+    """
+    try:
+        migrate_legacy_default_campaign()
+    except OSError as error:
+        logging.getLogger(__name__).warning("Could not migrate the old default campaign: %s", error)
+    root = last_campaign()
+    if root is not None:
+        return open_campaign(root)
+    root = default_campaign_dir()
+    if is_campaign_dir(root):
+        return open_campaign(root)
+    return Campaign(DEFAULT_CAMPAIGN_NAME, root)
+
+
 def get_current_campaign() -> Campaign:
     """
-    Get the current active campaign. If no campaign is set, a default
-    campaign will be created and set as the current campaign.
+    Get the current active campaign. If no campaign is set, the startup campaign
+    (see `startup_campaign`) becomes the current campaign.
     """
     global _CURRENT_CAMPAIGN
     if _CURRENT_CAMPAIGN is None:
-        set_current_campaign(Campaign("Unnamed Campaign", Path.cwd() / "default_campaign"))
+        set_current_campaign(startup_campaign())
     assert _CURRENT_CAMPAIGN is not None
     return _CURRENT_CAMPAIGN
 
 def set_current_campaign(campaign: Campaign):
     """
-    Set the current active campaign.
+    Set the current active campaign and remember it as the last one opened.
+
+    `campaign.json` only stores the name: the folder can be moved freely. The
+    `root` key written by older versions is dropped, other keys are kept.
     """
     global _CURRENT_CAMPAIGN
     campaign.ensure_directories()
-    with open(campaign.json, "w", encoding="utf-8") as file:
-        dump({
-            "name": campaign.name,
-            "root": str(campaign.root)
-        }, file, ensure_ascii=False, indent=4)
+    data: dict = {}
+    if campaign.json.is_file():
+        try:
+            stored = loads(campaign.json.read_text(encoding="utf-8"))
+            data = stored if isinstance(stored, dict) else {}
+        except (OSError, ValueError):
+            data = {}
+    data.pop("root", None)
+    data["name"] = campaign.name
+    campaign.json.write_text(dumps(data, ensure_ascii=False, indent=4), encoding="utf-8")
+    try:
+        remember_campaign(campaign.root)
+    except OSError as error:  # the recent list is a convenience, never a reason to fail
+        logging.getLogger(__name__).warning("Could not update the recent campaigns: %s", error)
     _CURRENT_CAMPAIGN = campaign
     return _CURRENT_CAMPAIGN

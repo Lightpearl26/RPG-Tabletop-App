@@ -37,22 +37,45 @@ pyinstaller packaging/player.spec
 
 Les exécutables sont écrits dans `dist/`.
 
+## Tests
+
+```powershell
+pytest
+```
+
+Les tests ne demandent pas d'interface graphique. `tests/test_architecture.py` vérifie le sens des dépendances décrit plus bas.
+
+## Où sont les données
+
+- **Campagnes** : une campagne est un dossier autonome contenant un `campaign.json`. Il peut être rangé n'importe où (disque, clé USB, dossier synchronisé) et déplacé librement. On l'ouvre avec *File > Open Campaign…*, et *File > Open Recent* liste les dernières campagnes. Au démarrage, l'application rouvre la dernière campagne ouverte.
+- **Données de cet ordinateur** : dossier `%LOCALAPPDATA%\RPGTabletop` sous Windows. Il contient :
+  - `default_campaign/`, la campagne utilisée quand aucune autre n'est connue ;
+  - `certs/`, le certificat TLS du serveur, unique pour la machine ;
+  - `recent_campaigns.json`.
+
+  La variable d'environnement `RPG_TABLETOP_DATA_DIR` permet de choisir un autre dossier.
+
+Les anciennes versions créaient `default_campaign/` dans le dossier de lancement. Au premier démarrage, ce dossier est copié dans `%LOCALAPPDATA%\RPGTabletop`, ainsi que son certificat, pour que les joueurs n'aient pas à refaire confiance au serveur. L'ancien dossier n'est pas modifié.
+
 ## Organisation du code
 
 ```
 rpg_tabletop/
 ├── apps/               points d'entrée : gm.py (MJ), player.py (joueur)
-├── core/               logique pure : dés, règles, géométrie de grille
-├── assets/             données de campagne et leur persistance
-├── session/            partie en cours : entités, actions, ciblage, initiative, sauvegarde
+├── core/               logique pure : dés, stats, règles, géométrie, dossiers utilisateur
+├── assets/             données de campagne et leur persistance (map/ : cartes)
+├── session/            partie en cours : entités, actions, ciblage, initiative,
+│                       runtime, journal et sauvegarde
 ├── net/                réseau (serveur, client, protocole, TLS, relais) — sans Qt
 └── ui/
     ├── theme/              palette Qt et feuilles de style
     ├── common/             widgets partagés par le MJ et le joueur
     ├── cards/              cartes de ressources et aperçu des formules
-    ├── campaign_manager/   fenêtre principale, navigateur, éditors/ (dont map/)
+    ├── campaign_manager/   fenêtre principale, navigateur, editors/ (dont map/)
     ├── gm_runtime/         fenêtre de partie du MJ
     └── player/             application joueur
+tests/                  tests pytest (sans interface graphique)
+packaging/              specs PyInstaller
 ```
 
-Sens des dépendances : `core` ← `assets` ← `session` ← `net` ← `ui` ← `apps`. Un module n’importe jamais une couche située à sa droite. Seul `ui` dépend de Qt, à une exception près : le rendu des cartes dans `assets/map.py`.
+Sens des dépendances : `core` ← `assets` ← `session` ← `net` ← `ui` ← `apps`. Un module n’importe jamais une couche située à sa droite. Seul `ui` dépend de Qt, à une exception près : le rendu des cartes dans `assets/map/`. Une carte est dessinée par un seul moteur, utilisé à la fois par l'éditeur et par la compilation en tuiles.

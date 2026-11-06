@@ -31,6 +31,7 @@ include = ["rpg_tabletop*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = [".", "tests"]
 
 [tool.pylint.main]
 extension-pkg-allow-list = ["PySide6", "shiboken6"]

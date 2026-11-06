@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from rpg_tabletop.assets.map import DrawTool
+from rpg_tabletop.core.paths import adopt_legacy_certificate, server_certificate_files
 from rpg_tabletop.net.assets import AssetCatalog
 from rpg_tabletop.net.commands import ActionIntent, ActionKind, TargetSelection
 from rpg_tabletop.net.gateway import GM_USER, GatewayResult, RuntimeNetworkGateway
@@ -636,8 +637,9 @@ class RuntimeWindow(QMainWindow):
     # ------------------------------------------------------------- network
     def _server_settings(self) -> ServerSettings:
         self.network_panel.save_settings()
-        runtime_dir = self.campaign.root / ".runtime"
-        runtime_dir.mkdir(parents=True, exist_ok=True)
+        # One certificate per computer; an older one kept in the campaign is reused once
+        adopt_legacy_certificate(self.campaign.root / ".runtime" / "certs")
+        cert_file, key_file = server_certificate_files()
         relay_enabled = self.network_panel.relay_enabled.isChecked()
         relay_host = self.network_panel.relay_host.text().strip()
         relay_key = self.network_panel.relay_key.text().strip()
@@ -656,8 +658,8 @@ class RuntimeWindow(QMainWindow):
             port=self.network_panel.port.value(),
             password=self.network_panel.password.text(),
             tls=TLSSettings(
-                cert_file=str(runtime_dir / "certs" / "server.crt"),
-                key_file=str(runtime_dir / "certs" / "server.key"),
+                cert_file=str(cert_file),
+                key_file=str(key_file),
                 common_name="rpg-tabletop-server",
             ),
             relay=relay,
