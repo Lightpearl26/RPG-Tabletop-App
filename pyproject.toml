@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rpg-tabletop"
+version = "0.1.0"
+description = "Campaign editor (IDE) and online runtime for tabletop RPG campaigns."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+dependencies = [
+    "PySide6==6.11.2",
+    "cryptography>=42",
+    "miniupnpc>=2.2.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pylint>=3",
+    "pyinstaller>=6",
+]
+
+[project.gui-scripts]
+rpg-tabletop = "rpg_tabletop.apps.gm:main"
+rpg-tabletop-player = "rpg_tabletop.apps.player:main"
+
+[tool.setuptools.packages.find]
+include = ["rpg_tabletop*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
+
+[tool.pylint.main]
+extension-pkg-allow-list = ["PySide6", "shiboken6"]
+
+[tool.pylint."messages control"]
+disable = ["protected-access", "redefined-builtin"]
+
+[tool.pylint.typecheck]
+# PySide6 stubs type signals as methods, so connect/emit look missing.
+generated-members = ["^connect$", "^disconnect$", "^emit$"]
