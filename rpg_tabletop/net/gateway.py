@@ -10,8 +10,9 @@ from rpg_tabletop.session.actions import ActionError, CombatResolver, check_dice
 from rpg_tabletop.session.initiative import check_roll
 from rpg_tabletop.session.targeting import TargetingError, resolve_targets
 from rpg_tabletop.core.rules import (
-    PRIVATE_STATS, chebyshev_distance, grid_cell, STRIKE_STAMINA_COST, SHOOT_STAMINA_COST,
+    chebyshev_distance, grid_cell, STRIKE_STAMINA_COST, SHOOT_STAMINA_COST,
 )
+from rpg_tabletop.core.stats import PRIVATE_STATS
 from rpg_tabletop.session.session import SessionEventType, SessionRuntime
 from .commands import ActionIntent, ActionKind, ClientCommand, ServerCommand
 from .models import DiceProposal, PendingKind, PendingRequest, PendingStatus

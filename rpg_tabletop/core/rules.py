@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from math import floor
 from typing import Any
 
+from .stats import CORE_STATS, PUBLIC_RESOURCE_STATS
+
 
 STRIKE_STAMINA_COST = 60
 SHOOT_STAMINA_COST = 60
@@ -18,14 +20,8 @@ PERCEPTION_POINTS_PER_VISION_CELL = 10
 BASE_MOVEMENT_CELLS = 3
 AGILITY_POINTS_PER_MOVEMENT_CELL = 15
 
-# Stats that only the GM may ever see or test.
-PRIVATE_STATS = frozenset({"mental_health", "drug_health"})
-
 # Stats a player may know about (own entity, or a token disclosed by the GM).
-PLAYER_STAT_NAMES = (
-    "hp", "stamina",
-    "str", "con", "dex", "agi", "int", "wis", "cha", "luc", "sur", "per",
-)
+PLAYER_STAT_NAMES = (*PUBLIC_RESOURCE_STATS, *CORE_STATS)
 # Fields the GM can disclose on a token
 DISCLOSABLE_FIELDS = ("name", *PLAYER_STAT_NAMES)
 # Stats drawn as a bar under a token (they come with a `<stat>_max`)

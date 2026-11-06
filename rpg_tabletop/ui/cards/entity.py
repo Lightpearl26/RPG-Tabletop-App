@@ -17,7 +17,8 @@ from PySide6.QtWidgets import (
 )
 
 from .base import ResourceCard
-from . import RESOURCE_PALETTE, STAT_NAMES, STAT_PALETTE
+from rpg_tabletop.core.stats import CORE_STATS as STAT_NAMES
+from rpg_tabletop.ui.theme.palette import RESOURCE_PALETTE, STAT_PALETTE
 from rpg_tabletop.session.entity import Entity
 
 

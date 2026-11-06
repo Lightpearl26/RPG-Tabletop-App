@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from rpg_tabletop.core.rules import PLAYER_STAT_NAMES, PRIVATE_STATS, RESOURCE_BAR_STATS
+from rpg_tabletop.core.rules import PLAYER_STAT_NAMES, RESOURCE_BAR_STATS
+from rpg_tabletop.core.stats import PRIVATE_STATS
 from rpg_tabletop.session.session import SessionRuntime, SessionToken
 from rpg_tabletop.session.targeting import targeting_options
 from rpg_tabletop.assets.item import Item

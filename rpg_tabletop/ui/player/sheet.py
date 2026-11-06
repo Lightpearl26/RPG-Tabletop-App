@@ -22,8 +22,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from rpg_tabletop.core.stats import CORE_STATS, PUBLIC_RESOURCE_STATS as RESOURCE_STATS
 from rpg_tabletop.ui.common.sheet_parts import (
-    CORE_STATS,
     EFFECT_LABELS,
     EFFECTS_COLUMNS,
     EVENTS_COLUMNS,
@@ -46,7 +46,6 @@ from rpg_tabletop.ui.common.sheet_parts import (
 )
 
 
-RESOURCE_STATS = ("hp", "stamina")  # mental and drug health stay GM-only
 SHEET_STATS = (*RESOURCE_STATS, *CORE_STATS)
 
 

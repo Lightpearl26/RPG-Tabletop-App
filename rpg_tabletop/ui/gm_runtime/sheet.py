@@ -41,11 +41,11 @@ from rpg_tabletop.assets.spell import TARGET_STATS, EffectType, RuntimePolicy
 from rpg_tabletop.session import store
 from rpg_tabletop.session.writeback import entity_files_by_id
 from rpg_tabletop.session.entity import Entity
-from rpg_tabletop.core.rules import DISCLOSABLE_FIELDS, PRIVATE_STATS
+from rpg_tabletop.core.rules import DISCLOSABLE_FIELDS
+from rpg_tabletop.core.stats import CORE_STATS, PRIVATE_STATS, RESOURCE_STATS
 from rpg_tabletop.session.session import SessionRuntime
 from rpg_tabletop.session.spell_effect import SpellEffect
 from rpg_tabletop.ui.common.sheet_parts import (
-    CORE_STATS,
     EFFECT_LABELS,
     EFFECTS_COLUMNS,
     EVENTS_COLUMNS,
@@ -69,7 +69,6 @@ from rpg_tabletop.ui.common.sheet_parts import (
 )
 
 
-RESOURCE_STATS = ("hp", "stamina", "mental_health", "drug_health")
 SHEET_STATS = (*RESOURCE_STATS, *CORE_STATS)
 EDIT_DELAY_MS = 450
 

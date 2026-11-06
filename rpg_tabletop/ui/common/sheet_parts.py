@@ -28,7 +28,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from rpg_tabletop.core.stats import PRIVATE_STATS
 from rpg_tabletop.ui.cards.formula import EntityStatBadge, FlowLayout
+from rpg_tabletop.ui.theme.palette import DEFAULT_FIELD_COLOR, RESOURCE_PALETTE, STAT_PALETTE
 from rpg_tabletop.ui.cards.spell import (
     COST_COLOR,
     DELAY_COLOR,
@@ -50,14 +52,12 @@ STAT_LABELS = {
     "agi": "AGI", "int": "INT", "wis": "WIS", "cha": "CHA", "luc": "LUC",
     "sur": "SUR", "per": "PER", "name": "Nom",
 }
+# On the sheets the GM-only gauges are drawn in the neutral color
 STAT_COLORS = {
-    "str": "#E35D6A", "con": "#E39A4A", "dex": "#4C8ED9", "agi": "#43B6D7",
-    "int": "#6E68D8", "wis": "#9B6BDB", "cha": "#D76AAE", "luc": "#D8B84E",
-    "sur": "#58C26A", "per": "#2F7D5A",
-    "hp": "#E35D6A", "stamina": "#D8B84E",
-    "mental_health": "#7F8A9B", "drug_health": "#7F8A9B",
+    **STAT_PALETTE,
+    **RESOURCE_PALETTE,
+    **{stat: DEFAULT_FIELD_COLOR for stat in PRIVATE_STATS},
 }
-CORE_STATS = ("str", "con", "dex", "agi", "int", "wis", "cha", "luc", "sur", "per")
 EFFECT_LABELS = {
     "damage": "Dégâts",
     "heal": "Soin",

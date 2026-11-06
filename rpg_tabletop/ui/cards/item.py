@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 
 # import local modules
 from .base import ResourceCard
-from . import STAT_PALETTE
+from rpg_tabletop.ui.theme.palette import STAT_PALETTE
 from rpg_tabletop.assets.item import Item
 
 

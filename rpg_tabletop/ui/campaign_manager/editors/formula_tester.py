@@ -30,7 +30,7 @@ from rpg_tabletop.assets.campaign import Campaign
 from rpg_tabletop.assets.character import Stats
 from rpg_tabletop.assets.spell import Formula
 from rpg_tabletop.core.dice import DiceAttack, DiceRatio
-from rpg_tabletop.ui.cards import field_color
+from rpg_tabletop.ui.theme.palette import field_color
 from .spell_widgets import SPELL_STATS, ClickableFrame
 
 

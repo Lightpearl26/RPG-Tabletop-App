@@ -32,7 +32,7 @@ from rpg_tabletop.net.runner import AsyncioLoopThread
 from rpg_tabletop.net.server import RPGNetworkServer, create_runtime_server
 from rpg_tabletop.session.session import Session, SessionRuntime
 from rpg_tabletop.session.targeting import TargetingError, targeting_spec
-from rpg_tabletop.ui.theme.stylesheets import CAMPAIGN_MANAGER_STYLESHEET
+from rpg_tabletop.ui.theme.stylesheets import CAMPAIGN_MANAGER_STYLESHEET, GM_RUNTIME_STYLESHEET
 from rpg_tabletop.ui.common.chat_panel import DEBUG, ERROR, INFO, WARNING, ChatPanel, network_log_level
 from .bridge import RuntimeNetworkBridge
 from .combat import CombatPanel
@@ -42,7 +42,6 @@ from .network import NetworkPanel
 from .pending import PendingPanel
 from .players import PlayerAssignmentPanel
 from .sheet import GMCharacterSheet
-from .style import RUNTIME_STYLESHEET
 from .tokens import TokenManagerPanel
 from rpg_tabletop.session.live_sync import RESOURCE_KINDS
 from .add_entities import AddEntitiesDialog
@@ -93,7 +92,7 @@ class RuntimeWindow(QMainWindow):
         self.setWindowTitle(f"RPG Tabletop Runtime — {runtime.session.name}")
         self.resize(1600, 960)
         self.setDockNestingEnabled(True)
-        self.setStyleSheet(CAMPAIGN_MANAGER_STYLESHEET + RUNTIME_STYLESHEET)
+        self.setStyleSheet(CAMPAIGN_MANAGER_STYLESHEET + GM_RUNTIME_STYLESHEET)
 
         self.map_view = RuntimeMapView(runtime, self)
         self._build_toolbar()

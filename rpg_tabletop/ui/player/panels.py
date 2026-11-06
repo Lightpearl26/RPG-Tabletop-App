@@ -11,24 +11,9 @@ from PySide6.QtWidgets import (
 )
 
 from rpg_tabletop.net import ActionIntent, ActionKind, TargetSelection
+from rpg_tabletop.core.stats import CORE_STATS, PUBLIC_RESOURCE_STATS
 from rpg_tabletop.ui.common.chat_panel import ChatPanel as SharedChatPanel
-
-
-STAT_ORDER = (
-    "str", "con", "agi", "dex", "int", "wis", "cha", "luc", "sur", "per",
-    "hp", "stamina",
-)
-STAT_LABELS = {
-    "str": "STR", "con": "CON", "agi": "AGI", "dex": "DEX",
-    "int": "INT", "wis": "WIS", "cha": "CHA", "luc": "LUC",
-    "sur": "SUR", "per": "PER", "hp": "HP", "stamina": "Stamina",
-    "mental_health": "Santé mentale", "drug_health": "Santé toxique",
-}
-STAT_COLORS = {
-    "str": "#E35D6A", "con": "#E39A4A", "dex": "#4C8ED9", "agi": "#43B6D7",
-    "int": "#6E68D8", "wis": "#9B6BDB", "cha": "#D76AAE", "luc": "#D8B84E",
-    "sur": "#58C26A", "per": "#2F7D5A",
-}
+from rpg_tabletop.ui.common.sheet_parts import stat_label
 
 
 class ActionPanel(QWidget):
@@ -102,9 +87,9 @@ class ActionPanel(QWidget):
         stats = entity.get("stats", {}) if isinstance(entity.get("stats"), dict) else {}
         current_stat = self.stat_combo.currentData()
         self.stat_combo.clear()
-        for stat in STAT_ORDER:
+        for stat in (*CORE_STATS, *PUBLIC_RESOURCE_STATS):
             if stat in stats:
-                self.stat_combo.addItem(STAT_LABELS.get(stat, stat.upper()), stat)
+                self.stat_combo.addItem(stat_label(stat), stat)
         if current_stat:
             index = self.stat_combo.findData(current_stat)
             if index >= 0:

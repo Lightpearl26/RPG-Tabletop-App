@@ -13,31 +13,33 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
 
+from .palette import COLORS
 
-# Same colors as the Campaign Manager and Runtime stylesheets
+
+# Same colors as the stylesheets
 _ACTIVE = {
-    QPalette.ColorRole.Window: "#171a21",
-    QPalette.ColorRole.WindowText: "#e5e9ef",
-    QPalette.ColorRole.Base: "#20252e",
-    QPalette.ColorRole.AlternateBase: "#1c2028",
-    QPalette.ColorRole.ToolTipBase: "#20252e",
-    QPalette.ColorRole.ToolTipText: "#e5e9ef",
-    QPalette.ColorRole.Text: "#e5e9ef",
-    QPalette.ColorRole.Button: "#292f3a",
-    QPalette.ColorRole.ButtonText: "#d9dee7",
+    QPalette.ColorRole.Window: COLORS["window"],
+    QPalette.ColorRole.WindowText: COLORS["text"],
+    QPalette.ColorRole.Base: COLORS["base"],
+    QPalette.ColorRole.AlternateBase: COLORS["surface"],
+    QPalette.ColorRole.ToolTipBase: COLORS["base"],
+    QPalette.ColorRole.ToolTipText: COLORS["text"],
+    QPalette.ColorRole.Text: COLORS["text"],
+    QPalette.ColorRole.Button: COLORS["button"],
+    QPalette.ColorRole.ButtonText: COLORS["button_text"],
     QPalette.ColorRole.BrightText: "#ffffff",
-    QPalette.ColorRole.Link: "#b59be0",
-    QPalette.ColorRole.Highlight: "#7356b5",
+    QPalette.ColorRole.Link: COLORS["link"],
+    QPalette.ColorRole.Highlight: COLORS["accent"],
     QPalette.ColorRole.HighlightedText: "#ffffff",
-    QPalette.ColorRole.PlaceholderText: "#6f7a8a",
+    QPalette.ColorRole.PlaceholderText: COLORS["disabled"],
 }
 
 _DISABLED = {
-    QPalette.ColorRole.WindowText: "#6f7a8a",
-    QPalette.ColorRole.Text: "#6f7a8a",
-    QPalette.ColorRole.ButtonText: "#6f7a8a",
-    QPalette.ColorRole.Highlight: "#3a4351",
-    QPalette.ColorRole.HighlightedText: "#aeb7c4",
+    QPalette.ColorRole.WindowText: COLORS["disabled"],
+    QPalette.ColorRole.Text: COLORS["disabled"],
+    QPalette.ColorRole.ButtonText: COLORS["disabled"],
+    QPalette.ColorRole.Highlight: COLORS["border_strong"],
+    QPalette.ColorRole.HighlightedText: COLORS["text_secondary"],
 }
 
 

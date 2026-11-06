@@ -21,7 +21,8 @@ from PySide6.QtWidgets import (
 
 from rpg_tabletop.assets.campaign import Campaign
 from rpg_tabletop.session.entity import StatsModifier
-from rpg_tabletop.ui.cards import STAT_NAMES, STAT_PALETTE
+from rpg_tabletop.core.stats import CORE_STATS, RESOURCE_STATS
+from rpg_tabletop.ui.theme.palette import STAT_PALETTE
 from .base import ResourceEditor
 
 
@@ -115,7 +116,7 @@ class EntityEditor(ResourceEditor):
         grid.setSpacing(14)
         stats_group = QGroupBox("Stat modifiers")
         stats_layout = QGridLayout(stats_group)
-        stat_names = list(dict.fromkeys(("hp", "stamina", "mental_health", "drug_health", *STAT_NAMES)))
+        stat_names = [*RESOURCE_STATS, *CORE_STATS]
         for index, stat in enumerate(stat_names):
             label = QLabel(stat.upper())
             if stat in STAT_PALETTE:

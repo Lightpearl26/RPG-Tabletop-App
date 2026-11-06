@@ -56,17 +56,12 @@ from PySide6.QtWidgets import (
 )
 
 # import local modules
-from . import (
-    STAT_PALETTE,
-    RESOURCE_PALETTE,
-)
+from rpg_tabletop.ui.theme.palette import field_color
 
 
 # ------------------------------------------------------------------
 # Constants
 # ------------------------------------------------------------------
-
-DEFAULT_FIELD_COLOR = "#7F8A9B"
 
 ENTITY_COLOR = "#4A5262"
 
@@ -77,25 +72,6 @@ RATIO_BACKGROUND = "#171B24"
 
 ATTACK_COLOR = "#E39A4A"
 ATTACK_BACKGROUND = "#342B28"
-
-
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
-
-def field_color(
-    field_name: str,
-) -> str:
-    """
-    Return the color associated with a stat or resource field.
-    """
-    field_name = field_name.lower()
-
-    return (
-        STAT_PALETTE.get(field_name)
-        or RESOURCE_PALETTE.get(field_name)
-        or DEFAULT_FIELD_COLOR
-    )
 
 
 # ------------------------------------------------------------------

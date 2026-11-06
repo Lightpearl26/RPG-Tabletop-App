@@ -20,7 +20,8 @@ from PySide6.QtWidgets import (
 )
 
 from rpg_tabletop.assets.spell import TARGET_SCOPES
-from rpg_tabletop.ui.cards import RESOURCE_PALETTE, STAT_NAMES
+from rpg_tabletop.core.stats import CORE_STATS as STAT_NAMES
+from rpg_tabletop.ui.theme.palette import RESOURCE_PALETTE
 from rpg_tabletop.ui.cards.formula import FormulaPreview
 
 

@@ -23,7 +23,8 @@ from PySide6.QtWidgets import (
 )
 
 from rpg_tabletop.assets.campaign import Campaign
-from rpg_tabletop.ui.cards import RESOURCE_PALETTE, STAT_NAMES, field_color
+from rpg_tabletop.core.stats import CORE_STATS as STAT_NAMES
+from rpg_tabletop.ui.theme.palette import RESOURCE_PALETTE, field_color
 from .base import ResourceEditor
 
 

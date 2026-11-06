@@ -23,7 +23,7 @@ from .map_view import PlayerMapView
 from rpg_tabletop.ui.common.chat_panel import DEBUG, ERROR, INFO, WARNING
 from .panels import ActionPanel, ChatPanel
 from rpg_tabletop.ui.common.combat_turn import CombatTurnWidget
-from .style import PLAYER_RUNTIME_STYLESHEET
+from rpg_tabletop.ui.theme.stylesheets import PLAYER_STYLESHEET
 from .sheet import CharacterSheetWindow
 
 
@@ -57,7 +57,7 @@ class PlayerRuntimeWindow(QMainWindow):
         self.setWindowTitle("RPG Tabletop — Joueur")
         self.resize(1440, 900)
         self.setMinimumSize(980, 640)
-        self.setStyleSheet(PLAYER_RUNTIME_STYLESHEET)
+        self.setStyleSheet(PLAYER_STYLESHEET)
         self._sheet: CharacterSheetWindow | None = None
         self._initiative_dialog: InitiativeRollDialog | None = None
         # Dice the GM's app asked for: (approval id, key) -> dialog
