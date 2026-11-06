@@ -41,7 +41,6 @@ from PySide6.QtWidgets import (
     QSizePolicy,
 )
 
-from ...assets.campaign import get_current_campaign
 from ...assets.map import (
     ImageElement,
     MapAsset,

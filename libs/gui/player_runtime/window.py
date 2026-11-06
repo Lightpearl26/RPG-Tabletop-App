@@ -9,10 +9,10 @@ import shutil
 from typing import Any
 
 from PySide6.QtCore import QStandardPaths, QTimer, Qt, QSettings
-from PySide6.QtGui import QCloseEvent, QAction
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QDialog, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QSplitter,
-    QTabWidget, QVBoxLayout, QWidget, QScrollArea, QFrame,
+    QVBoxLayout, QWidget, QScrollArea, QFrame,
 )
 
 from ...net import ClientSettings
@@ -21,10 +21,9 @@ from .connection import PlayerNetworkController
 from .dialogs import DiceRollDialog, InitiativeRollDialog, PlayerLoginDialog, TokenInspectDialog
 from .map_view import PlayerMapView
 from ..widgets.chat_panel import DEBUG, ERROR, INFO, WARNING
-from .panels import ActionPanel, CharacterPanel, ChatPanel
+from .panels import ActionPanel, ChatPanel
 from ..widgets.combat_turn_widget import CombatTurnWidget
 from .style import PLAYER_RUNTIME_STYLESHEET
-from .panels import ActionPanel, ChatPanel
 from .sheet import CharacterSheetWindow
 
 

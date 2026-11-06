@@ -12,8 +12,7 @@ from .commands import ActionIntent, ClientCommand, ServerCommand
 from .config import ClientSettings
 from .connection import NetworkConnection
 from .protocol import (
-    PROTOCOL_VERSION, ChatMessage, CommandMessage, ErrorMessage, MessageType,
-    NetworkMessage, PingMessage,
+    PROTOCOL_VERSION, ChatMessage, CommandMessage, ErrorMessage, NetworkMessage, PingMessage,
 )
 from .tls import build_client_ssl_context, peer_certificate_fingerprint, verify_peer_fingerprint
 

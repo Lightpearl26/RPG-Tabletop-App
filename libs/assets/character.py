@@ -11,9 +11,7 @@ character attributes, stats, and other character-related operations in the game.
 # import built-in modules
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Optional
 from json import load
-from pathlib import Path
 from os.path import exists
 
 # import local modules

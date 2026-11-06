@@ -785,7 +785,6 @@ class PlayerMapView(QWidget):
             return
         if event.button() != Qt.MouseButton.LeftButton or self._drag_token_id is None:
             return
-        token_id = self._drag_token_id
         target = self._drag_preview or self._drag_start
         self._drag_token_id = None
         self._drag_preview = None

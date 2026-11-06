@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
-    QComboBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
-    QLineEdit, QListWidget, QPushButton, QScrollArea, QTabWidget, QTextBrowser,
-    QVBoxLayout, QWidget,
+    QComboBox, QGroupBox, QHBoxLayout, QLabel,
+    QListWidget, QPushButton, QVBoxLayout, QWidget,
 )
 
 from ...net import ActionIntent, ActionKind, TargetSelection
@@ -30,103 +29,6 @@ STAT_COLORS = {
     "int": "#6E68D8", "wis": "#9B6BDB", "cha": "#D76AAE", "luc": "#D8B84E",
     "sur": "#58C26A", "per": "#2F7D5A",
 }
-
-
-class CharacterPanel(QWidget):
-    """Read-only view of the local player's own Entity projection."""
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        root = QVBoxLayout(self)
-        root.setContentsMargins(10, 10, 10, 10)
-        root.setSpacing(8)
-        self.name_label = QLabel("En attente de ton Entity")
-        self.name_label.setObjectName("PlayerTitle")
-        root.addWidget(self.name_label)
-        self.character_label = QLabel("Aucune Entity liée par le MJ")
-        self.character_label.setObjectName("PlayerMuted")
-        root.addWidget(self.character_label)
-
-        self.resource_group = QGroupBox("Ressources")
-        self.resource_form = QFormLayout(self.resource_group)
-        self.resource_values: dict[str, QLabel] = {}
-        for key, label in (("hp", "HP"), ("stamina", "Stamina")):
-            value = QLabel("—")
-            self.resource_values[key] = value
-            self.resource_form.addRow(label, value)
-        root.addWidget(self.resource_group)
-
-        self.tabs = QTabWidget()
-        stats_page = QWidget()
-        stats_layout = QGridLayout(stats_page)
-        stats_layout.setContentsMargins(8, 8, 8, 8)
-        stats_layout.setHorizontalSpacing(14)
-        stats_layout.setVerticalSpacing(7)
-        self.stat_values: dict[str, QLabel] = {}
-        for index, stat in enumerate(STAT_ORDER):
-            if stat in {"hp", "stamina"}:
-                continue
-            label = QLabel(STAT_LABELS[stat])
-            label.setStyleSheet(f"color: {STAT_COLORS[stat]}; font-weight: 700;")
-            value = QLabel("—")
-            value.setAlignment(Qt.AlignmentFlag.AlignRight)
-            self.stat_values[stat] = value
-            row, col = divmod(len(self.stat_values) - 1, 2)
-            stats_layout.addWidget(label, row, col * 2)
-            stats_layout.addWidget(value, row, col * 2 + 1)
-        stats_layout.setColumnStretch(1, 1)
-        stats_layout.setColumnStretch(3, 1)
-        self.tabs.addTab(stats_page, "Caractéristiques")
-
-        self.items_list = QListWidget()
-        self.tabs.addTab(self.items_list, "Inventaire")
-        self.spells_list = QListWidget()
-        self.tabs.addTab(self.spells_list, "Sorts")
-        root.addWidget(self.tabs, 1)
-
-        self.effects_label = QLabel("Effets actifs : —")
-        self.effects_label.setWordWrap(True)
-        self.effects_label.setObjectName("PlayerMuted")
-        root.addWidget(self.effects_label)
-
-    def set_entity(self, entity: dict[str, Any] | None) -> None:
-        if not isinstance(entity, dict):
-            self.name_label.setText("En attente de ton Entity")
-            self.character_label.setText("Le MJ doit encore lier une Entity à ton joueur.")
-            for label in (*self.resource_values.values(), *self.stat_values.values()):
-                label.setText("—")
-            self.items_list.clear()
-            self.spells_list.clear()
-            self.effects_label.setText("Effets actifs : —")
-            return
-
-        self.name_label.setText(str(entity.get("name", "Entity")))
-        self.character_label.setText(f"Personnage : {entity.get('character', '—')}")
-        stats = entity.get("stats", {}) if isinstance(entity.get("stats"), dict) else {}
-        stats_max = entity.get("stats_max", {}) if isinstance(entity.get("stats_max"), dict) else {}
-        for key, label in self.resource_values.items():
-            value = stats.get(key, "—")
-            maximum = stats_max.get(key)
-            label.setText(f"{value} / {maximum}" if maximum is not None and key in stats else str(value))
-        for key, label in self.stat_values.items():
-            label.setText(str(stats.get(key, "—")))
-
-        self.items_list.clear()
-        for item in entity.get("items", []) if isinstance(entity.get("items"), list) else []:
-            if isinstance(item, dict):
-                name = str(item.get("name") or item.get("id") or "Objet")
-                quantity = item.get("quantity")
-                self.items_list.addItem(f"{name} × {quantity}" if quantity is not None else name)
-            else:
-                self.items_list.addItem(str(item))
-        self.spells_list.clear()
-        spells = entity.get("spells", {}) if isinstance(entity.get("spells"), dict) else {}
-        for name, spell in spells.items():
-            detail = spell if isinstance(spell, dict) else {}
-            self.spells_list.addItem(f"{name}  •  {detail.get('cost', '?')} stamina  •  {detail.get('targeting', 'single')}")
-        effects = entity.get("spell_effects", [])
-        events = entity.get("spell_events", [])
-        self.effects_label.setText(f"Effets actifs : {len(effects) if isinstance(effects, list) else 0}  •  Événements actifs : {len(events) if isinstance(events, list) else 0}")
 
 
 class ActionPanel(QWidget):

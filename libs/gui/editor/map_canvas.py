@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from math import cos, hypot, radians, sin, sqrt
+from math import hypot, sqrt
 from pathlib import Path
 from typing import Optional
 
@@ -20,7 +20,6 @@ from PySide6.QtGui import (
     QKeySequence,
     QMouseEvent,
     QPainter,
-    QPainterPath,
     QPen,
     QPolygonF,
     QWheelEvent,

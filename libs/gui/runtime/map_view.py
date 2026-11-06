@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QColor, QImage, QMouseEvent, QPainter, QPen, QBrush, QWheelEvent,
     QDragEnterEvent, QDragMoveEvent, QDropEvent,
