@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from rpg_tabletop.assets.spell import TARGET_SCOPES, EffectType, Formula
-from rpg_tabletop.ui.cards.formula import EntityStatBadge
+from rpg_tabletop.ui.cards.formula_parts import EntityStatBadge
 from rpg_tabletop.ui.cards.spell import (
     EFFECT_BONUS_COLOR,
     EFFECT_MALUS_COLOR,

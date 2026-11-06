@@ -14,7 +14,8 @@ from PySide6.QtWidgets import QWidget
 
 from rpg_tabletop.assets.map import DrawingElement, DrawTool, MapAsset, MediaCache, Rect, Vec2
 from rpg_tabletop.core.geometry import GridGeometry, area_cells, chebyshev, line_cells
-from rpg_tabletop.session.session import SessionRuntime, SessionToken
+from rpg_tabletop.session.models import SessionToken
+from rpg_tabletop.session.runtime import SessionRuntime
 from .tokens import TOKEN_ENTITY_MIME
 from rpg_tabletop.ui.common.token_overlay import draw_token_overlay
 

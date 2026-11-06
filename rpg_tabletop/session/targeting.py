@@ -40,7 +40,8 @@ from rpg_tabletop.core.geometry import (
 )
 
 if TYPE_CHECKING:
-    from .session import SessionRuntime, SessionToken
+    from .models import SessionToken
+    from .runtime import SessionRuntime
 
 
 STRIKE_REACH = 1

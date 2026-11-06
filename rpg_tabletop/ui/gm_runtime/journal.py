@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QAbstractItemView, QComboBox, QHBoxLayout, QLabel, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
 
-from rpg_tabletop.session.session import SessionEventType, SessionRuntime
+from rpg_tabletop.session.models import SessionEventType
+from rpg_tabletop.session.runtime import SessionRuntime
 
 
 class JournalPanel(QWidget):

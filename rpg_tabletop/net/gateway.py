@@ -13,7 +13,8 @@ from rpg_tabletop.core.rules import (
     chebyshev_distance, grid_cell, STRIKE_STAMINA_COST, SHOOT_STAMINA_COST,
 )
 from rpg_tabletop.core.stats import PRIVATE_STATS
-from rpg_tabletop.session.session import SessionEventType, SessionRuntime
+from rpg_tabletop.session.models import SessionEventType
+from rpg_tabletop.session.runtime import SessionRuntime
 from .commands import ActionIntent, ActionKind, ClientCommand, ServerCommand
 from .models import DiceProposal, PendingKind, PendingRequest, PendingStatus
 from .projection import build_player_runtime_projection

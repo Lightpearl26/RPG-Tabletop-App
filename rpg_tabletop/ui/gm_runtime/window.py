@@ -30,7 +30,8 @@ from rpg_tabletop.net.config import RelaySettings, ServerSettings, TLSSettings
 from rpg_tabletop.net.protocol import ChatMessage
 from rpg_tabletop.net.runner import AsyncioLoopThread
 from rpg_tabletop.net.server import RPGNetworkServer, create_runtime_server
-from rpg_tabletop.session.session import Session, SessionRuntime
+from rpg_tabletop.session.journal import Session
+from rpg_tabletop.session.runtime import SessionRuntime
 from rpg_tabletop.session.targeting import TargetingError, targeting_spec
 from rpg_tabletop.ui.theme.stylesheets import CAMPAIGN_MANAGER_STYLESHEET, GM_RUNTIME_STYLESHEET
 from rpg_tabletop.ui.common.chat_panel import DEBUG, ERROR, INFO, WARNING, ChatPanel, network_log_level

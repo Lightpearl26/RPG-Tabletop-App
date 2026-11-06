@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from rpg_tabletop.session.session import SessionRuntime
+from rpg_tabletop.session.runtime import SessionRuntime
 
 
 TOKEN_ENTITY_MIME = "application/x-rpg-tabletop-session-entity"

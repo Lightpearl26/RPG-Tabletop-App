@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 
 from rpg_tabletop.session import store
 from rpg_tabletop.session.entity import Entity
-from rpg_tabletop.session.session import SessionRuntime
+from rpg_tabletop.session.runtime import SessionRuntime
 
 
 class AddEntitiesDialog(QDialog):

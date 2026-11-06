@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
 )
 
 from rpg_tabletop.net.models import PendingKind, PendingRequest
-from rpg_tabletop.session.session import SessionRuntime
+from rpg_tabletop.session.runtime import SessionRuntime
 
 
 KIND_LABELS = {"strike": "Strike", "shoot": "Shoot"}

@@ -27,7 +27,8 @@ from uuid import uuid4
 
 from rpg_tabletop.assets.campaign import Campaign
 from .entity import Entity
-from .session import SESSION_FILE, Session, SessionRuntime
+from .journal import SESSION_FILE, Session
+from .runtime import SessionRuntime
 
 
 INVALID_NAME_CHARACTERS = '<>:"/\\|?*'

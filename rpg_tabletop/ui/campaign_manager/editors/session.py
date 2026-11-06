@@ -44,7 +44,7 @@ from PySide6.QtWidgets import (
 
 from rpg_tabletop.assets.campaign import Campaign
 from rpg_tabletop.session import store
-from rpg_tabletop.session.session import SESSION_FILE, Session
+from rpg_tabletop.session.journal import SESSION_FILE, Session
 from .base import ResourceEditor
 
 

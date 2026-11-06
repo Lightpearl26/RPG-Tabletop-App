@@ -29,7 +29,8 @@ from PySide6.QtWidgets import (
 )
 
 from rpg_tabletop.core.stats import PRIVATE_STATS
-from rpg_tabletop.ui.cards.formula import EntityStatBadge, FlowLayout
+from rpg_tabletop.ui.cards.formula_parts import EntityStatBadge
+from .flow_layout import FlowLayout
 from rpg_tabletop.ui.theme.palette import DEFAULT_FIELD_COLOR, RESOURCE_PALETTE, STAT_PALETTE
 from rpg_tabletop.ui.cards.spell import (
     COST_COLOR,

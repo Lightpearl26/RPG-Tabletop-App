@@ -20,10 +20,8 @@ from PySide6.QtWidgets import (
 
 # import local modules
 from .base import ResourceCard
-from .formula import (
-    EntityStatBadge,
-    FormulaPreview,
-)
+from .formula import FormulaPreview
+from .formula_parts import EntityStatBadge
 from rpg_tabletop.assets.spell import Spell
 
 

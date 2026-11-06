@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 
 from rpg_tabletop.ui.common.combat_turn import CombatTurnWidget
 from rpg_tabletop.session.initiative import InitiativeRoster, RollSource, roll_d20
-from rpg_tabletop.session.session import SessionRuntime
+from rpg_tabletop.session.runtime import SessionRuntime
 
 
 ROLE_ID = Qt.ItemDataRole.UserRole

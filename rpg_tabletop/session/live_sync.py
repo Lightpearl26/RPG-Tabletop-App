@@ -36,7 +36,7 @@ from rpg_tabletop.assets.spell import Spell
 from .entity import StatsModifier
 
 if TYPE_CHECKING:
-    from .session import SessionRuntime
+    from .runtime import SessionRuntime
 
 
 # Resource type of the IDE -> kind of asset update
@@ -64,7 +64,7 @@ class AssetUpdate:
 
 def _snapshotters():
     # Imported late: session.py imports this module.
-    from .session import _character_to_dict, _spell_to_dict
+    from .snapshot import _character_to_dict, _spell_to_dict
 
     return _character_to_dict, _spell_to_dict
 

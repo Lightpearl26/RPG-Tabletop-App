@@ -32,7 +32,8 @@ from .spell_effect import EffectType, SpellEffect
 from .spell_event import SpellEvent, share_effects
 
 if TYPE_CHECKING:
-    from .session import SessionEvent, SessionRuntime
+    from .models import SessionEvent
+    from .runtime import SessionRuntime
 
 
 ATTACK_KINDS = ("strike", "shoot")
@@ -227,7 +228,7 @@ class CombatResolver:
         source_id: str,
         target_ids: Iterable[str],
     ) -> SessionEvent:
-        from .session import SessionEventType
+        from .models import SessionEventType
 
         states_before, effects_before = before
         changed = {}
@@ -261,7 +262,7 @@ class CombatResolver:
         """
         Step 1 of a strike or a shot: spend the turn stamina and find the damage dice.
         """
-        from .session import SessionEventType
+        from .models import SessionEventType
 
         if kind not in ATTACK_KINDS:
             raise ActionError(f"Unknown attack: {kind}")

@@ -43,7 +43,7 @@ from rpg_tabletop.session.writeback import entity_files_by_id
 from rpg_tabletop.session.entity import Entity
 from rpg_tabletop.core.rules import DISCLOSABLE_FIELDS
 from rpg_tabletop.core.stats import CORE_STATS, PRIVATE_STATS, RESOURCE_STATS
-from rpg_tabletop.session.session import SessionRuntime
+from rpg_tabletop.session.runtime import SessionRuntime
 from rpg_tabletop.session.spell_effect import SpellEffect
 from rpg_tabletop.ui.common.sheet_parts import (
     EFFECT_LABELS,
