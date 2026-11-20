@@ -16,6 +16,7 @@ import sys
 from PySide6.QtWidgets import QApplication
 
 from rpg_tabletop.ui.campaign_manager.window import CampaignManagerWindow
+from rpg_tabletop.ui.common.update_dialog import startup_update_check
 from rpg_tabletop.ui.theme.qt_palette import apply_dark_theme
 
 
@@ -33,6 +34,9 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("RPG Tabletop App")
     apply_dark_theme(app)
+
+    if startup_update_check("gm"):
+        return 0  # the installer (or a new process) takes over
 
     window = CampaignManagerWindow()
     window.show()

@@ -7,7 +7,26 @@ Le projet contient deux applications :
 - **RPG Tabletop** (MJ) : gestionnaire de campagne (personnages, sorts, objets, cartes, sessions) et runtime de partie qui héberge le serveur.
 - **RPG Tabletop Player** : client joueur qui se connecte au runtime du MJ.
 
-## Installation
+## Installer les applications
+
+Télécharger l'installeur sur la [page des versions](https://github.com/Lightpearl26/RPG-Tabletop-App/releases/latest) :
+
+- `RPGTabletop-Setup.exe` pour le MJ ;
+- `RPGTabletopPlayer-Setup.exe` pour les joueurs.
+
+L'installation se fait pour l'utilisateur courant (`%LOCALAPPDATA%\Programs`), sans droits administrateur. Windows SmartScreen peut avertir au premier lancement car l'installeur n'est pas signé : *Informations complémentaires > Exécuter quand même*.
+
+### Mises à jour
+
+Au démarrage, chaque application compare sa version à la dernière version publiée sur GitHub. Si elle est plus récente, elle propose de la télécharger : l'installeur est vérifié (somme SHA-256 de `SHA256SUMS.txt`), lancé en mode silencieux, puis l'application redémarre. *Ignorer cette version* ne la propose plus au démarrage ; chez le MJ, *Help > Check for Updates…* vérifie à la demande.
+
+L'application joueur vérifie avant de se connecter, pour rester à la même version que le serveur du MJ.
+
+Lancée depuis les sources (dépôt git), l'application compare la branche locale à sa branche distante et propose un `git pull --ff-only`. Si `requirements.txt` ou `pyproject.toml` changent, elle demande de relancer `pip install -r requirements.txt`.
+
+La variable d'environnement `RPG_TABLETOP_NO_UPDATE=1` désactive la vérification au démarrage.
+
+## Développement
 
 Python 3.12 ou plus récent.
 
@@ -28,14 +47,29 @@ python -m rpg_tabletop.apps.player     # application joueur
 
 Dans VS Code, utiliser une configuration de lancement de type `module` avec `rpg_tabletop` ou `rpg_tabletop.apps.player`.
 
-## Construire les exécutables
+## Construire les installeurs
+
+Il faut PyInstaller (`pip install -e .[dev]`) et [Inno Setup 6](https://jrsoftware.org/isdl.php) (`winget install JRSoftware.InnoSetup`).
 
 ```powershell
-pyinstaller packaging/gm.spec
-pyinstaller packaging/player.spec
+.\packaging\build.ps1
 ```
 
-Les exécutables sont écrits dans `dist/`.
+Le script construit les deux applications (`dist\RPGTabletop\`, `dist\RPGTabletopPlayer\`), puis les installeurs et `SHA256SUMS.txt` dans `dist\installers\`.
+
+## Publier une version
+
+La version est définie à un seul endroit : `__version__` dans `rpg_tabletop/__init__.py`.
+
+```powershell
+# après avoir passé __version__ à "0.2.0" et commité
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+Le workflow `.github/workflows/release.yml` lance les tests, construit les installeurs sous Windows et crée la version GitHub avec les deux installeurs et `SHA256SUMS.txt`. Les applications installées la proposent à leur démarrage suivant.
+
+Un tag avec suffixe (`v0.2.0-rc1`) est publié comme pré-version : les applications ne la proposent pas, ce qui permet de tester un build avant de le diffuser.
 
 ## Tests
 
@@ -51,7 +85,10 @@ Les tests ne demandent pas d'interface graphique. `tests/test_architecture.py` v
 - **Données de cet ordinateur** : dossier `%LOCALAPPDATA%\RPGTabletop` sous Windows. Il contient :
   - `default_campaign/`, la campagne utilisée quand aucune autre n'est connue ;
   - `certs/`, le certificat TLS du serveur, unique pour la machine ;
-  - `recent_campaigns.json`.
+  - `recent_campaigns.json` ;
+  - `update.json`, les versions ignorées.
+
+  La désinstallation ne touche pas à ce dossier.
 
   La variable d'environnement `RPG_TABLETOP_DATA_DIR` permet de choisir un autre dossier.
 
@@ -67,7 +104,7 @@ rpg_tabletop/
 ├── session/            partie en cours : entités, actions, ciblage, initiative,
 │                       journal et sauvegarde ; runtime/ : SessionRuntime découpé en
 │                       mixins (events, player_rules, maps, entities, sheet_edits, combat)
-├── net/                réseau (serveur, client, protocole, TLS, relais) — sans Qt
+├── net/                réseau (serveur, client, protocole, TLS, relais, mises à jour) — sans Qt
 └── ui/
     ├── theme/              palette Qt et feuilles de style
     ├── common/             widgets partagés par le MJ et le joueur
@@ -76,7 +113,7 @@ rpg_tabletop/
     ├── gm_runtime/         fenêtre de partie du MJ
     └── player/             application joueur
 tests/                  tests pytest (sans interface graphique)
-packaging/              specs PyInstaller
+packaging/              specs PyInstaller, installeur Inno Setup, build.ps1
 ```
 
 Sens des dépendances : `core` ← `assets` ← `session` ← `net` ← `ui` ← `apps`. Un module n’importe jamais une couche située à sa droite. Seul `ui` dépend de Qt, à une exception près : le rendu des cartes dans `assets/map/`. Une carte est dessinée par un seul moteur, utilisé à la fois par l'éditeur et par la compilation en tuiles.

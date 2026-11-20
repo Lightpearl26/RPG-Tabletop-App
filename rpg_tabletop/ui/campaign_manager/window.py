@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from rpg_tabletop import __version__
 from rpg_tabletop.assets import resources
 from rpg_tabletop.assets.campaign import (
     DEFAULT_CAMPAIGN_NAME,
@@ -71,6 +72,7 @@ from rpg_tabletop.ui.cards.session import THEME as SESSION_CARD_THEME
 from rpg_tabletop.ui.cards.session import SessionCard
 from rpg_tabletop.ui.cards.spell import THEME as SPELL_CARD_THEME
 from rpg_tabletop.ui.cards.spell import SpellCard
+from rpg_tabletop.ui.common.update_dialog import manual_update_check
 from rpg_tabletop.ui.gm_runtime import RuntimeWindow
 from rpg_tabletop.ui.theme.stylesheets import CAMPAIGN_MANAGER_STYLESHEET
 
@@ -422,6 +424,22 @@ class CampaignManagerWindow(QMainWindow):
         )
         self._add_action(
             view_menu, "Previous Tab", lambda: self._step_tab(-1), "Ctrl+PgUp"
+        )
+
+        help_menu = menu_bar.addMenu("Help")
+        self._add_action(help_menu, "Check for Updates...", self._on_check_updates)
+        self._add_action(help_menu, "About RPG Tabletop", self._on_about)
+
+    def _on_check_updates(self) -> None:
+        if manual_update_check("gm", self, before_install=self.close):
+            QApplication.quit()
+
+    def _on_about(self) -> None:
+        QMessageBox.about(
+            self,
+            "About RPG Tabletop",
+            f"<b>RPG Tabletop</b> {__version__}<br>"
+            "Éditeur de campagnes et runtime en ligne pour jeux de rôle sur table.",
         )
 
     def _edit_focused(self, method_name: str) -> None:

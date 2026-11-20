@@ -8,7 +8,8 @@ Everything that belongs to this computer rather than to a campaign lives here:
     <user data>/RPGTabletop/
     ├── default_campaign/        # campaign opened when no other one is known
     ├── certs/                   # TLS certificate of the game server (one per machine)
-    └── recent_campaigns.json    # campaigns opened recently, most recent first
+    ├── recent_campaigns.json    # campaigns opened recently, most recent first
+    └── update.json              # update choices (version the user chose to skip)
 
 <user data> is %LOCALAPPDATA% on Windows, ~/Library/Application Support on macOS and
 $XDG_DATA_HOME (~/.local/share) elsewhere. The RPG_TABLETOP_DATA_DIR environment
@@ -51,6 +52,11 @@ def default_campaign_dir() -> Path:
 def recent_campaigns_file() -> Path:
     """JSON list of the campaigns opened recently."""
     return user_data_dir() / "recent_campaigns.json"
+
+
+def update_state_file() -> Path:
+    """JSON file of the update choices, shared by the GM and player applications."""
+    return user_data_dir() / "update.json"
 
 
 def certificates_dir() -> Path:
