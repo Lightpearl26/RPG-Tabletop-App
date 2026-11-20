@@ -1,10 +1,10 @@
-"""Updater: versions, GitHub release parsing, checked downloads and git checkouts."""
+"""In-app updater: saved choices, launcher restart and git checkouts."""
 
 from __future__ import annotations
 
-import hashlib
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -12,67 +12,13 @@ import pytest
 from rpg_tabletop.net import update
 
 
-# -- versions ------------------------------------------------------------------
+# -- settings and launcher -------------------------------------------------------
 
-@pytest.mark.parametrize(
-    "text, expected",
-    [
-        ("0.1.0", (0, 1)),
-        ("v1.2.3", (1, 2, 3)),
-        ("V2", (2,)),
-        ("1.10.0-rc1", (1, 10)),
-        ("garbage", ()),
-        ("", ()),
-    ],
-)
-def test_parse_version(text, expected):
-    assert update.parse_version(text) == expected
-
-
-def test_is_newer():
-    assert update.is_newer("0.2.0", "0.1.9")
-    assert update.is_newer("v1.10", "1.9.9")
-    assert not update.is_newer("1.0", "1.0.0")
-    assert not update.is_newer("0.9", "1.0")
-    assert not update.is_newer("nightly", "0.1")
-
-
-# -- releases ------------------------------------------------------------------
-
-def _release_json(tag="v9.0.0", assets=(update.GM_INSTALLER, update.CHECKSUMS_ASSET), base="https://x"):
-    return {
-        "tag_name": tag,
-        "body": "## Nouveautés",
-        "html_url": "https://github.com/o/r/releases/tag/" + tag,
-        "assets": [
-            {"name": name, "browser_download_url": f"{base}/{name}", "size": 10} for name in assets
-        ],
-    }
-
-
-def test_parse_release():
-    release = update.parse_release(_release_json())
-    assert release.version == "9.0.0" and release.tag == "v9.0.0"
-    assert release.notes == "## Nouveautés"
-    assert release.asset(update.GM_INSTALLER).url == "https://x/" + update.GM_INSTALLER
-    assert release.asset("missing.exe") is None
-
-
-def test_check_for_update_offers_newer_release_with_the_right_installer():
-    fetch = lambda timeout: _release_json()  # noqa: E731
-    assert update.check_for_update(update.GM_INSTALLER, "0.1.0", fetch=fetch).version == "9.0.0"
-    # same version, or no installer for this application: nothing to offer
-    assert update.check_for_update(update.GM_INSTALLER, "9.0", fetch=fetch) is None
-    assert update.check_for_update(update.PLAYER_INSTALLER, "0.1.0", fetch=fetch) is None
-
-
-def test_skipped_versions_are_remembered_per_application():
-    assert update.skipped("gm") == ""
-    update.skip("gm", "9.0.0")
+def test_skipped_values_are_remembered_per_key():
+    assert update.skipped("git") == ""
     update.skip("git", "abc")
-    assert update.skipped("gm") == "9.0.0"
-    assert update.skipped("player") == ""
     assert update.skipped("git") == "abc"
+    assert update.skipped("other") == ""
 
 
 def test_updates_can_be_disabled(monkeypatch):
@@ -81,64 +27,20 @@ def test_updates_can_be_disabled(monkeypatch):
     assert update.updates_disabled()
 
 
-# -- download and checksum -----------------------------------------------------
-
-def test_expected_checksum():
-    sums = "aa11  RPGTabletop-Setup.exe\r\nBB22 *RPGTabletopPlayer-Setup.exe\n"
-    assert update.expected_checksum(sums, "RPGTabletop-Setup.exe") == "aa11"
-    assert update.expected_checksum(sums, "RPGTabletopPlayer-Setup.exe") == "bb22"
-    assert update.expected_checksum(sums, "other.exe") is None
-
-
-def _published_release(tmp_path, content=b"installer", listed_hash=None):
-    """A release whose files are served from a local folder (file:// URLs)."""
-    server = tmp_path / "server"
-    server.mkdir()
-    (server / update.GM_INSTALLER).write_bytes(content)
-    digest = listed_hash or hashlib.sha256(content).hexdigest()
-    (server / update.CHECKSUMS_ASSET).write_text(f"{digest}  {update.GM_INSTALLER}\n")
-    return update.parse_release(_release_json(base=server.as_uri()))
+def test_launcher_path_comes_from_the_environment(tmp_path, monkeypatch):
+    assert update.launcher_path() is None
+    launcher = tmp_path / "launcher.pyw"
+    monkeypatch.setenv(update.LAUNCHER_ENV, str(launcher))
+    assert update.launcher_path() is None  # missing file
+    launcher.write_text("")
+    assert update.launcher_path() == launcher
 
 
-def test_download_installer_checks_the_checksum(tmp_path):
-    release = _published_release(tmp_path, b"x" * 600_000)
-    seen = []
-    path = update.download_installer(
-        release, update.GM_INSTALLER, progress=lambda done, total: seen.append((done, total)),
-        directory=tmp_path / "downloads",
-    )
-    assert path.read_bytes() == b"x" * 600_000
-    assert seen[-1] == (600_000, 600_000)
-    assert [p.name for p in path.parent.iterdir()] == [path.name]  # no partial file left
-
-
-def test_corrupted_download_is_deleted(tmp_path):
-    release = _published_release(tmp_path, listed_hash="0" * 64)
-    with pytest.raises(update.UpdateError, match="SHA-256"):
-        update.download_installer(release, update.GM_INSTALLER, directory=tmp_path / "downloads")
-    assert not any((tmp_path / "downloads").iterdir())
-
-
-def test_installer_without_checksum_is_refused(tmp_path):
-    release = update.parse_release(_release_json(assets=(update.GM_INSTALLER,)))
-    with pytest.raises(update.UpdateError, match=update.CHECKSUMS_ASSET):
-        update.download_installer(release, update.GM_INSTALLER, directory=tmp_path)
-
-
-def test_download_can_be_cancelled(tmp_path):
-    release = _published_release(tmp_path)
-    with pytest.raises(update.UpdateCancelled):
-        update.download_installer(
-            release, update.GM_INSTALLER, cancelled=lambda: True, directory=tmp_path / "d"
-        )
-    assert not any((tmp_path / "d").iterdir())
-
-
-def test_installer_is_started_silently_with_relaunch(tmp_path):
+def test_restart_with_launcher_asks_for_a_check(tmp_path):
     calls = []
-    update.start_installer(tmp_path / "setup.exe", popen=lambda cmd, **kw: calls.append(cmd))
-    assert calls == [[str(tmp_path / "setup.exe"), "/SILENT", "/SUPPRESSMSGBOXES",
-                      "/NORESTART", "/CLOSEAPPLICATIONS", "/RELAUNCH=1"]]
+    launcher = tmp_path / "launcher.pyw"
+    update.restart_with_launcher(launcher, "gm", popen=lambda cmd, **kw: calls.append(cmd))
+    assert calls == [[sys.executable, str(launcher), "gm", "--check"]]
 
 
 # -- git checkout --------------------------------------------------------------

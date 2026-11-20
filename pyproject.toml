@@ -19,7 +19,6 @@ dependencies = [
 dev = [
     "pytest>=8",
     "pylint>=3",
-    "pyinstaller>=6",
 ]
 
 [project.gui-scripts]

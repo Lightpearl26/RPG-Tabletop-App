@@ -9,22 +9,21 @@ Le projet contient deux applications :
 
 ## Installer les applications
 
-Télécharger l'installeur sur la [page des versions](https://github.com/Lightpearl26/RPG-Tabletop-App/releases/latest) :
-
-- `RPGTabletop-Setup.exe` pour le MJ ;
-- `RPGTabletopPlayer-Setup.exe` pour les joueurs.
-
-L'installation se fait pour l'utilisateur courant (`%LOCALAPPDATA%\Programs`), sans droits administrateur. Windows SmartScreen peut avertir au premier lancement car l'installeur n'est pas signé : *Informations complémentaires > Exécuter quand même*.
+Un seul installeur, `RPGTabletop-Setup.exe`, propose deux types d'installation : *Joueur*, ou *Maître du jeu et joueur*. Il contient tout ce qu'il faut (Python embarqué, Qt et les autres dépendances) : rien n'est à installer avant. L'installation se fait pour l'utilisateur courant (`%LOCALAPPDATA%\Programs\RPG Tabletop`), sans droits administrateur. Windows SmartScreen peut avertir au premier lancement car l'installeur n'est pas signé : *Informations complémentaires > Exécuter quand même*.
 
 ### Mises à jour
 
-Au démarrage, chaque application compare sa version à la dernière version publiée sur GitHub. Si elle est plus récente, elle propose de la télécharger : l'installeur est vérifié (somme SHA-256 de `SHA256SUMS.txt`), lancé en mode silencieux, puis l'application redémarre. *Ignorer cette version* ne la propose plus au démarrage ; chez le MJ, *Help > Check for Updates…* vérifie à la demande.
+Les raccourcis lancent d'abord le lanceur (`packaging/launcher.py`). Il lit `__version__` dans `rpg_tabletop/__init__.py` sur la branche `main` de GitHub. Si elle diffère de la version installée, il propose la mise à jour : le code de `main` est téléchargé et remplace celui installé, puis l'application démarre. *Ignorer cette version* ne la propose plus. Chez le MJ, *Help > Check for Updates…* relance le lanceur pour vérifier à la demande.
 
-L'application joueur vérifie avant de se connecter, pour rester à la même version que le serveur du MJ.
+Si `requirements.txt` change, les nouvelles dépendances sont installées avec pip dans une fenêtre de console, puis l'application démarre. Si quoi que ce soit échoue (pas de réseau, pip), la version installée démarre ; les erreurs sont notées dans `%LOCALAPPDATA%\RPGTabletop\launcher.log`.
+
+Le dépôt doit être public : le lanceur lit GitHub sans identifiant.
 
 Lancée depuis les sources (dépôt git), l'application compare la branche locale à sa branche distante et propose un `git pull --ff-only`. Si `requirements.txt` ou `pyproject.toml` changent, elle demande de relancer `pip install -r requirements.txt`.
 
-La variable d'environnement `RPG_TABLETOP_NO_UPDATE=1` désactive la vérification au démarrage.
+Variables d'environnement :
+- `RPG_TABLETOP_NO_UPDATE=1` : pas de vérification au démarrage ;
+- `RPG_TABLETOP_UPDATE_BRANCH=<branche>` : le lanceur suit une autre branche que `main` (tests).
 
 ## Développement
 
@@ -34,7 +33,7 @@ Python 3.12 ou plus récent.
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
-# outils de développement (tests, pylint, PyInstaller)
+# outils de développement (tests, pylint)
 pip install -e .[dev]
 ```
 
@@ -47,29 +46,29 @@ python -m rpg_tabletop.apps.player     # application joueur
 
 Dans VS Code, utiliser une configuration de lancement de type `module` avec `rpg_tabletop` ou `rpg_tabletop.apps.player`.
 
-## Construire les installeurs
-
-Il faut PyInstaller (`pip install -e .[dev]`) et [Inno Setup 6](https://jrsoftware.org/isdl.php) (`winget install JRSoftware.InnoSetup`).
-
-```powershell
-.\packaging\build.ps1
-```
-
-Le script construit les deux applications (`dist\RPGTabletop\`, `dist\RPGTabletopPlayer\`), puis les installeurs et `SHA256SUMS.txt` dans `dist\installers\`.
-
 ## Publier une version
 
 La version est définie à un seul endroit : `__version__` dans `rpg_tabletop/__init__.py`.
 
 ```powershell
-# après avoir passé __version__ à "0.2.0" et commité
-git tag v0.2.0
-git push origin v0.2.0
+# passer __version__ à "0.2.0", puis
+git commit -am "Version 0.2.0"
+git push origin main
 ```
 
-Le workflow `.github/workflows/release.yml` lance les tests, construit les installeurs sous Windows et crée la version GitHub avec les deux installeurs et `SHA256SUMS.txt`. Les applications installées la proposent à leur démarrage suivant.
+Au lancement suivant, les applications installées proposent la mise à jour. Un push qui ne change pas `__version__` n'est proposé à personne : on peut pousser des corrections intermédiaires et ne changer la version que lorsqu'elles sont prêtes à être diffusées.
 
-Un tag avec suffixe (`v0.2.0-rc1`) est publié comme pré-version : les applications ne la proposent pas, ce qui permet de tester un build avant de le diffuser.
+## Construire l'installeur
+
+Il faut [Inno Setup 6](https://jrsoftware.org/isdl.php) (`winget install JRSoftware.InnoSetup`) et une connexion internet.
+
+```powershell
+.\packaging\build.ps1
+```
+
+Le script télécharge Python embarqué (version réglable avec `-PythonVersion`), y installe `requirements.txt`, ajoute le code et le lanceur, vérifie que les deux applications s'importent, puis écrit `dist\installers\RPGTabletop-Setup.exe`.
+
+L'installeur n'est à refaire que pour de nouveaux utilisateurs (sinon il installe un code ancien, que le lanceur met à jour au premier lancement) ou pour changer de version de Python. On peut le diffuser comme on veut, par exemple en pièce jointe d'une release GitHub créée à la main.
 
 ## Tests
 
@@ -113,7 +112,7 @@ rpg_tabletop/
     ├── gm_runtime/         fenêtre de partie du MJ
     └── player/             application joueur
 tests/                  tests pytest (sans interface graphique)
-packaging/              specs PyInstaller, installeur Inno Setup, build.ps1
+packaging/              lanceur, installeur Inno Setup, build.ps1
 ```
 
 Sens des dépendances : `core` ← `assets` ← `session` ← `net` ← `ui` ← `apps`. Un module n’importe jamais une couche située à sa droite. Seul `ui` dépend de Qt, à une exception près : le rendu des cartes dans `assets/map/`. Une carte est dessinée par un seul moteur, utilisé à la fois par l'éditeur et par la compilation en tuiles.

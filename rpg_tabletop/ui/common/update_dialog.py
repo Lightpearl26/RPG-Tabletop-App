@@ -3,29 +3,27 @@
 """
 Update dialogs of the GM and player applications.
 
-``startup_update_check`` runs before the main window opens: it is silent when there
-is nothing to do or when GitHub cannot be reached. ``manual_update_check`` is behind
-the *Help > Check for Updates* menu and always says what it found.
+In the installed version the launcher updates the code before the application
+starts (packaging/launcher.py); *Help > Check for Updates* closes the application
+and starts the launcher again. From a source checkout, the application itself
+offers ``git pull`` when the remote branch has new commits.
 
-Both return True when the application must quit at once, because an installer or a
-new process has been started to replace it.
+``startup_update_check`` and ``manual_update_check`` return True when the
+application must quit at once, because a new process takes over.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QEventLoop, Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QHBoxLayout,
     QLabel,
     QMessageBox,
-    QProgressDialog,
     QPushButton,
     QTextBrowser,
     QVBoxLayout,
@@ -34,11 +32,6 @@ from PySide6.QtWidgets import (
 
 from rpg_tabletop import __version__
 from rpg_tabletop.net import update
-
-# Application key -> installer asset of the GitHub release
-INSTALLERS = {"gm": update.GM_INSTALLER, "player": update.PLAYER_INSTALLER}
-
-_CHECK_TIMEOUT = 4.0
 
 
 @contextmanager
@@ -107,160 +100,32 @@ class UpdateDialog(QDialog):
         self.accept()
 
 
-class _DownloadWorker(QThread):
-    """Downloads and checks an installer outside the GUI thread."""
-
-    progress = Signal(int, int)
-    succeeded = Signal(str)
-    failed = Signal(str)
-
-    def __init__(self, release: update.ReleaseInfo, asset_name: str) -> None:
-        super().__init__()
-        self._release = release
-        self._asset_name = asset_name
-
-    def run(self) -> None:  # noqa: D401 (Qt override)
-        try:
-            path = update.download_installer(
-                self._release,
-                self._asset_name,
-                progress=lambda done, total: self.progress.emit(done // 1024, total // 1024),
-                cancelled=self.isInterruptionRequested,
-            )
-        except update.UpdateCancelled:
-            self.failed.emit("")
-        except update.UpdateError as error:
-            self.failed.emit(str(error))
-        else:
-            self.succeeded.emit(str(path))
-
-
-class _DownloadProgressDialog(QProgressDialog):
-    """
-    Progress window of a download.
-
-    The worker's signals are connected to methods of this widget, so Qt delivers
-    them in the GUI thread.
-    """
-
-    def __init__(self, version: str, parent: QWidget | None) -> None:
-        super().__init__(f"Téléchargement de la version {version}…", "Annuler", 0, 0, parent)
-        self.version = version
-        self.path: str = ""
-        self.error: str = ""
-        self.setWindowTitle("Mise à jour")
-        self.setWindowModality(Qt.WindowModality.ApplicationModal)
-        self.setMinimumDuration(0)
-        self.setAutoClose(False)
-        self.setAutoReset(False)
-
-    def on_progress(self, done_kib: int, total_kib: int) -> None:
-        if total_kib > 0:
-            self.setMaximum(total_kib)
-            self.setValue(min(done_kib, total_kib))
-            self.setLabelText(
-                f"Téléchargement de la version {self.version}… "
-                f"{done_kib / 1024:.1f} / {total_kib / 1024:.1f} Mo"
-            )
-
-    def on_succeeded(self, path: str) -> None:
-        self.path = path
-
-    def on_failed(self, message: str) -> None:
-        self.error = message
-
-
-def _download(release: update.ReleaseInfo, asset_name: str, parent: QWidget | None) -> Path | None:
-    """Download with a progress window; None if cancelled or failed (already reported)."""
-    dialog = _DownloadProgressDialog(release.version, parent)
-    worker = _DownloadWorker(release, asset_name)
-    loop = QEventLoop()
-    worker.progress.connect(dialog.on_progress)
-    worker.succeeded.connect(dialog.on_succeeded)
-    worker.failed.connect(dialog.on_failed)
-    worker.finished.connect(loop.quit)
-    dialog.canceled.connect(worker.requestInterruption)
-
-    dialog.show()
-    worker.start()
-    loop.exec()
-    worker.wait()
-    QApplication.processEvents()  # deliver the last queued signals
-    dialog.close()
-
-    if dialog.path:
-        return Path(dialog.path)
-    if dialog.error:
-        _report_failure(dialog.error, release.page_url, parent)
-    return None
-
-
-def _report_failure(message: str, page_url: str, parent: QWidget | None) -> None:
-    box = QMessageBox(parent)
-    box.setIcon(QMessageBox.Icon.Warning)
-    box.setWindowTitle("Mise à jour")
-    box.setText("La mise à jour n'a pas pu être installée.")
-    box.setInformativeText(message)
-    if page_url:
-        open_button = box.addButton("Ouvrir la page de la version", QMessageBox.ButtonRole.ActionRole)
-        box.addButton(QMessageBox.StandardButton.Close)
-        box.exec()
-        if box.clickedButton() is open_button:
-            QDesktopServices.openUrl(QUrl(page_url))
-    else:
-        box.exec()
-
-
 # ----------------------------------------------------------------------------
-# Installed version: GitHub releases
+# Installed version: launcher
 # ----------------------------------------------------------------------------
 
-def _check_release(
-    app_key: str, parent: QWidget | None, manual: bool, before_install: Callable[[], bool] | None
-) -> bool:
-    asset_name = INSTALLERS[app_key]
-    update.cleanup_downloads()
-    try:
-        with _busy():
-            release = update.check_for_update(asset_name, timeout=_CHECK_TIMEOUT)
-    except update.UpdateError as error:
-        if manual:
-            QMessageBox.warning(parent, "Mise à jour", str(error))
-        return False
-
-    if release is None:
-        if manual:
-            QMessageBox.information(
-                parent, "Mise à jour", f"Vous avez la dernière version ({__version__})."
-            )
-        return False
-    if not manual and update.skipped(app_key) == release.version:
-        return False
-
-    link = f' — <a href="{release.page_url}">page de la version</a>' if release.page_url else ""
-    dialog = UpdateDialog(
-        "Mise à jour disponible",
-        f"<b>La version {release.version} est disponible.</b><br>"
-        f"Version installée : {__version__}{link}<br><br>"
-        "L'application se fermera, puis se relancera une fois la mise à jour installée.",
-        release.notes or "*Pas de notes pour cette version.*",
-        parent=parent,
+def _check_with_launcher(
+    app_key: str, parent: QWidget | None, before_install: Callable[[], bool] | None
+) -> bool | None:
+    """None when the application was not started by the launcher."""
+    launcher = update.launcher_path()
+    if launcher is None:
+        return None
+    answer = QMessageBox.question(
+        parent,
+        "Mise à jour",
+        f"Version installée : {__version__}.<br><br>"
+        "Pour chercher une mise à jour, l'application va se fermer et le lanceur "
+        "va vérifier la version sur GitHub. Continuer ?",
     )
-    dialog.exec()
-    if dialog.choice == UpdateDialog.SKIP:
-        update.skip(app_key, release.version)
-    if dialog.choice != UpdateDialog.UPDATE:
-        return False
-
-    installer = _download(release, asset_name, parent)
-    if installer is None:
+    if answer != QMessageBox.StandardButton.Yes:
         return False
     if before_install is not None and not before_install():
         return False
     try:
-        update.start_installer(installer)
+        update.restart_with_launcher(launcher, app_key)
     except update.UpdateError as error:
-        _report_failure(str(error), release.page_url, parent)
+        QMessageBox.warning(parent, "Mise à jour", str(error))
         return False
     return True
 
@@ -358,20 +223,21 @@ def _check_git(
 # Entry points
 # ----------------------------------------------------------------------------
 
-def startup_update_check(app_key: str, parent: QWidget | None = None) -> bool:
+def startup_update_check(app_key: str, parent: QWidget | None = None) -> bool:  # pylint: disable=unused-argument
     """
     Check for an update when the application starts.
+
+    Only from a source checkout: the installed version was already checked by the
+    launcher.
 
     Args:
         app_key: "gm" or "player".
 
     Returns:
-        True if the application must quit to let the update run.
+        True if the application must quit (it restarts with the new code).
     """
-    if update.updates_disabled():
+    if update.updates_disabled() or update.launcher_path() is not None:
         return False
-    if update.is_frozen():
-        return _check_release(app_key, parent, False, None)
     return _check_git(parent, False, None)
 
 
@@ -381,13 +247,14 @@ def manual_update_check(
     before_install: Callable[[], bool] | None = None,
 ) -> bool:
     """
-    Same as startup_update_check, but reports every outcome and ignores skipped versions.
+    *Help > Check for Updates*: reports every outcome and ignores skipped versions.
 
     Args:
-        before_install: called once the update is ready, just before it replaces the
-            application; returning False cancels it. The GM window passes its
-            ``close`` method so that unsaved changes are handled first.
+        before_install: called just before the application is replaced or closed;
+            returning False cancels. The GM window passes its ``close`` method so that
+            unsaved changes are handled first.
     """
-    if update.is_frozen():
-        return _check_release(app_key, parent, True, before_install)
+    result = _check_with_launcher(app_key, parent, before_install)
+    if result is not None:
+        return result
     return _check_git(parent, True, before_install)
