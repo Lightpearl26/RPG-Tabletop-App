@@ -4,6 +4,7 @@
 ;   python\        embedded Python with every dependency of requirements.txt
 ;   app\           the code (rpg_tabletop\, requirements.txt, launcher.py)
 ;   launcher.pyw   the launcher, which keeps app\ up to date with the main branch
+;   app.ico        icon of the shortcuts (drawn in packaging\app_icon.svg)
 ;
 ; The shortcuts start "python\pythonw.exe launcher.pyw player" (or gm). Nothing has to
 ; be installed beforehand, and the installation is per user (%LOCALAPPDATA%\Programs),
@@ -26,6 +27,7 @@
 #define AppName "RPG Tabletop"
 #define RepoUrl "https://github.com/Lightpearl26/RPG-Tabletop-App"
 #define Pythonw "{app}\python\pythonw.exe"
+#define Icon "{app}\app.ico"
 
 #if !FileExists(StageDir + "\launcher.pyw")
   #error build\installer is missing: run packaging\build.ps1
@@ -52,7 +54,8 @@ OutputBaseFilename=RPGTabletop-Setup
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
-UninstallDisplayIcon={#Pythonw}
+UninstallDisplayIcon={#Icon}
+SetupIconFile={#AddBackslash(SourcePath)}..\rpg_tabletop\ui\theme\app_icon.ico
 UninstallDisplayName={#AppName}
 CloseApplications=yes
 RestartApplications=no
@@ -83,10 +86,12 @@ Type: filesandordirs; Name: "{app}\python"
 Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\RPG Tabletop Player"; Filename: "{#Pythonw}"; Parameters: """{app}\launcher.pyw"" player"; WorkingDir: "{app}"; Components: player
-Name: "{autoprograms}\RPG Tabletop"; Filename: "{#Pythonw}"; Parameters: """{app}\launcher.pyw"" gm"; WorkingDir: "{app}"; Components: gm
-Name: "{autodesktop}\RPG Tabletop Player"; Filename: "{#Pythonw}"; Parameters: """{app}\launcher.pyw"" player"; WorkingDir: "{app}"; Components: player; Tasks: desktopicon
-Name: "{autodesktop}\RPG Tabletop"; Filename: "{#Pythonw}"; Parameters: """{app}\launcher.pyw"" gm"; WorkingDir: "{app}"; Components: gm; Tasks: desktopicon
+; AppUserModelID: same IDs as rpg_tabletop\ui\theme\app_icon.py, so that the windows
+; are grouped under this icon in the taskbar, and not under Python's
+Name: "{autoprograms}\RPG Tabletop Player"; Filename: "{#Pythonw}"; Parameters: """{app}\launcher.pyw"" player"; WorkingDir: "{app}"; IconFilename: "{#Icon}"; AppUserModelID: "RPGTabletop.Player"; Components: player
+Name: "{autoprograms}\RPG Tabletop"; Filename: "{#Pythonw}"; Parameters: """{app}\launcher.pyw"" gm"; WorkingDir: "{app}"; IconFilename: "{#Icon}"; AppUserModelID: "RPGTabletop.GM"; Components: gm
+Name: "{autodesktop}\RPG Tabletop Player"; Filename: "{#Pythonw}"; Parameters: """{app}\launcher.pyw"" player"; WorkingDir: "{app}"; IconFilename: "{#Icon}"; AppUserModelID: "RPGTabletop.Player"; Components: player; Tasks: desktopicon
+Name: "{autodesktop}\RPG Tabletop"; Filename: "{#Pythonw}"; Parameters: """{app}\launcher.pyw"" gm"; WorkingDir: "{app}"; IconFilename: "{#Icon}"; AppUserModelID: "RPGTabletop.GM"; Components: gm; Tasks: desktopicon
 
 [Run]
 Filename: "{#Pythonw}"; Parameters: """{app}\launcher.pyw"" gm"; WorkingDir: "{app}"; Description: "{cm:LaunchProgram,RPG Tabletop}"; Components: gm; Flags: nowait postinstall skipifsilent
@@ -99,3 +104,4 @@ Type: filesandordirs; Name: "{app}\app.new"
 Type: filesandordirs; Name: "{app}\app.old"
 Type: filesandordirs; Name: "{app}\python"
 Type: files; Name: "{app}\launcher.pyw"
+Type: files; Name: "{app}\app.ico"

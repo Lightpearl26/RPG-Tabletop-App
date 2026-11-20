@@ -7,6 +7,7 @@ The installer (packaging/installer.iss) lays out:
 
     <install dir>/                 %LOCALAPPDATA%\\Programs\\RPG Tabletop
     ├── launcher.pyw               this file
+    ├── app.ico                    icon of the shortcuts
     ├── python/                    embedded Python with every dependency
     └── app/                       the code: rpg_tabletop/, requirements.txt, launcher.py
 
@@ -65,10 +66,13 @@ DATA_DIR_ENV = "RPG_TABLETOP_DATA_DIR"
 # Given to the application: path of this launcher (Help > Check for Updates uses it)
 LAUNCHER_ENV = "RPG_TABLETOP_LAUNCHER"
 
+# key: (module, window title, Windows application ID as in rpg_tabletop.ui.theme.app_icon)
 APPS = {
-    "gm": ("rpg_tabletop.apps.gm", "RPG Tabletop"),
-    "player": ("rpg_tabletop.apps.player", "RPG Tabletop Player"),
+    "gm": ("rpg_tabletop.apps.gm", "RPG Tabletop", "RPGTabletop.GM"),
+    "player": ("rpg_tabletop.apps.player", "RPG Tabletop Player", "RPGTabletop.Player"),
 }
+# Icon inside the code, copied to app.ico after each update
+ICON_IN_APP = Path("rpg_tabletop") / "ui" / "theme" / "app_icon.ico"
 
 # Repository paths copied into app/ ("dir/" for a whole folder)
 INCLUDED = ("rpg_tabletop/", "requirements.txt", "packaging/launcher.py")
@@ -118,6 +122,10 @@ class Layout:
     @property
     def launcher(self) -> Path:
         return self.root / "launcher.pyw"
+
+    @property
+    def icon(self) -> Path:
+        return self.root / "app.ico"
 
     @property
     def python(self) -> Path:
@@ -359,12 +367,16 @@ def swap_in(layout: Layout) -> None:
             f"puis relancez. ({error})"
         ) from error
     shutil.rmtree(layout.old_dir, ignore_errors=True)
-    new_launcher = layout.app_dir / "launcher.py"
-    if new_launcher.is_file():
-        try:
-            shutil.copyfile(new_launcher, layout.launcher)
-        except OSError:
-            pass  # the next update will try again
+    # Files kept outside app/ (the shortcuts point to them), refreshed from the new code
+    for source, target in (
+        (layout.app_dir / "launcher.py", layout.launcher),
+        (layout.app_dir / ICON_IN_APP, layout.icon),
+    ):
+        if source.is_file():
+            try:
+                shutil.copyfile(source, target)
+            except OSError:
+                pass  # the next update will try again
 
 
 def pip_command(layout: Layout) -> list[str]:
@@ -446,11 +458,21 @@ def run_gui(layout: Layout, app_key: str, force_check: bool) -> int:
     """Check, offer and install the update, then start the application."""
     # pylint: disable=import-outside-toplevel
     from PySide6.QtCore import QEventLoop, Qt, QThread, Signal
+    from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
+    if sys.platform == "win32":
+        try:  # same taskbar icon and group as the application
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APPS[app_key][2])
+        except (AttributeError, OSError):
+            pass
     qt_app = QApplication(sys.argv)
     qt_app.setApplicationName(APPS[app_key][1])
     qt_app.setStyle("Fusion")
+    if layout.icon.is_file():
+        qt_app.setWindowIcon(QIcon(str(layout.icon)))
     title = "Mise à jour"
 
     class Downloader(QThread):

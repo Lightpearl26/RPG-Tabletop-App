@@ -24,6 +24,32 @@ function Invoke-Checked([string]$what, [scriptblock]$command) {
     if ($LASTEXITCODE) { throw "$what failed (exit code $LASTEXITCODE)" }
 }
 
+function Find-InnoSetup {
+    $command = Get-Command iscc -ErrorAction SilentlyContinue
+    if ($command) { return $command.Source }
+    $candidates = @(
+        "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+        "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+    )
+    # Wherever it was installed, the uninstall entry knows the folder
+    foreach ($key in @(
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1",
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1",
+        "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1"
+    )) {
+        $location = (Get-ItemProperty $key -ErrorAction SilentlyContinue).InstallLocation
+        if ($location) { $candidates += Join-Path $location "ISCC.exe" }
+    }
+    return $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+
+# Checked first, so that a missing tool does not waste the downloads below
+$iscc = Find-InnoSetup
+if (-not $iscc) {
+    throw "Inno Setup 6 not found (ISCC.exe). Install it with: winget install JRSoftware.InnoSetup  (then open a new terminal)"
+}
+
 $init = Get-Content "rpg_tabletop\__init__.py" -Raw
 $version = [regex]::Match($init, '__version__\s*=\s*["'']([^"'']+)["'']').Groups[1].Value
 if (-not $version) { throw "No __version__ in rpg_tabletop\__init__.py" }
@@ -67,6 +93,7 @@ Get-ChildItem $app -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recu
 Copy-Item "requirements.txt" $app
 Copy-Item "packaging\launcher.py" (Join-Path $app "launcher.py")
 Copy-Item "packaging\launcher.py" (Join-Path $stage "launcher.pyw")
+Copy-Item "rpg_tabletop\ui\theme\app_icon.ico" (Join-Path $stage "app.ico")
 
 # 4. Check that the bundle can load both applications -----------------------------------
 Invoke-Checked "import check" {
@@ -75,15 +102,6 @@ Invoke-Checked "import check" {
 Get-ChildItem $app -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
 
 # 5. Installer ----------------------------------------------------------------------------
-$iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
-if (-not $iscc) {
-    $iscc = @(
-        "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-        "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
-        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
-    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-}
-if (-not $iscc) { throw "Inno Setup 6 not found (ISCC.exe): winget install JRSoftware.InnoSetup" }
 Invoke-Checked "Inno Setup" { & $iscc "/DAppVersion=$version" "/DStageDir=$stage" "packaging\installer.iss" }
 
 $setup = Join-Path $root "dist\installers\RPGTabletop-Setup.exe"

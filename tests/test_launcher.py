@@ -130,11 +130,13 @@ def test_swap_in_replaces_code_and_launcher(tmp_path):
         "rpg_tabletop/__init__.py": _init("2.0"),
         "requirements.txt": "PySide6==6.11.2\n",
         "packaging/launcher.py": "# new launcher",
+        "rpg_tabletop/ui/theme/app_icon.ico": "ICON",
     })
     launcher.extract_update(archive, layout.new_dir)
     launcher.swap_in(layout)
     assert launcher.installed_version(layout.app_dir) == "2.0"
     assert layout.launcher.read_text() == "# new launcher"
+    assert layout.icon.read_text() == "ICON"
     assert not layout.new_dir.exists() and not layout.old_dir.exists()
 
 

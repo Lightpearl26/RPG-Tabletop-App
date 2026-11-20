@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QApplication, QDialog
 
 from rpg_tabletop.ui.common.update_dialog import startup_update_check
 from rpg_tabletop.ui.player import PlayerLoginDialog, PlayerRuntimeWindow
+from rpg_tabletop.ui.theme.app_icon import PLAYER_APP_ID, apply_app_icon
 from rpg_tabletop.ui.theme.qt_palette import apply_dark_theme
 
 
@@ -24,6 +25,7 @@ def main() -> int:
     app.setApplicationName("RPG Tabletop Player")
     app.setOrganizationName("RPGTabletop")
     apply_dark_theme(app)
+    apply_app_icon(app, PLAYER_APP_ID)
 
     # Before connecting: the player must run the same version as the GM's server
     if startup_update_check("player"):
