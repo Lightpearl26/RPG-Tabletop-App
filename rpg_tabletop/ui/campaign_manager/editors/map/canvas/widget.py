@@ -352,7 +352,12 @@ class MapCanvas(
                 view = self.visible_world_rect()
 
                 try:
-                    self.asset.render_scene(painter, self.media, view)
+                    self.asset.render_scene(
+                        painter,
+                        self.media,
+                        view,
+                        bounded=not self.asset.infinite,
+                    )
                     self._render_error = None
                 except Exception as error:  # Keep the editor usable if an asset is missing.
                     self._render_error = str(error)

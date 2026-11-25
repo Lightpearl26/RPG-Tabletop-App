@@ -6,7 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -62,6 +62,9 @@ from .state import DRAW_TOOLS, EditorTool
 
 class MapWorkspace(QWidget):
     """Map editor surface designed to be embedded in CampaignManagerWindow."""
+
+    # The map changed outside the undo history (an infinite map sized at compilation)
+    map_changed = Signal()
 
     def __init__(
         self,
@@ -239,6 +242,20 @@ class MapWorkspace(QWidget):
         self._fill_color_value = "#89b4fa"
         self._refresh_color_buttons()
         self._update_tool_controls()
+
+        toolbar.addSeparator()
+        toolbar.addWidget(self._section_label("MAP"))
+
+        self._infinite_action = QAction("Infinite Map", self)
+        self._infinite_action.setCheckable(True)
+        self._infinite_action.setChecked(self.asset.infinite)
+        self._infinite_action.setToolTip(
+            "Infinite map: draw anywhere around the origin; the map is cut to\n"
+            "its content (dashed frame) when it is compiled.\n"
+            "Unchecked: the map keeps a fixed size."
+        )
+        self._infinite_action.toggled.connect(self._set_infinite)
+        toolbar.addAction(self._infinite_action)
 
         toolbar.addSeparator()
         toolbar.addWidget(self._section_label("VIEW"))
@@ -1072,6 +1089,7 @@ class MapWorkspace(QWidget):
         self.canvas.token_double_clicked.connect(self._open_entity_sheet)
         self.canvas.token_placed.connect(lambda _entity_id: self.refresh_token_sources())
         self.canvas.history_changed.connect(lambda _undo, _redo: self._update_status())
+        self.canvas.history_changed.connect(lambda _undo, _redo: self._sync_infinite_action())
 
     # -------------------------------------------------------------------------
     # Status
@@ -1103,8 +1121,14 @@ class MapWorkspace(QWidget):
             if self.canvas.pending_token_entity_id
             else ""
         )
+        bounds = self.canvas.editor_map_rect()
+        size_text = (
+            f" | infinite (export: {bounds.width:.0f} x {bounds.height:.0f} px)"
+            if self.asset.infinite
+            else f" | {self.asset.width} x {self.asset.height} px"
+        )
         self._status_bar.showMessage(
-            f"{self.asset.name} | tool: {self.canvas.active_tool.name.lower()} "
+            f"{self.asset.name}{size_text} | tool: {self.canvas.active_tool.name.lower()} "
             f"| zoom: {self.canvas.camera.zoom:.2f}x"
             f"{mouse_text}{selection_text}{token_text}"
         )
@@ -1128,10 +1152,36 @@ class MapWorkspace(QWidget):
         if hasattr(self, "_compile_button"):
             self._compile_button.setEnabled(loaded)
 
+    def _sync_infinite_action(self) -> None:
+        """Show the size mode of the map (after undo, redo or loading)."""
+        if not hasattr(self, "_infinite_action"):
+            return
+        blocked = self._infinite_action.blockSignals(True)
+        self._infinite_action.setChecked(self.asset.infinite)
+        self._infinite_action.blockSignals(blocked)
+
+    def _set_infinite(self, infinite: bool) -> None:
+        """
+        Switch between an infinite map and a fixed-size one, as an undoable edit.
+
+        Leaving the infinite mode keeps the size the map would get now, so the
+        content stays inside; entering it keeps every coordinate.
+        """
+        if infinite == self.asset.infinite:
+            return
+        before = self.canvas._capture_state()
+        if not infinite:
+            self.asset.fit_to_content()
+        self.asset.infinite = infinite
+        self.canvas._commit_history(before)
+        self.canvas.update()
+        self._update_status()
+
     def _activate_map(self, asset: MapAsset, map_dir: Path, *, fit: bool = False) -> None:
         self.map_dir = Path(map_dir)
         self.asset = asset
         self.canvas.set_asset(asset, self.map_dir)
+        self._sync_infinite_action()
         self._tool_actions[EditorTool.SELECT].setChecked(True)
         self._set_map_loaded(True)
         self.refresh_token_sources()
@@ -1171,8 +1221,11 @@ class MapWorkspace(QWidget):
             self._update_status()
             return
 
+        self.canvas.update()
+        self.map_changed.emit()
         self._status_bar.showMessage(
-            f"Compiled {compiled.columns} x {compiled.rows} tiles.",
+            f"Compiled {compiled.columns} x {compiled.rows} tiles "
+            f"({compiled.width} x {compiled.height} px).",
             4000,
         )
 
@@ -1201,8 +1254,11 @@ class MapWorkspace(QWidget):
             self._update_status()
             return
 
+        self.canvas.update()
+        self.map_changed.emit()
         self._status_bar.showMessage(
-            f"Saved and compiled ({compiled.columns} x {compiled.rows} tiles).",
+            f"Saved and compiled ({compiled.columns} x {compiled.rows} tiles, "
+            f"{compiled.width} x {compiled.height} px).",
             4000,
         )
 

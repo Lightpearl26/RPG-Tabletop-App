@@ -51,6 +51,7 @@ class FlattenedMap:
         source_map_id: The id of the map that was compiled.
         source_hash: Hash of everything that affects the pixels.
         width, height: The size of the map in pixels.
+        origin_x, origin_y: The map coordinates of the top-left corner of tile 0_0.
         tile_size: The side of a tile in pixels.
         tile_format: The format of the tile files.
         tiles: For each written tile, the hash of its pixels.
@@ -66,6 +67,8 @@ class FlattenedMap:
     tile_format: str
     tiles: dict[str, str] = field(default_factory=dict)
     uniform: dict[str, str] = field(default_factory=dict)
+    origin_x: int = 0
+    origin_y: int = 0
 
     @property
     def columns(self) -> int:
@@ -104,6 +107,7 @@ class FlattenedMap:
             "source_map_id": self.source_map_id,
             "source_hash": self.source_hash,
             "size": [self.width, self.height],
+            "origin": [self.origin_x, self.origin_y],
             "tile_size": self.tile_size,
             "format": self.tile_format,
             "tiles": dict(self.tiles),
@@ -120,6 +124,7 @@ class FlattenedMap:
         """
         try:
             width, height = data["size"]
+            origin_x, origin_y = data.get("origin", [0, 0])
             return cls(
                 source_map_id=str(data["source_map_id"]),
                 source_hash=str(data["source_hash"]),
@@ -129,6 +134,8 @@ class FlattenedMap:
                 tile_format=str(data["format"]),
                 tiles={str(k): str(v) for k, v in dict(data.get("tiles", {})).items()},
                 uniform={str(k): str(v) for k, v in dict(data.get("uniform", {})).items()},
+                origin_x=int(origin_x),
+                origin_y=int(origin_y),
             )
         except (TypeError, KeyError, ValueError) as error:
             raise ValueError(f"Invalid compiled map data: {error}") from error

@@ -10,7 +10,7 @@ from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from hashlib import sha256
 from json import dumps, loads
-from math import ceil
+from math import ceil, floor
 from pathlib import Path
 from shutil import copy2
 from typing import Any, Optional
@@ -28,6 +28,8 @@ from rpg_tabletop.assets.campaign import get_current_campaign
 from rpg_tabletop.assets.references import json_text
 
 from .common import (
+    AUTO_SIZE_MARGIN_CELLS,
+    AUTO_SIZE_MARGIN_PX,
     DEFAULT_TILE_FORMAT,
     DEFAULT_TILE_SIZE,
     ERROR,
@@ -89,6 +91,10 @@ class MapAsset:
         id: The unique identifier of the map.
         name: The display name of the map.
         width, height: The size of the map in pixels.
+        origin_x, origin_y: The map coordinates of the top-left corner of the map.
+        infinite: Whether the map is sized to its content at each compilation
+                  (see `fit_to_content`); `width`, `height` and the origin then
+                  hold the size of the last compilation.
         background: The background of the scene.
         grid: The grid settings (overlay, never flattened).
         elements: The drawn elements, from bottom to top.
@@ -101,6 +107,9 @@ class MapAsset:
     name: str = "New Map"
     width: int = 4096
     height: int = 4096
+    origin_x: int = 0
+    origin_y: int = 0
+    infinite: bool = False
     background: MapBackground = field(default_factory=MapBackground)
     grid: GridSettings = field(default_factory=GridSettings)
     elements: list[MapElement] = field(default_factory=list)
@@ -117,7 +126,7 @@ class MapAsset:
         The grid, the tokens and the camera are left out on purpose. Images are
         named after their content, so their path stands for their content.
         """
-        signature = {
+        signature: dict[str, Any] = {
             "size": [self.width, self.height],
             "background": self.background.to_dict(),
             "elements": [
@@ -125,6 +134,9 @@ class MapAsset:
                 if element.visible and element.flattened
             ],
         }
+        if self.origin_x or self.origin_y:
+            # Left out at (0, 0) so maps made before origins keep their hash
+            signature["origin"] = [self.origin_x, self.origin_y]
         text = dumps(_canonical(signature), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         return sha256(text.encode("utf-8")).hexdigest()
 
@@ -136,6 +148,77 @@ class MapAsset:
         return self.compiled is not None and self.compiled.matches(
             self.source_hash(), tile_size, tile_format
         )
+
+    # ----- Bounds ------------------------------------------------------------
+
+    def map_rect(self) -> Rect:
+        """
+        The area covered by the map (and by its tiles), in map coordinates.
+        """
+        return Rect(float(self.origin_x), float(self.origin_y), float(self.width), float(self.height))
+
+    def token_rect(self, token: InitialTokenPlacement) -> Rect:
+        """
+        The square a token covers, before rotation.
+        """
+        cell = float(self.grid.cell_size) if self.grid.cell_size > 0 else 64.0
+        side = cell * max(0.0, token.size_cells)
+        return Rect(token.pos.x - side / 2, token.pos.y - side / 2, side, side)
+
+    def content_bounds(self) -> Optional[Rect]:
+        """
+        Bounding box of everything placed on the map, None if the map is empty.
+
+        Every element counts, hidden ones and walls included (they can be shown
+        or still block in play), and so does every token. The background does not.
+        """
+        rects = [element.bounds() for element in self.elements]
+        for token in self.initial_tokens:
+            # A rotated square stays inside the circle around it
+            rect = self.token_rect(token)
+            rects.append(rect.inflate(rect.width * 0.21))
+        if not rects:
+            return None
+        left = min(rect.x for rect in rects)
+        top = min(rect.y for rect in rects)
+        right = max(rect.right for rect in rects)
+        bottom = max(rect.bottom for rect in rects)
+        return Rect(left, top, right - left, bottom - top)
+
+    def auto_rect(self) -> Rect:
+        """
+        The area an infinite map takes when it is compiled.
+
+        The content bounds plus a margin, with edges on grid lines when the map has
+        a grid and on whole pixels in any case. An empty map gets the margin around
+        the origin.
+        """
+        content = self.content_bounds() or Rect(0.0, 0.0, 0.0, 0.0)
+        if self.grid.enabled and self.grid.cell_size > 0:
+            cell = float(self.grid.cell_size)
+            ox, oy = self.grid.offset_x, self.grid.offset_y
+            margin = AUTO_SIZE_MARGIN_CELLS
+            left = ox + (floor((content.x - ox) / cell) - margin) * cell
+            top = oy + (floor((content.y - oy) / cell) - margin) * cell
+            right = ox + (ceil((content.right - ox) / cell) + margin) * cell
+            bottom = oy + (ceil((content.bottom - oy) / cell) + margin) * cell
+        else:
+            margin = float(AUTO_SIZE_MARGIN_PX)
+            left, top = content.x - margin, content.y - margin
+            right, bottom = content.right + margin, content.bottom + margin
+        x, y = floor(left), floor(top)
+        width = max(1, ceil(right) - x)
+        height = max(1, ceil(bottom) - y)
+        return Rect(float(x), float(y), float(width), float(height))
+
+    def fit_to_content(self) -> Rect:
+        """
+        Size the map to `auto_rect()`. Nothing moves: only the origin and size change.
+        """
+        rect = self.auto_rect()
+        self.origin_x, self.origin_y = int(rect.x), int(rect.y)
+        self.width, self.height = int(rect.width), int(rect.height)
+        return rect
 
     # ----- Tokens ------------------------------------------------------------
 
@@ -195,7 +278,14 @@ class MapAsset:
         if self.width <= 0 or self.height <= 0:
             issues.append(MapIssue(ERROR, "The map size must be positive."))
         elif max(self.width, self.height) > MAX_MAP_SIDE_PX:
-            issues.append(MapIssue(ERROR, f"A map side cannot exceed {MAX_MAP_SIDE_PX} px."))
+            if self.infinite:
+                issues.append(MapIssue(
+                    ERROR,
+                    f"The content spans {self.width} x {self.height} px; "
+                    f"a map side cannot exceed {MAX_MAP_SIDE_PX} px.",
+                ))
+            else:
+                issues.append(MapIssue(ERROR, f"A map side cannot exceed {MAX_MAP_SIDE_PX} px."))
         if self.grid.cell_size <= 0:
             issues.append(MapIssue(ERROR, "The grid cell size must be positive."))
         if not _is_color(self.background.color):
@@ -240,7 +330,10 @@ class MapAsset:
                 issues.append(MapIssue(ERROR, f"{label}: the size must be positive."))
             if not 0.0 <= token.opacity <= 1.0:
                 issues.append(MapIssue(ERROR, f"{label}: opacity must be between 0 and 1."))
-            if not (0 <= token.pos.x <= self.width and 0 <= token.pos.y <= self.height):
+            if not (
+                self.origin_x <= token.pos.x <= self.origin_x + self.width
+                and self.origin_y <= token.pos.y <= self.origin_y + self.height
+            ):
                 issues.append(MapIssue(WARNING, f"{label}: the token is outside the map."))
         return issues
 
@@ -270,6 +363,8 @@ class MapAsset:
             "id": self.id,
             "name": self.name,
             "size": [self.width, self.height],
+            "origin": [self.origin_x, self.origin_y],
+            "infinite": self.infinite,
             "background": self.background.to_dict(),
             "grid": self.grid.to_dict(),
             "elements": [element.to_dict() for element in self.elements],
@@ -295,12 +390,16 @@ class MapAsset:
             if version > FORMAT_VERSION:
                 raise ValueError(f"Map format {version} is newer than this app understands.")
             width, height = data.get("size", [4096, 4096])
+            origin_x, origin_y = data.get("origin", [0, 0])
             compiled = data.get("compiled")
             return cls(
                 id=str(data.get("id") or uuid4().hex),
                 name=str(data.get("name", "New Map")),
                 width=int(width),
                 height=int(height),
+                origin_x=int(origin_x),
+                origin_y=int(origin_y),
+                infinite=bool(data.get("infinite", False)),
                 background=MapBackground.from_dict(data.get("background", {})),
                 grid=GridSettings.from_dict(data.get("grid", {})),
                 elements=[MapElement.from_dict(e) for e in data.get("elements", [])],
@@ -353,7 +452,14 @@ class MapAsset:
 
     # ----- Rendering ---------------------------------------------------------
 
-    def render_scene(self, painter: QPainter, media: MediaCache, view: Optional[Rect] = None) -> None:
+    def render_scene(
+        self,
+        painter: QPainter,
+        media: MediaCache,
+        view: Optional[Rect] = None,
+        *,
+        bounded: bool = True,
+    ) -> None:
         """
         Draw the background and the visible elements in map coordinates.
 
@@ -362,10 +468,15 @@ class MapAsset:
 
         Args:
             view: The visible area in map coordinates; elements outside are skipped.
+            bounded: Clip to `map_rect()`. The editor turns it off for infinite
+                     maps: the background color then fills the whole view.
         """
-        map_rect = Rect(0.0, 0.0, float(self.width), float(self.height))
+        map_rect = self.map_rect()
+        area = map_rect if bounded or view is None else view
         painter.save()
-        painter.setClipRect(map_rect.to_qrectf(), Qt.ClipOperation.IntersectClip)
+        painter.setClipRect(area.to_qrectf(), Qt.ClipOperation.IntersectClip)
+        painter.fillRect(area.to_qrectf(), QColor(self.background.color))
+        # The background image always covers the map rectangle only
         self.background.render(painter, media, map_rect)
         for element in self.elements:
             if not element.visible or not element.flattened:
@@ -400,7 +511,8 @@ class MapAsset:
         """
         Render one tile, with its own image: memory use does not depend on map size.
         """
-        origin_x, origin_y = column * tile_size, row * tile_size
+        origin_x = self.origin_x + column * tile_size
+        origin_y = self.origin_y + row * tile_size
         image = self._new_image(tile_size, tile_size)
         painter = QPainter(image)
         try:
@@ -425,6 +537,7 @@ class MapAsset:
         try:
             self._quality_hints(painter)
             painter.scale(scale, scale)
+            painter.translate(-self.origin_x, -self.origin_y)
             self.render_scene(painter, media)
         finally:
             painter.end()
@@ -521,6 +634,8 @@ class MapAsset:
             source_hash=source_hash,
             width=self.width,
             height=self.height,
+            origin_x=self.origin_x,
+            origin_y=self.origin_y,
             tile_size=tile_size,
             tile_format=tile_format,
             tiles=tiles,
@@ -539,12 +654,19 @@ class MapAsset:
     ) -> FlattenedMap:
         map_dir = Path(map_dir)
         map_dir.mkdir(parents=True, exist_ok=True)
-        self.validate(map_dir)
+        previous_state = self.compiled
+        previous_rect = (self.origin_x, self.origin_y, self.width, self.height)
+        if self.infinite:
+            self.fit_to_content()
+        try:
+            self.validate(map_dir)
+        except BaseException:
+            self.origin_x, self.origin_y, self.width, self.height = previous_rect
+            raise
 
         staging = map_dir / STAGING_DIR
         _remove(staging)
         staging.mkdir()
-        previous_state = self.compiled
         try:
             compiled, rebuilt = self._build(
                 staging,
@@ -565,6 +687,7 @@ class MapAsset:
             _commit(items)
         except BaseException:
             self.compiled = previous_state
+            self.origin_x, self.origin_y, self.width, self.height = previous_rect
             raise
         finally:
             _remove(staging)
@@ -581,7 +704,8 @@ class MapAsset:
         """
         Flatten the scene into tiles and a preview, without writing `map.json`.
 
-        Either every file is replaced or none is.
+        Either every file is replaced or none is. An infinite map is first sized
+        to its content (`fit_to_content`).
 
         Args:
             progress: Called as `progress(done, total)`; returning False cancels.

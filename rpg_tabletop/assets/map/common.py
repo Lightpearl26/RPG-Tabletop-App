@@ -28,6 +28,11 @@ PREVIEW_MAX_PX = 512
 # Safety limit, not a technical one: tiles are rendered one at a time
 MAX_MAP_SIDE_PX = 65536
 
+# Infinite maps: empty space kept around the content when the map is sized at
+# compilation, in grid cells (or in pixels when the map has no grid).
+AUTO_SIZE_MARGIN_CELLS = 1
+AUTO_SIZE_MARGIN_PX = 64
+
 ERROR = "error"
 WARNING = "warning"
 

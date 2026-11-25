@@ -125,6 +125,9 @@ class EditorState:
     selected_token_ids: list[str]
     selected_token_id: Optional[str]
     camera_selected: bool
+    # Map size mode: whether the map is infinite, and its (origin_x, origin_y, width, height)
+    infinite: bool = False
+    map_rect: tuple[int, int, int, int] = (0, 0, 4096, 4096)
 
 
 @dataclass(slots=True)

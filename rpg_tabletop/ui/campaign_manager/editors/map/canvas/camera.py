@@ -145,22 +145,17 @@ class CameraMixin:
             dx = world.x - session.start_world.x
             dy = world.y - session.start_world.y
 
-            state.center = Vec2(
-                max(
-                    0.0,
-                    min(
-                        float(self.asset.width),
-                        session.start_center.x + dx,
-                    ),
-                ),
-                max(
-                    0.0,
-                    min(
-                        float(self.asset.height),
-                        session.start_center.y + dy,
-                    ),
-                ),
+            center = Vec2(
+                session.start_center.x + dx,
+                session.start_center.y + dy,
             )
+            if not self.asset.infinite:
+                bounds = self.asset.map_rect()
+                center = Vec2(
+                    max(bounds.x, min(bounds.right, center.x)),
+                    max(bounds.y, min(bounds.bottom, center.y)),
+                )
+            state.center = center
 
         elif session.mode == "zoom":
             center_screen = self.world_to_screen(
@@ -370,21 +365,31 @@ class CameraMixin:
     def set_current_as_initial_camera(self) -> None:
         self.asset.initial_gm_camera = self.camera.to_state()
 
+    def editor_map_rect(self) -> Rect:
+        """
+        The area the map will cover once compiled: its rectangle, or for an
+        infinite map the size it would get if it were compiled now.
+        """
+        if self.asset.infinite:
+            return self.asset.auto_rect()
+        return self.asset.map_rect()
+
     def fit_map(self, margin_px: float = 32.0) -> None:
-        if self.asset.width <= 0 or self.asset.height <= 0:
+        bounds = self.editor_map_rect()
+        if bounds.width <= 0 or bounds.height <= 0:
             return
 
         usable_width = max(1.0, self.width() - margin_px * 2.0)
         usable_height = max(1.0, self.height() - margin_px * 2.0)
 
         zoom = min(
-            usable_width / self.asset.width,
-            usable_height / self.asset.height,
+            usable_width / bounds.width,
+            usable_height / bounds.height,
         )
 
         self.camera.center = Vec2(
-            self.asset.width / 2.0,
-            self.asset.height / 2.0,
+            bounds.x + bounds.width / 2.0,
+            bounds.y + bounds.height / 2.0,
         )
         self.camera.set_zoom(zoom)
         self.zoom_changed.emit(self.camera.zoom)

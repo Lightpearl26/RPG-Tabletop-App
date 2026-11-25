@@ -29,8 +29,18 @@ One renderer
 flatten use that same code, so what the GM sees is what gets compiled. Rendering
 needs a `QGuiApplication` (fonts), which the app always has when it compiles.
 
-Coordinates are in pixels. A tile is `tile_size` x `tile_size` pixels; tiles on the
+Coordinates are in pixels, around a fixed origin (0, 0). The map covers the
+rectangle `map_rect()`: `width` x `height` pixels from (`origin_x`, `origin_y`).
+A tile is `tile_size` x `tile_size` pixels, counted from that corner; tiles on the
 right and bottom edges are padded with transparent pixels.
+
+Infinite maps
+-------------
+A map with `infinite=True` has no size while it is edited: the editor shows an
+endless canvas around the origin. When it is compiled (or saved), the map is
+sized to its content (`fit_to_content`): the bounding box of its elements and
+tokens, aligned on the grid, plus a margin. Coordinates are never shifted, so
+tokens, walls and the grid keep their place; only the origin and size change.
 
 Modules
 -------
@@ -40,6 +50,8 @@ tiles) and asset (MapAsset). Import from the package: `from rpg_tabletop.assets.
 """
 
 from .common import (
+    AUTO_SIZE_MARGIN_CELLS,
+    AUTO_SIZE_MARGIN_PX,
     DEFAULT_TILE_FORMAT,
     DEFAULT_TILE_SIZE,
     ERROR,
@@ -93,6 +105,8 @@ from .asset import (
 )
 
 __all__ = [
+    "AUTO_SIZE_MARGIN_CELLS",
+    "AUTO_SIZE_MARGIN_PX",
     "DEFAULT_TILE_FORMAT",
     "DEFAULT_TILE_SIZE",
     "ERROR",

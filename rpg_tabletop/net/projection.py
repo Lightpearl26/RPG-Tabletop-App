@@ -146,6 +146,7 @@ def _map_view(runtime: SessionRuntime, entity_id: str) -> dict[str, Any] | None:
             "id": asset.id,
             "name": asset.name,
             "size": [asset.width, asset.height],
+            "origin": [asset.origin_x, asset.origin_y],
             "grid": asset.grid.to_dict(),
             "compiled": compiled,
         },

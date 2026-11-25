@@ -121,6 +121,7 @@ class MapEditor(ResourceEditor):
         self.workspace.canvas.history_changed.connect(
             lambda _undo, _redo: self._refresh_modified()
         )
+        self.workspace.map_changed.connect(self._refresh_modified)
 
         self.title = self.asset.name or resource_id or "New Map"
 
@@ -144,7 +145,8 @@ class MapEditor(ResourceEditor):
         if not name or name.casefold().startswith("new map"):
             name = "New Map"
 
-        self.asset = MapAsset(name=name)
+        # New maps are infinite: they are sized to their content when compiled
+        self.asset = MapAsset(name=name, infinite=True)
         return deepcopy(self.asset.to_dict())
 
     def _load(self, resource_id: str) -> None:
@@ -284,9 +286,11 @@ class MapEditor(ResourceEditor):
             self.asset.name,
         )
 
+        self.workspace.canvas.update()
         self.workspace._status_bar.showMessage(
             f"Saved and compiled "
-            f"({compiled.columns} x {compiled.rows} tiles).",
+            f"({compiled.columns} x {compiled.rows} tiles, "
+            f"{compiled.width} x {compiled.height} px).",
             4000,
         )
         return target

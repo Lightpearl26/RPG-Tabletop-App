@@ -94,7 +94,10 @@ class RuntimeMapView(QWidget):
         zx = max(1.0, self.width() - margin * 2) / max(1.0, self.asset.width)
         zy = max(1.0, self.height() - margin * 2) / max(1.0, self.asset.height)
         self.zoom = max(self.MIN_ZOOM, min(self.MAX_ZOOM, min(zx, zy)))
-        self.center = Vec2(self.asset.width / 2, self.asset.height / 2)
+        self.center = Vec2(
+            self.asset.origin_x + self.asset.width / 2,
+            self.asset.origin_y + self.asset.height / 2,
+        )
         self.update()
 
     def world_to_screen(self, point: Vec2) -> QPointF:

@@ -39,6 +39,13 @@ class HistoryMixin:
             selected_token_ids=sorted(self.selected_token_ids),
             selected_token_id=self.selected_token_id,
             camera_selected=self.camera_selected,
+            infinite=self.asset.infinite,
+            map_rect=(
+                self.asset.origin_x,
+                self.asset.origin_y,
+                self.asset.width,
+                self.asset.height,
+            ),
         )
 
     def _restore_state(self, state: EditorState) -> None:
@@ -57,6 +64,13 @@ class HistoryMixin:
         self.asset.initial_gm_camera = CameraState.from_dict(
             deepcopy(state.initial_camera)
         )
+        self.asset.infinite = state.infinite
+        (
+            self.asset.origin_x,
+            self.asset.origin_y,
+            self.asset.width,
+            self.asset.height,
+        ) = state.map_rect
 
         ids = {element.id for element in self.asset.elements}
         self.selected_element_ids = {

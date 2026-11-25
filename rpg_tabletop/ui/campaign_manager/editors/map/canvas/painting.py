@@ -44,10 +44,12 @@ class PaintingMixin:
         pen.setWidthF(1.0 / self.camera.zoom)
         painter.setPen(pen)
 
-        map_left = 0.0
-        map_top = 0.0
-        map_right = float(self.asset.width)
-        map_bottom = float(self.asset.height)
+        # An infinite map has no edge yet: the grid fills the view
+        bounds = view if self.asset.infinite else self.asset.map_rect()
+        map_left = bounds.x
+        map_top = bounds.y
+        map_right = bounds.right
+        map_bottom = bounds.bottom
 
         first_col = int((view.x - grid.offset_x) // size) - 1
         last_col = int((view.right - grid.offset_x) // size) + 1
@@ -67,9 +69,25 @@ class PaintingMixin:
     def _draw_map_border(self, painter: QPainter) -> None:
         pen = QPen(QColor("#7f849c"))
         pen.setWidthF(1.0 / self.camera.zoom)
-        painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRect(QRectF(0.0, 0.0, float(self.asset.width), float(self.asset.height)))
+        if self.asset.infinite:
+            # Where the map will be cut at compilation, if it were compiled now
+            pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.drawRect(self.asset.auto_rect().to_qrectf())
+            self._draw_origin(painter)
+        else:
+            painter.setPen(pen)
+            painter.drawRect(self.asset.map_rect().to_qrectf())
+
+    def _draw_origin(self, painter: QPainter) -> None:
+        """Mark the origin (0, 0) with a small cross of constant screen size."""
+        arm = 12.0 / self.camera.zoom
+        pen = QPen(QColor("#f38ba8"))
+        pen.setWidthF(1.5 / self.camera.zoom)
+        painter.setPen(pen)
+        painter.drawLine(QPointF(-arm, 0.0), QPointF(arm, 0.0))
+        painter.drawLine(QPointF(0.0, -arm), QPointF(0.0, arm))
 
     def _draw_selection(self, painter: QPainter) -> None:
         """Draw selection frames for tokens or static map elements."""

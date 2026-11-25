@@ -200,16 +200,15 @@ class PlayerMapView(QWidget):
             self.update()
             self.viewport_changed.emit()
             return
-        asset = self._asset_data()
-        size = asset.get("size") if asset else None
-        if not isinstance(size, (list, tuple)) or len(size) != 2 or self.width() <= 0 or self.height() <= 0:
+        map_rect = self._map_rect()
+        if map_rect is None or self.width() <= 0 or self.height() <= 0:
             return
-        width, height = max(1.0, float(size[0])), max(1.0, float(size[1]))
+        width, height = max(1.0, map_rect.width()), max(1.0, map_rect.height())
         margin = 28.0
         zx = max(1.0, self.width() - margin * 2) / width
         zy = max(1.0, self.height() - margin * 2) / height
         self.zoom = max(self.MIN_ZOOM, min(self.MAX_ZOOM, min(zx, zy)))
-        self.center = Vec2(width / 2, height / 2)
+        self.center = Vec2(map_rect.center().x(), map_rect.center().y())
         self.update()
         self.viewport_changed.emit()
 
@@ -224,14 +223,17 @@ class PlayerMapView(QWidget):
             return set()
         try:
             tile_size = max(1, int(compiled.get("tile_size", 512)))
-            width, height = (float(value) for value in asset.get("size", [0, 0]))
+            width, height = (float(value) for value in compiled.get("size", asset.get("size", [0, 0])))
         except (TypeError, ValueError):
             return set()
         if width <= 0 or height <= 0 or self.width() <= 0 or self.height() <= 0:
             return set()
-        visible = self._visible_world_rect().intersected(QRectF(0, 0, width, height))
+        # Tiles are counted from the corner of the compiled area
+        ox, oy = self._origin(compiled)
+        visible = self._visible_world_rect().intersected(QRectF(ox, oy, width, height))
         if visible.isEmpty():
             return set()
+        visible.translate(-ox, -oy)
         first_col = max(0, int(floor(visible.left() / tile_size)))
         first_row = max(0, int(floor(visible.top() / tile_size)))
         last_col = min(int(ceil(width / tile_size)) - 1, max(0, int(ceil(visible.right() / tile_size)) - 1))
@@ -326,6 +328,28 @@ class PlayerMapView(QWidget):
             return None
         asset = self.map_data.get("asset")
         return asset if isinstance(asset, dict) else None
+
+    @staticmethod
+    def _origin(data: dict[str, Any] | None) -> tuple[float, float]:
+        """The `origin` of a map or compilation record; (0, 0) for older maps."""
+        try:
+            x, y = (data or {}).get("origin", [0, 0])
+            return float(x), float(y)
+        except (TypeError, ValueError):
+            return 0.0, 0.0
+
+    def _map_rect(self, asset: dict[str, Any] | None = None) -> QRectF | None:
+        """The area covered by the map, in map coordinates; None if unknown."""
+        asset = asset if asset is not None else self._asset_data()
+        size = asset.get("size") if isinstance(asset, dict) else None
+        if not isinstance(size, (list, tuple)) or len(size) != 2:
+            return None
+        try:
+            width, height = float(size[0]), float(size[1])
+        except (TypeError, ValueError):
+            return None
+        x, y = self._origin(asset)
+        return QRectF(x, y, width, height)
 
     def _grid(self) -> dict[str, Any]:
         asset = self._asset_data() or {}
@@ -449,8 +473,8 @@ class PlayerMapView(QWidget):
                 painter.setPen(QColor("#98a2b1"))
                 painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "En attente de la carte du MJ…")
                 return
-            size = asset.get("size", [0, 0])
-            if not isinstance(size, (list, tuple)) or len(size) != 2:
+            map_rect = self._map_rect(asset)
+            if map_rect is None:
                 return
 
             painter.save()
@@ -460,7 +484,6 @@ class PlayerMapView(QWidget):
                 painter.translate(self.width() / 2, self.height() / 2)
                 painter.scale(self.zoom, self.zoom)
                 painter.translate(-self.center.x, -self.center.y)
-                map_rect = QRectF(0, 0, float(size[0]), float(size[1]))
                 fov = self._fov_rect()
                 play_rect = map_rect.intersected(fov) if fov is not None else map_rect
 
@@ -519,6 +542,9 @@ class PlayerMapView(QWidget):
         visible = self._visible_world_rect().intersected(map_rect)
         if visible.isEmpty():
             return
+        # Tiles are counted from the corner of the compiled area
+        ox, oy = self._origin(compiled)
+        visible.translate(-ox, -oy)
         first_col = max(0, int(floor(visible.left() / tile_size)))
         last_col = max(0, int(floor(visible.right() / tile_size)))
         first_row = max(0, int(floor(visible.top() / tile_size)))
@@ -527,7 +553,7 @@ class PlayerMapView(QWidget):
         for row in range(first_row, last_row + 1):
             for col in range(first_col, last_col + 1):
                 key = f"{col}_{row}"
-                rect = QRectF(col * tile_size, row * tile_size, tile_size, tile_size)
+                rect = QRectF(ox + col * tile_size, oy + row * tile_size, tile_size, tile_size)
                 if key in uniform:
                     painter.fillRect(rect, QColor(str(uniform[key])))
                     continue
