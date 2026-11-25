@@ -2,4 +2,4 @@
 
 # Single source of the version: pyproject.toml, the installer and the launcher read it.
 # Pushing a new value on main offers the update to every installed application.
-__version__ = "0.1.2"
+__version__ = "0.1.3"
