@@ -8,6 +8,8 @@ stay server-side.
 
 from __future__ import annotations
 
+from hashlib import sha256
+from pathlib import Path
 from typing import Any
 
 from rpg_tabletop.core.rules import PLAYER_STAT_NAMES, RESOURCE_BAR_STATS
@@ -16,6 +18,7 @@ from rpg_tabletop.session.models import SessionToken
 from rpg_tabletop.session.runtime import SessionRuntime
 from rpg_tabletop.session.targeting import targeting_options
 from rpg_tabletop.assets.item import Item
+from .sync_cache import compiled_signature
 
 
 STAT_NAMES = PLAYER_STAT_NAMES  # mental_health / drug_health are GM-only
@@ -105,6 +108,50 @@ def _own_entity_view(runtime: SessionRuntime, entity_id: str) -> dict[str, Any]:
     }
 
 
+# path -> (mtime_ns, size, image id, hex): a sync is built after every change
+# and for every player, so the picture is read again only when its file changes.
+_TOKEN_IMAGES: dict[str, tuple[int, int, str, str]] = {}
+# signature -> compiled map dict, shared by every projection (never mutated)
+_COMPILED: dict[str, dict[str, Any]] = {}
+
+
+def _token_image(path: Any) -> tuple[str | None, str | None]:
+    """(image id, hex) of a token picture, (None, None) when there is none."""
+    if not path:
+        return None, None
+    path = Path(path)
+    try:
+        stat = path.stat()
+    except OSError:
+        return None, None
+    key = str(path)
+    cached = _TOKEN_IMAGES.get(key)
+    if cached is not None and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+        return cached[2], cached[3]
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None, None
+    image_id = sha256(raw).hexdigest()
+    hex_data = raw.hex()
+    _TOKEN_IMAGES[key] = (stat.st_mtime_ns, stat.st_size, image_id, hex_data)
+    return image_id, hex_data
+
+
+def _compiled_view(asset) -> dict[str, Any] | None:
+    if asset.compiled is None:
+        return None
+    compiled = asset.compiled.to_dict()
+    signature = compiled_signature(compiled)
+    cached = _COMPILED.get(signature)
+    if cached is None:
+        compiled["signature"] = signature
+        if len(_COMPILED) >= 8:
+            _COMPILED.pop(next(iter(_COMPILED)))
+        _COMPILED[signature] = cached = compiled
+    return cached
+
+
 def _token_view(runtime: SessionRuntime, observer_id: str, token: SessionToken) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     try:
@@ -112,11 +159,7 @@ def _token_view(runtime: SessionRuntime, observer_id: str, token: SessionToken) 
     except (KeyError, PermissionError):
         summary = {}
     entity = runtime.entities[str(token.entity_id)]
-    if entity.token:
-        with entity.token.open("rb") as file:
-            raw = file.read().hex()
-    else:
-        raw = None
+    image_id, raw = _token_image(entity.token)
     return {
         "id": token.id,
         "entity_id": token.entity_id,
@@ -126,7 +169,9 @@ def _token_view(runtime: SessionRuntime, observer_id: str, token: SessionToken) 
         "opacity": token.opacity,
         "self": token.entity_id == observer_id,
         "public": summary,
-        "image": raw
+        "image": raw,
+        # Lets the server send each picture once per connection (net.sync_cache)
+        "image_id": image_id,
     }
 
 
@@ -136,12 +181,34 @@ def _map_view(runtime: SessionRuntime, entity_id: str) -> dict[str, Any] | None:
 
     asset = runtime._active_map_asset()  # projection is trusted server-side code
     own_token = runtime.active_map.token_for_entity(entity_id)
-    fov_origin = own_token.pos.to_list() if own_token is not None else None
+    if own_token is None:
+        # The GM's current map is the only one that counts. A player whose
+        # entity has no token on it sees nothing of it: no tiles (without a
+        # token there is no field of view, so the whole map would otherwise be
+        # visible and downloaded), no tokens, no annotations. The token keeps
+        # its position on the other maps, stored in the session journal.
+        return {
+            "map_id": runtime.active_map_id,
+            "present": False,
+            "asset": {
+                "id": asset.id,
+                "name": asset.name,
+                "size": [asset.width, asset.height],
+                "origin": [asset.origin_x, asset.origin_y],
+                "grid": asset.grid.to_dict(),
+                "compiled": None,
+            },
+            "fov": None,
+            "tokens": [],
+            "elements": [],
+        }
+    fov_origin = own_token.pos.to_list()
 
-    compiled = asset.compiled.to_dict() if asset.compiled is not None else None
+    compiled = _compiled_view(asset)
     visible_tokens = runtime.visible_tokens_for(entity_id)
     return {
         "map_id": runtime.active_map_id,
+        "present": True,
         "asset": {
             "id": asset.id,
             "name": asset.name,

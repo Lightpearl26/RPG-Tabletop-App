@@ -140,27 +140,24 @@ class PlayerNetworkController(QObject):
     def send_chat(self, message: str) -> None:
         self._client_call("chat", "send_chat", str(message))
 
-    async def _request_assets_batched(self, items: list[dict[str, str]]) -> None:
+    async def _request_assets_batched(self, items: list[dict[str, str]], replace: bool) -> None:
         if self.client is None:
             raise RuntimeError("Client non initialisé.")
         lock = self._asset_request_lock
         if lock is None:
             raise RuntimeError("Le client n'a pas terminé sa connexion.")
-        # The server accepts at most 64 assets per request and rate-limits
-        # incoming commands to five per second. Serialize and space batches.
+        # The server queues the files and streams them in the background. With
+        # `replace`, the first message replaces what it still had to send.
         async with lock:
-            for index in range(0, len(items), 64):
-                batch = items[index:index + 64]
-                await self.client.send(CommandMessage(
-                    ClientCommand.ASSET_REQUEST.value,
-                    {"items": batch},
-                ))
-                if index + 64 < len(items):
-                    await asyncio.sleep(0.30)
+            batch_size = 1024
+            for index in range(0, max(1, len(items)), batch_size):
+                await self.client.request_assets(
+                    items[index:index + batch_size], replace=replace and index == 0
+                )
 
-    def request_assets(self, items: list[dict[str, str]]) -> None:
-        if items:
-            self._submit("assets", self._request_assets_batched(items))
+    def request_assets(self, items: list[dict[str, str]], *, replace: bool = False) -> None:
+        if items or replace:
+            self._submit("assets", self._request_assets_batched(list(items), replace))
 
     def shutdown(self) -> None:
         """Close the client cleanly; called from the Qt thread during window close."""

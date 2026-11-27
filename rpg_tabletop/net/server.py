@@ -23,6 +23,7 @@ from .protocol import (
     NetworkMessage, PingMessage,
 )
 from .relay import RelayEndpoint, VPSRelay
+from .sync_cache import compact_projection
 from .tls import build_server_ssl_context, certificate_fingerprint, ensure_server_certificate
 from .upnp import UPnPPortMapping, UPnPStatus
 
@@ -30,6 +31,19 @@ LogCallback = Callable[[str], None]
 PendingCallback = Callable[[PendingRequest], None]
 ClientCallback = Callable[[str], None]
 ChatCallback = Callable[[str, str], None]
+
+# Asset requests are queued and streamed by a background task per player, so a
+# big map never blocks the reading of that player's messages (pongs included).
+ASSET_COMMANDS = frozenset({
+    ClientCommand.ASSET_MANIFEST_REQUEST.value, ClientCommand.ASSET_REQUEST.value,
+})
+MAX_ASSET_ITEMS_PER_REQUEST = 1024
+MAX_ASSET_QUEUE = 4096
+# A message to one player may not hold the others back longer than this
+SEND_TIMEOUT = 15.0
+# Over the rate limit a message is refused; this many times over it, the
+# connection is considered abusive and closed.
+RATE_LIMIT_DISCONNECT_FACTOR = 4
 
 
 @dataclass(slots=True)
@@ -44,6 +58,14 @@ class ServerClientSession:
     last_ping_id: int | None = None
     ping_ms: int | None = None
     recent_messages: deque[float] = field(default_factory=deque)
+    # Assets waiting to be streamed, as (namespace, path)
+    asset_queue: deque[tuple[str, str]] = field(default_factory=deque)
+    asset_wakeup: asyncio.Event = field(default_factory=asyncio.Event)
+    asset_task: asyncio.Task[None] | None = None
+    assets_sent: int = 0
+    # Heavy projection parts this connection already received (net.sync_cache)
+    sent_images: set[str] = field(default_factory=set)
+    sent_compiled: set[str] = field(default_factory=set)
 
 
 class RPGNetworkServer:
@@ -187,6 +209,8 @@ class RPGNetworkServer:
                 await self._heartbeat_task
             self._heartbeat_task = None
         for session in list(self.clients.values()):
+            if session.asset_task is not None:
+                session.asset_task.cancel()
             await session.connection.close()
         self.clients.clear()
         for task in list(self._client_tasks):
@@ -206,7 +230,7 @@ class RPGNetworkServer:
             self._client_tasks.add(task)
         connection = NetworkConnection(reader, writer)
         peer = writer.get_extra_info("peername") or ("?", 0)
-        username: str | None = None
+        session: ServerClientSession | None = None
         try:
             auth = await asyncio.wait_for(connection.receive(), timeout=15.0)
             if auth.protocol_version != PROTOCOL_VERSION:
@@ -221,21 +245,27 @@ class RPGNetworkServer:
                     ErrorType.AUTH_REJECTED, "AUTH must be the first message", reply_to=auth.message_id
                 ))
                 return
-            username = await self._authenticate(connection, peer, auth)
-            if username is None:
+            session = await self._authenticate(connection, peer, auth)
+            if session is None:
                 return
-            await self._client_loop(self.clients[username])
+            await self._client_loop(session)
+        except asyncio.CancelledError:
+            raise
         except (asyncio.TimeoutError, ConnectionError, OSError, RuntimeError, ValueError) as exc:
             self._log(f"[connect] peer={peer} error={exc}")
+        except Exception as exc:  # noqa: BLE001 - never leave a ghost session behind
+            self._log(f"[connect] peer={peer} unexpected {type(exc).__name__}: {exc}")
         finally:
-            if username is not None:
-                await self._drop_client(username, announce=True)
+            if session is not None:
+                await self._drop_session(session, announce=True)
             else:
                 await connection.close()
             if task is not None:
                 self._client_tasks.discard(task)
 
-    async def _authenticate(self, connection: NetworkConnection, peer, request: CommandMessage) -> str | None:
+    async def _authenticate(
+        self, connection: NetworkConnection, peer, request: CommandMessage
+    ) -> ServerClientSession | None:
         username = str(request.args.get("username", "")).strip()
         password = str(request.args.get("password", ""))
         requested_entity = str(request.args.get("entity_id", "")).strip()
@@ -244,9 +274,6 @@ class RPGNetworkServer:
             return None
         if username.lower() in {"admin", "gm", "server"}:
             await connection.send(ErrorMessage(ErrorType.AUTH_REJECTED, "Reserved username", reply_to=request.message_id))
-            return None
-        if username in self.clients:
-            await connection.send(ErrorMessage(ErrorType.AUTH_REJECTED, "Username already in use", reply_to=request.message_id))
             return None
         if not hmac.compare_digest(password.encode("utf-8"), self.settings.password.encode("utf-8")):
             await connection.send(ErrorMessage(ErrorType.AUTH_REJECTED, "Invalid password", reply_to=request.message_id))
@@ -258,41 +285,88 @@ class RPGNetworkServer:
                 ErrorType.AUTH_REJECTED, "Requested Entity does not match the GM binding", reply_to=request.message_id
             ))
             return None
+
+        # A player who comes back while the server still holds their previous
+        # connection (it died on their side, or the heartbeat has not noticed
+        # yet) replaces it instead of being refused for minutes.
+        previous = self.clients.get(username)
+        if previous is not None:
+            self._log(f"[auth] username={username!r} reconnects: closing the previous connection")
+            await self._safe_send(previous, ErrorMessage(ErrorType.CLOSED, "Replaced by a new connection"), timeout=2.0)
+            await self._drop_session(previous, announce=False)
+
         session = ServerClientSession(username, tuple(peer), connection, bound_entity_id=bound)
         self.clients[username] = session
-        if bound and self.gateway is not None:
-            try:
-                self.gateway.bind(username, bound)
-            except (KeyError, ValueError) as exc:
-                self.clients.pop(username, None)
-                await connection.send(ErrorMessage(ErrorType.AUTH_REJECTED, str(exc), reply_to=request.message_id))
-                return None
+        try:
+            if bound and self.gateway is not None:
+                try:
+                    self.gateway.bind(username, bound)
+                except (KeyError, ValueError) as exc:
+                    self.clients.pop(username, None)
+                    await connection.send(ErrorMessage(ErrorType.AUTH_REJECTED, str(exc), reply_to=request.message_id))
+                    return None
 
-        await connection.send(CommandMessage(
-            ServerCommand.AUTH_OK.value,
-            {
-                "username": username,
-                "entity_id": bound,
-                "protocol_version": PROTOCOL_VERSION,
-                "server_fingerprint": self.certificate_fingerprint,
-            },
-            reply_to=request.message_id,
-        ))
-        already = [name for name in self.clients if name != username]
-        await connection.send(CommandMessage(ServerCommand.PLAYER_LIST.value, {"players": already}))
-        await self.broadcast(
-            CommandMessage(ServerCommand.PLAYER_JOINED.value, {"username": username}),
-            exclude={username},
-        )
-        if bound and self.gateway is not None:
             await connection.send(CommandMessage(
-                ServerCommand.RUNTIME_SYNC.value,
-                {"projection": self.gateway.projection_for(username)},
+                ServerCommand.AUTH_OK.value,
+                {
+                    "username": username,
+                    "entity_id": bound,
+                    "protocol_version": PROTOCOL_VERSION,
+                    "server_fingerprint": self.certificate_fingerprint,
+                },
+                reply_to=request.message_id,
             ))
+            already = [name for name in self.clients if name != username]
+            await connection.send(CommandMessage(ServerCommand.PLAYER_LIST.value, {"players": already}))
+            if previous is None:
+                await self.broadcast(
+                    CommandMessage(ServerCommand.PLAYER_JOINED.value, {"username": username}),
+                    exclude={username},
+                )
+            if bound and self.gateway is not None:
+                try:
+                    message = self._runtime_sync_message(session)
+                except Exception as exc:  # noqa: BLE001 - the next sync will catch up
+                    self._log(f"[auth] username={username!r} first sync failed: {type(exc).__name__}: {exc}")
+                else:
+                    await connection.send(message)
+        except BaseException:
+            # The session must not outlive a failed authentication ("Username
+            # already in use" until the heartbeat timeout otherwise).
+            if self.clients.get(username) is session:
+                self.clients.pop(username, None)
+                if self.gateway is not None and self.gateway.entity_for(username) == bound:
+                    self.gateway.unbind(username)
+            raise
         self._log(f"[auth] accepted username={username!r} peer={peer} entity={bound!r}")
         if self.on_client_connected is not None:
             self.on_client_connected(username)
-        return username
+        return session
+
+    def _runtime_sync_message(
+        self,
+        session: ServerClientSession,
+        projection: dict[str, Any] | None = None,
+        *,
+        reply_to: str | None = None,
+    ) -> CommandMessage:
+        """A RUNTIME_SYNC for this player, without what their connection already has."""
+        if projection is None:
+            if self.gateway is None:
+                raise RuntimeError("No RuntimeNetworkGateway is connected")
+            projection = self.gateway.projection_for(session.username)
+        compact = compact_projection(projection, session.sent_images, session.sent_compiled)
+        return CommandMessage(ServerCommand.RUNTIME_SYNC.value, {"projection": compact}, reply_to=reply_to)
+
+    def _for_session(self, session: ServerClientSession, message: NetworkMessage) -> NetworkMessage:
+        """Compact the RUNTIME_SYNC messages the gateway built for this player."""
+        if (
+            isinstance(message, CommandMessage)
+            and message.command == ServerCommand.RUNTIME_SYNC.value
+            and isinstance(message.args.get("projection"), dict)
+        ):
+            return self._runtime_sync_message(session, message.args["projection"], reply_to=message.reply_to)
+        return message
 
     async def bind_player(self, username: str, entity_id: str) -> None:
         if username not in self.clients:
@@ -304,9 +378,7 @@ class RPGNetworkServer:
         session = self.clients[username]
         session.bound_entity_id = entity_id
         await session.connection.send(CommandMessage(ServerCommand.ENTITY_BOUND.value, {"entity_id": entity_id}))
-        await session.connection.send(CommandMessage(
-            ServerCommand.RUNTIME_SYNC.value, {"projection": self.gateway.projection_for(username)}
-        ))
+        await session.connection.send(self._runtime_sync_message(session))
 
     async def request_initiative(self, username: str, entity_id: str) -> None:
         """Ask a player for the d20 initiative of their entity."""
@@ -361,11 +433,27 @@ class RPGNetworkServer:
                     session.last_pong_time = monotonic()
                     session.ping_ms = max(0, int((session.last_pong_time - session.last_ping_time) * 1000))
                 continue
+            if isinstance(message, CommandMessage) and message.command in ASSET_COMMANDS:
+                # Cheap (only queued) and bounded: not counted by the rate limit,
+                # which a viewport scrolled over a big map would otherwise trip.
+                try:
+                    await self._handle_asset_command(session, message)
+                except (KeyError, ValueError, OSError) as exc:
+                    await session.connection.send(ErrorMessage(
+                        ErrorType.REQUEST_REJECTED, str(exc), reply_to=message.message_id
+                    ))
+                continue
             if self._rate_limited(session):
+                if len(session.recent_messages) > self.settings.rate_limit_messages * RATE_LIMIT_DISCONNECT_FACTOR:
+                    await session.connection.send(ErrorMessage(
+                        ErrorType.RATE_LIMIT, "Too many messages; disconnected", reply_to=message.message_id
+                    ))
+                    self._log(f"[session] username={session.username!r} flooded the server: disconnected")
+                    break
                 await session.connection.send(ErrorMessage(
                     ErrorType.RATE_LIMIT, "Too many messages; slow down", reply_to=message.message_id
                 ))
-                break
+                continue
             if isinstance(message, ChatMessage):
                 clean = ChatMessage(session.username, message.message[:4000], reply_to=message.message_id)
                 if self.on_chat is not None:
@@ -376,20 +464,22 @@ class RPGNetworkServer:
                 continue
             if message.command == ClientCommand.QUIT.value:
                 break
-            if message.command in {ClientCommand.ASSET_MANIFEST_REQUEST.value, ClientCommand.ASSET_REQUEST.value}:
-                try:
-                    await self._handle_asset_command(session, message)
-                except (KeyError, ValueError, FileNotFoundError) as exc:
-                    await session.connection.send(ErrorMessage(
-                        ErrorType.REQUEST_REJECTED, str(exc), reply_to=message.message_id
-                    ))
-                continue
             if self.gateway is None:
                 await session.connection.send(ErrorMessage(
                     ErrorType.INVALID_STATE, "No game runtime is connected", reply_to=message.message_id
                 ))
                 continue
-            result = self.gateway.handle(session.username, message)
+            try:
+                result = self.gateway.handle(session.username, message)
+            except Exception as exc:  # noqa: BLE001 - a bad request must not cut the player off
+                self._log(
+                    f"[session] username={session.username!r} {message.command} failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                await session.connection.send(ErrorMessage(
+                    ErrorType.INVALID_STATE, f"Server error: {exc}", reply_to=message.message_id
+                ))
+                continue
             await self._apply_gateway_result(session.username, result)
 
     async def _handle_asset_command(self, session: ServerClientSession, request: CommandMessage) -> None:
@@ -402,38 +492,85 @@ class RPGNetworkServer:
             namespaces = request.args.get("namespaces")
             if namespaces is not None and not isinstance(namespaces, list):
                 raise ValueError("namespaces must be a list")
-            manifest = [entry.to_dict() for entry in self.asset_catalog.manifest(namespaces)]
+            entries = await asyncio.to_thread(self.asset_catalog.manifest, namespaces)
+            manifest = [entry.to_dict() for entry in entries]
             await session.connection.send(CommandMessage(
                 ServerCommand.ASSET_MANIFEST.value, {"manifest": manifest}, reply_to=request.message_id
             ))
             return
         items = request.args.get("items", [])
-        if not isinstance(items, list) or len(items) > 64:
-            raise ValueError("items must be a list of at most 64 assets")
+        if not isinstance(items, list) or len(items) > MAX_ASSET_ITEMS_PER_REQUEST:
+            raise ValueError(f"items must be a list of at most {MAX_ASSET_ITEMS_PER_REQUEST} assets")
+        # `replace`: the client sends what it needs now (what is on screen); the
+        # files it no longer needs are dropped instead of being sent anyway.
+        if request.args.get("replace"):
+            session.asset_queue.clear()
+        queued = set(session.asset_queue)
         for item in items:
             if not isinstance(item, dict):
                 continue
-            namespace, path = str(item.get("namespace", "")), str(item.get("path", ""))
-            for chunk in self.asset_catalog.chunks(namespace, path):
-                await session.connection.send(CommandMessage(ServerCommand.ASSET_CHUNK.value, chunk))
-        await session.connection.send(CommandMessage(
-            ServerCommand.ASSET_DONE.value, {"count": len(items)}, reply_to=request.message_id
-        ))
+            key = (str(item.get("namespace", "")), str(item.get("path", "")))
+            if not key[0] or not key[1] or key in queued:
+                continue
+            if len(session.asset_queue) >= MAX_ASSET_QUEUE:
+                break
+            session.asset_queue.append(key)
+            queued.add(key)
+        if session.asset_task is None or session.asset_task.done():
+            session.asset_task = asyncio.create_task(self._asset_worker(session))
+        session.asset_wakeup.set()
+
+    async def _asset_worker(self, session: ServerClientSession) -> None:
+        """
+        Stream the queued assets of one player, one chunk per message.
+
+        Each chunk takes the connection's send lock on its own, so heartbeats,
+        syncs and replies go out between two chunks instead of after the whole
+        map, and the player's own messages keep being read meanwhile.
+        """
+        catalog = self.asset_catalog
+        if catalog is None:
+            return
+        try:
+            while self.is_running and session.connection.is_active:
+                if not session.asset_queue:
+                    if session.assets_sent:
+                        count, session.assets_sent = session.assets_sent, 0
+                        await session.connection.send(CommandMessage(
+                            ServerCommand.ASSET_DONE.value, {"count": count}
+                        ))
+                    session.asset_wakeup.clear()
+                    if not session.asset_queue:
+                        await session.asset_wakeup.wait()
+                    continue
+                namespace, path = session.asset_queue.popleft()
+                try:
+                    chunks = await asyncio.to_thread(lambda: list(catalog.chunks(namespace, path)))
+                except (KeyError, ValueError, OSError) as exc:
+                    await session.connection.send(CommandMessage(
+                        ServerCommand.ASSET_FAILED.value,
+                        {"namespace": namespace, "path": path, "reason": str(exc)},
+                    ))
+                    continue
+                for chunk in chunks:
+                    await session.connection.send(CommandMessage(ServerCommand.ASSET_CHUNK.value, chunk))
+                session.assets_sent += 1
+        except asyncio.CancelledError:
+            raise
+        except (ConnectionError, OSError, RuntimeError):
+            return
 
     async def _apply_gateway_result(self, username: str, result: GatewayResult) -> None:
         """Replies to the requester (absent for GM requests), messages to other players, sync."""
         session = self.clients.get(username)
         if session is not None:
             for reply in result.replies:
-                await session.connection.send(reply)
+                await session.connection.send(self._for_session(session, reply))
         for recipient, message in result.outbox:
             target = self.clients.get(recipient)
             if target is None:
                 continue
-            try:
-                await target.connection.send(message)
-            except (ConnectionError, OSError, RuntimeError):
-                pass
+            await self._safe_send(target, self._for_session(target, message))
         if result.broadcast_sync:
             await self.broadcast_runtime_sync()
 
@@ -489,55 +626,86 @@ class RPGNetworkServer:
     async def broadcast_runtime_sync(self) -> None:
         if self.gateway is None:
             return
+        sends = []
         for username, session in list(self.clients.items()):
             if self.gateway.entity_for(username) is None:
                 continue
             try:
-                projection = self.gateway.projection_for(username)
-                await session.connection.send(CommandMessage(
-                    ServerCommand.RUNTIME_SYNC.value, {"projection": projection}
-                ))
-            except (ConnectionError, KeyError, PermissionError, RuntimeError):
+                message = self._runtime_sync_message(session)
+            except (KeyError, PermissionError, RuntimeError):
                 continue
+            except Exception as exc:  # noqa: BLE001 - one bad projection must not stop the others
+                self._log(f"[sync] username={username!r} projection failed: {type(exc).__name__}: {exc}")
+                continue
+            sends.append(self._safe_send(session, message))
+        if sends:
+            await asyncio.gather(*sends)
 
     async def broadcast(self, message: NetworkMessage, *, exclude: set[str] | None = None) -> None:
         excluded = exclude or set()
-        for username, session in list(self.clients.items()):
-            if username in excluded:
-                continue
-            try:
-                await session.connection.send(message)
-            except (ConnectionError, OSError, RuntimeError):
-                pass
+        targets = [session for username, session in list(self.clients.items()) if username not in excluded]
+        if targets:
+            # Concurrently: a slow player must not delay everybody else
+            await asyncio.gather(*(self._safe_send(session, message) for session in targets))
+
+    async def _safe_send(
+        self, session: ServerClientSession, message: NetworkMessage, *, timeout: float = SEND_TIMEOUT
+    ) -> bool:
+        try:
+            await asyncio.wait_for(session.connection.send(message), timeout)
+            return True
+        except (asyncio.TimeoutError, ConnectionError, OSError, RuntimeError):
+            return False
 
     async def _heartbeat_loop(self) -> None:
         while self.is_running:
-            now = monotonic()
-            for username, session in list(self.clients.items()):
-                if now - session.last_pong_time > self.settings.heartbeat_timeout:
-                    with suppress(ConnectionError, OSError, RuntimeError):
-                        await session.connection.send(ErrorMessage(ErrorType.TIMEOUT, "Heartbeat timeout"))
-                    await self._drop_client(username, announce=True)
-                    continue
-                if session.last_ping_time <= session.last_pong_time:
-                    ping_id = int(now * 1000)
-                    session.last_ping_id = ping_id
-                    session.last_ping_time = now
-                    with suppress(ConnectionError, OSError, RuntimeError):
-                        await session.connection.send(PingMessage(ping_id))
-            await self.broadcast(CommandMessage(
-                ServerCommand.PLAYER_PINGS.value,
-                {"players": [
-                    {"username": name, "ping_ms": client.ping_ms}
-                    for name, client in self.clients.items()
-                ]},
-            ))
+            try:
+                await self._heartbeat_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - the heartbeat must never die
+                self._log(f"[heartbeat] {type(exc).__name__}: {exc}")
             await asyncio.sleep(self.settings.heartbeat_interval)
 
+    async def _heartbeat_once(self) -> None:
+        now = monotonic()
+        pings = []
+        for session in list(self.clients.values()):
+            if now - session.last_pong_time > self.settings.heartbeat_timeout:
+                await self._safe_send(session, ErrorMessage(ErrorType.TIMEOUT, "Heartbeat timeout"), timeout=2.0)
+                await self._drop_session(session, announce=True)
+                continue
+            if session.last_ping_time <= session.last_pong_time:
+                ping_id = int(now * 1000)
+                session.last_ping_id = ping_id
+                session.last_ping_time = now
+                pings.append(self._safe_send(session, PingMessage(ping_id)))
+        if pings:
+            await asyncio.gather(*pings)
+        await self.broadcast(CommandMessage(
+            ServerCommand.PLAYER_PINGS.value,
+            {"players": [
+                {"username": name, "ping_ms": client.ping_ms}
+                for name, client in self.clients.items()
+            ]},
+        ))
+
     async def _drop_client(self, username: str, *, announce: bool) -> None:
-        session = self.clients.pop(username, None)
-        if session is None:
+        session = self.clients.get(username)
+        if session is not None:
+            await self._drop_session(session, announce=announce)
+
+    async def _drop_session(self, session: ServerClientSession, *, announce: bool) -> None:
+        """Forget one connection; a newer connection of the same player is left alone."""
+        task = session.asset_task
+        session.asset_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+        username = session.username
+        if self.clients.get(username) is not session:
+            await session.connection.close()
             return
+        self.clients.pop(username, None)
         if self.gateway is not None:
             pending = self.gateway.pending_for(username)
             if pending is not None:

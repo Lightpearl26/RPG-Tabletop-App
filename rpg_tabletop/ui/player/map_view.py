@@ -2,6 +2,7 @@
 """Player-safe interactive map view driven only by server projections."""
 from __future__ import annotations
 
+from hashlib import sha256
 from math import floor, ceil
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -43,6 +44,7 @@ class PlayerMapView(QWidget):
         self.center = Vec2()
         self.zoom = 1.0
         self._tile_cache: dict[Path, QImage] = {}
+        self._token_pictures: dict[str, QImage] = {}
         self._elements: list[MapElement] = []
         self._media: MediaCache | None = None
         self._panning = False
@@ -94,11 +96,16 @@ class PlayerMapView(QWidget):
                 from PySide6.QtCore import QTimer
                 QTimer.singleShot(0, self.fit_map)
         self._elements = []
-        self._media = None
+        if self.map_data is None or new_map_id != old_map_id:
+            self._media = None
         if self.map_data is not None:
             map_id = str(self.map_data.get("map_id", ""))
             safe_map_id = PurePosixPath(map_id.replace("\\", "/"))
-            if map_id and not safe_map_id.is_absolute() and len(safe_map_id.parts) == 1 and map_id not in {".", ".."}:
+            if (
+                self._media is None and map_id and not safe_map_id.is_absolute()
+                and len(safe_map_id.parts) == 1 and map_id not in {".", ".."}
+            ):
+                # Kept between syncs: missing files are not cached, decoded ones are
                 self._media = MediaCache(self.cache_root / "maps" / map_id)
             for raw in self.map_data.get("elements", []):
                 if not isinstance(raw, dict):
@@ -212,8 +219,15 @@ class PlayerMapView(QWidget):
         self.update()
         self.viewport_changed.emit()
 
+    @property
+    def on_map(self) -> bool:
+        """False when the player's entity has no token on the GM's current map."""
+        return self.map_data is not None and self.map_data.get("present", True) is not False
+
     def visible_tile_keys(self) -> set[str]:
         """Return only compiled tile files intersecting the current viewport."""
+        if not self.on_map:
+            return set()
         asset = self._asset_data()
         compiled = asset.get("compiled") if isinstance(asset, dict) else None
         if not isinstance(compiled, dict):
@@ -244,6 +258,26 @@ class PlayerMapView(QWidget):
             for col in range(first_col, last_col + 1)
             if f"{col}_{row}" in tiles
         }
+
+    def prioritized_tile_keys(self) -> list[str]:
+        """The visible tiles, nearest to the center of the view first."""
+        keys = self.visible_tile_keys()
+        if not keys:
+            return []
+        compiled = (self._asset_data() or {}).get("compiled") or {}
+        try:
+            tile_size = max(1, int(compiled.get("tile_size", 512)))
+        except (TypeError, ValueError):
+            tile_size = 512
+        ox, oy = self._origin(compiled)
+        center = self._visible_world_rect().center()
+        cx, cy = (center.x() - ox) / tile_size, (center.y() - oy) / tile_size
+
+        def distance(key: str) -> float:
+            col, row = (int(part) for part in key.split("_", 1))
+            return (col + 0.5 - cx) ** 2 + (row + 0.5 - cy) ** 2
+
+        return sorted(keys, key=distance)
 
     # -------------------------------------------------------------- coordinates
     def world_to_screen(self, point: Vec2) -> QPointF:
@@ -473,6 +507,13 @@ class PlayerMapView(QWidget):
                 painter.setPen(QColor("#98a2b1"))
                 painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "En attente de la carte du MJ…")
                 return
+            if not self.on_map:
+                painter.setPen(QColor("#98a2b1"))
+                painter.drawText(
+                    self.rect(), Qt.AlignmentFlag.AlignCenter,
+                    "Ton personnage n'est pas sur cette carte.\nLe MJ doit y placer ton token.",
+                )
+                return
             map_rect = self._map_rect(asset)
             if map_rect is None:
                 return
@@ -652,6 +693,29 @@ class PlayerMapView(QWidget):
             y = oy + row * cell
             painter.drawLine(QPointF(visible.left(), y), QPointF(visible.right(), y))
 
+    def _token_picture(self, token: dict[str, Any]) -> QImage | None:
+        """
+        The decoded picture of a token, decoded once and kept by image id.
+
+        It used to be written to a temporary file and decoded again on every
+        repaint (every mouse move, every received tile), which froze the view.
+        """
+        raw = token.get("image")
+        if not raw:
+            return None
+        key = str(token.get("image_id") or "") or sha256(str(raw).encode("ascii", "ignore")).hexdigest()
+        cached = self._token_pictures.get(key)
+        if cached is not None:
+            return None if cached.isNull() else cached
+        try:
+            picture = QImage.fromData(bytes.fromhex(str(raw)))
+        except ValueError:
+            picture = QImage()
+        if len(self._token_pictures) > 256:
+            self._token_pictures.clear()
+        self._token_pictures[key] = picture
+        return None if picture.isNull() else picture
+
     def _draw_tokens(self, painter: QPainter) -> None:
         own_name = str(self.own_entity.get("name", "Vous"))
         for token in self._tokens():
@@ -676,17 +740,13 @@ class PlayerMapView(QWidget):
                 outline = QColor("#f9e2af")
             painter.setPen(QPen(outline, max(1.5, 2.0 / self.zoom)))
             painter.drawEllipse(rect)
-            if image:
-                temp_file = Path.cwd() / "temp.webp"
-                with temp_file.open("wb") as file:
-                    file.write(bytes.fromhex(image))
-                image = QImage(str(temp_file))
+            picture = self._token_picture(token) if image else None
+            if picture is not None:
                 clipath = QPainterPath()
                 clipath.addEllipse(rect)
                 painter.setClipPath(clipath)
-                painter.drawImage(rect, image)
+                painter.drawImage(rect, picture)
                 painter.setClipping(False)
-                temp_file.unlink()
             else:
                 initials = "".join(part[:1] for part in name.split())[:2].upper() or "?"
                 painter.setPen(QColor("#f4f4f5"))
@@ -721,6 +781,9 @@ class PlayerMapView(QWidget):
 
     # ------------------------------------------------------------------ input
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        if not self.on_map:
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.MiddleButton:
             # The view is locked on the player's token when a field of view exists
             if self._fov_rect() is None:

@@ -44,6 +44,8 @@ class ServerCommand(str, Enum):
     ASSET_MANIFEST = "ASSET_MANIFEST"
     ASSET_CHUNK = "ASSET_CHUNK"
     ASSET_DONE = "ASSET_DONE"
+    # One requested asset could not be sent (missing or refused file)
+    ASSET_FAILED = "ASSET_FAILED"
     # The GM asks a player for the d20 initiative of their entity
     INITIATIVE_REQUEST = "INITIATIVE_REQUEST"
     INITIATIVE_CANCELLED = "INITIATIVE_CANCELLED"

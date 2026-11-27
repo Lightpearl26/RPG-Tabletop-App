@@ -7,7 +7,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, Iterable
 
-DEFAULT_CHUNK_BYTES = 192 * 1024
+# Small chunks let pings, syncs and replies slip in between two pieces of a file
+DEFAULT_CHUNK_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True, slots=True)

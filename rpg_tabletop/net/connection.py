@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Async JSON-line connection shared by server and client."""
 from __future__ import annotations
-from asyncio import Lock, StreamReader, StreamWriter
+from asyncio import Lock, StreamReader, StreamWriter, TimeoutError as AsyncTimeout, wait_for
 from .protocol import NetworkMessage, decode
 
 
@@ -34,6 +34,7 @@ class NetworkConnection:
         self.is_active = False
         self.writer.close()
         try:
-            await self.writer.wait_closed()
-        except (ConnectionError, OSError, RuntimeError):
+            # A peer that vanished never finishes the TLS close: do not hang on it
+            await wait_for(self.writer.wait_closed(), 3.0)
+        except (AsyncTimeout, ConnectionError, OSError, RuntimeError):
             pass

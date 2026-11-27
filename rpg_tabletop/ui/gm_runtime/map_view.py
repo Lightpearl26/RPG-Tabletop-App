@@ -2,6 +2,7 @@
 """GM runtime map viewport."""
 from __future__ import annotations
 
+from math import hypot
 from pathlib import Path
 from typing import Optional
 
@@ -10,9 +11,11 @@ from PySide6.QtGui import (
     QColor, QImage, QMouseEvent, QPainter, QPen, QBrush, QWheelEvent,
     QDragEnterEvent, QDragMoveEvent, QDropEvent,
 )
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QMenu, QWidget
 
-from rpg_tabletop.assets.map import DrawingElement, DrawTool, MapAsset, MediaCache, Rect, Vec2
+from rpg_tabletop.assets.map import (
+    DrawingElement, DrawTool, MapAsset, MapElement, MediaCache, Rect, Vec2,
+)
 from rpg_tabletop.core.geometry import GridGeometry, area_cells, chebyshev, line_cells
 from rpg_tabletop.session.models import SessionToken
 from rpg_tabletop.session.runtime import SessionRuntime
@@ -51,6 +54,12 @@ class RuntimeMapView(QWidget):
         self._drawing_width = 3.0
         self._drawing_points: list[Vec2] = []
         self._drawing_active = False
+        # Annotations added during the session (drawings...): selection and move
+        self.selected_element_id: str | None = None
+        self._drag_element_id: str | None = None
+        self._drag_element_snapshot: MapElement | None = None
+        self._drag_element_start: Vec2 | None = None
+        self._drag_element_press = QPointF()
         # Action targeting (GM acting for an entity): see start_targeting
         self._targeting: dict | None = None
         self._target_ids: list[str] = []
@@ -138,6 +147,7 @@ class RuntimeMapView(QWidget):
                         if getattr(element, "visible", True):
                             element.render(painter, self.media)
                 self._draw_grid(painter)
+                self._draw_element_selection(painter)
                 for wall in self.asset.walls():
                     wall.render(painter, self.media)
                 self._draw_tokens(painter)
@@ -471,6 +481,8 @@ class RuntimeMapView(QWidget):
             self._drawing_tool = tool if isinstance(tool, DrawTool) else DrawTool(str(tool))
         self._drawing_active = False
         self._drawing_points.clear()
+        if self._drawing_tool is not None:
+            self.selected_element_id = None
         self.setCursor(
             Qt.CursorShape.CrossCursor if self._drawing_tool is not None
             else Qt.CursorShape.ArrowCursor
@@ -487,20 +499,18 @@ class RuntimeMapView(QWidget):
         state = self.runtime.active_map
         if state is None:
             return
-        for element in reversed(state.elements):
-            bounds = element.bounds()
-            if (
-                bounds.x - 6 <= world.x <= bounds.x + bounds.width + 6
-                and bounds.y - 6 <= world.y <= bounds.y + bounds.height + 6
-            ):
-                try:
-                    self.runtime.remove_map_element(element.id)
-                except Exception as exc:
-                    self.status_message.emit(str(exc))
-                    return
-                self.runtime_changed.emit()
-                self.update()
-                return
+        element = self.element_at(world)
+        if element is None:
+            return
+        try:
+            self.runtime.remove_map_element(element.id)
+        except Exception as exc:
+            self.status_message.emit(str(exc))
+            return
+        if self.selected_element_id == element.id:
+            self.selected_element_id = None
+        self.runtime_changed.emit()
+        self.update()
 
     def _commit_drawing(self) -> None:
         if not self._drawing_active or not isinstance(self._drawing_tool, DrawTool):
@@ -525,6 +535,91 @@ class RuntimeMapView(QWidget):
                 stroke_color=self._drawing_color,
                 stroke_width=self._drawing_width,
             ))
+        except Exception as exc:
+            self.status_message.emit(str(exc))
+            self.update()
+            return
+        self.runtime_changed.emit()
+        self.update()
+
+    # ------------------------------------------------------------ annotations
+    def _runtime_element(self, element_id: str | None) -> MapElement | None:
+        state = self.runtime.active_map
+        if state is None or not element_id:
+            return None
+        return next((element for element in state.elements if element.id == element_id), None)
+
+    def element_at(self, world: Vec2) -> MapElement | None:
+        """The topmost session annotation under the cursor (a few pixels of slack)."""
+        state = self.runtime.active_map
+        if state is None:
+            return None
+        tolerance = 6.0 / max(self.zoom, 0.05)
+        for element in reversed(state.elements):
+            if getattr(element, "visible", True) and _element_hit(element, world, tolerance):
+                return element
+        return None
+
+    def _select_element(self, element: MapElement | None) -> None:
+        self.selected_element_id = element.id if element is not None else None
+        if element is not None:
+            self.selected_token_id = None
+            hint = "verrouillée" if element.locked else "glisser pour déplacer"
+            self.status_message.emit(f"Annotation sélectionnée — {hint}, Suppr pour l'effacer.")
+        self.update()
+
+    def _draw_element_selection(self, painter: QPainter) -> None:
+        element = self._runtime_element(self.selected_element_id)
+        if element is None:
+            return
+        bounds = element.bounds()
+        margin = 4.0 / max(self.zoom, 0.05)
+        pen = QPen(QColor("#b58cff"), max(1.0, 1.5 / self.zoom), Qt.PenStyle.DashLine)
+        painter.save()
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(QRectF(
+            bounds.x - margin, bounds.y - margin, bounds.width + 2 * margin, bounds.height + 2 * margin
+        ))
+        painter.restore()
+
+    def remove_selected_element(self) -> None:
+        element = self._runtime_element(self.selected_element_id)
+        self.selected_element_id = None
+        if element is None:
+            self.update()
+            return
+        try:
+            self.runtime.remove_map_element(element.id)
+        except Exception as exc:
+            self.status_message.emit(str(exc))
+            return
+        self.status_message.emit("Annotation effacée.")
+        self.runtime_changed.emit()
+        self.update()
+
+    def _show_element_menu(self, element: MapElement, global_pos) -> None:
+        menu = QMenu(self)
+        delete = menu.addAction("Effacer l'annotation")
+        if menu.exec(global_pos) is delete and self.selected_element_id == element.id:
+            self.remove_selected_element()
+
+    def _finish_element_drag(self) -> None:
+        element_id, snapshot = self._drag_element_id, self._drag_element_snapshot
+        self._drag_element_id = None
+        self._drag_element_snapshot = None
+        self._drag_element_start = None
+        live = self._runtime_element(element_id)
+        if live is None or snapshot is None:
+            return
+        moved = MapElement.from_dict(live.to_dict())
+        # The journal records "before -> after": put the original back first
+        _copy_placement(live, snapshot)
+        if moved.to_dict() == snapshot.to_dict():
+            self.update()
+            return
+        try:
+            self.runtime.update_map_element(moved)
         except Exception as exc:
             self.status_message.emit(str(exc))
             self.update()
@@ -618,18 +713,36 @@ class RuntimeMapView(QWidget):
         token = self.token_at(world)
         if event.button() == Qt.MouseButton.RightButton and token is not None:
             self.selected_token_id = token.id
+            self.selected_element_id = None
             self.token_selected.emit(token.id)
             self.token_context_requested.emit(token.id)
             self.update()
             event.accept()
             return
+        # Tokens come first; then the annotations drawn during the session
+        element = self.element_at(world) if token is None else None
+        if event.button() == Qt.MouseButton.RightButton and element is not None:
+            self._select_element(element)
+            self._show_element_menu(element, event.globalPosition().toPoint())
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             self.selected_token_id = token.id if token is not None else None
             if token is not None:
+                self.selected_element_id = None
                 self.token_selected.emit(token.id)
                 self._drag_token_id = token.id
                 self._drag_start_pos = Vec2(token.pos.x, token.pos.y)
                 self._drag_offset = Vec2(world.x - token.pos.x, world.y - token.pos.y)
+            elif element is not None:
+                self._select_element(element)
+                if not element.locked:
+                    self._drag_element_id = element.id
+                    self._drag_element_snapshot = MapElement.from_dict(element.to_dict())
+                    self._drag_element_start = world
+                    self._drag_element_press = event.position()
+            else:
+                self.selected_element_id = None
             self.update()
             event.accept()
             return
@@ -655,6 +768,18 @@ class RuntimeMapView(QWidget):
             else:
                 self._drawing_points[-1] = world
             self.update()
+            return
+
+        if self._drag_element_id and self._drag_element_snapshot is not None:
+            live = self._runtime_element(self._drag_element_id)
+            start = self._drag_element_start
+            if live is not None and start is not None:
+                press = self._drag_element_press
+                if hypot(event.position().x() - press.x(), event.position().y() - press.y()) < 3:
+                    return  # a click, not a drag
+                world = self.screen_to_world(event.position())
+                _copy_placement(live, self._drag_element_snapshot, Vec2(world.x - start.x, world.y - start.y))
+                self.update()
             return
 
         if self._drag_token_id and self.runtime.active_map is not None:
@@ -690,6 +815,9 @@ class RuntimeMapView(QWidget):
                 else:
                     self._drawing_points[-1] = world
             self._commit_drawing()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_element_id:
+            self._finish_element_drag()
             return
         if event.button() == Qt.MouseButton.LeftButton and self._drag_token_id:
             token_id = self._drag_token_id
@@ -748,6 +876,26 @@ class RuntimeMapView(QWidget):
                 event.accept()
                 return
         if (
+            event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace)
+            and self.selected_element_id
+            and self._drawing_tool is None
+            and self._drag_element_id is None
+        ):
+            self.remove_selected_element()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Escape and self.selected_element_id:
+            if self._drag_element_id is not None:
+                live = self._runtime_element(self._drag_element_id)
+                if live is not None and self._drag_element_snapshot is not None:
+                    _copy_placement(live, self._drag_element_snapshot)
+                self._drag_element_id = None
+                self._drag_element_snapshot = None
+            self.selected_element_id = None
+            self.update()
+            event.accept()
+            return
+        if (
             event.key() == Qt.Key.Key_Delete
             and self.selected_token_id
             and self._drawing_tool is None
@@ -776,3 +924,72 @@ class RuntimeMapView(QWidget):
         self.status_message.emit(f"Token retiré de la map : {label}")
         self.runtime_changed.emit()
         self.update()
+
+
+# ---------------------------------------------------------------- annotations
+def _segment_distance(point: Vec2, first: Vec2, second: Vec2) -> float:
+    dx, dy = second.x - first.x, second.y - first.y
+    length2 = dx * dx + dy * dy
+    if length2 <= 0:
+        return hypot(point.x - first.x, point.y - first.y)
+    t = max(0.0, min(1.0, ((point.x - first.x) * dx + (point.y - first.y) * dy) / length2))
+    return hypot(point.x - (first.x + t * dx), point.y - (first.y + t * dy))
+
+
+def _element_hit(element: MapElement, point: Vec2, tolerance: float) -> bool:
+    """
+    Whether `point` touches what the element draws.
+
+    Strokes are hit along their line (not anywhere in their bounding box), so a
+    big rectangle or circle does not swallow the clicks made inside it, unless
+    it is filled.
+    """
+    if not isinstance(element, DrawingElement):
+        bounds = element.bounds()
+        return (
+            bounds.x - tolerance <= point.x <= bounds.x + bounds.width + tolerance
+            and bounds.y - tolerance <= point.y <= bounds.y + bounds.height + tolerance
+        )
+    points = element.points
+    if not points:
+        return False
+    reach = max(0.0, float(element.stroke_width)) / 2 + tolerance
+    first, last = points[0], points[-1]
+    if element.tool is DrawTool.LINE:
+        return _segment_distance(point, first, last) <= reach
+    if element.tool in (DrawTool.RECT, DrawTool.CIRCLE):
+        left, right = sorted((first.x, last.x))
+        top, bottom = sorted((first.y, last.y))
+        filled = bool(element.fill_color)
+        if element.tool is DrawTool.RECT:
+            inside = left - reach <= point.x <= right + reach and top - reach <= point.y <= bottom + reach
+            if not inside:
+                return False
+            if filled:
+                return True
+            corners = [Vec2(left, top), Vec2(right, top), Vec2(right, bottom), Vec2(left, bottom)]
+            return any(
+                _segment_distance(point, corners[i], corners[(i + 1) % 4]) <= reach for i in range(4)
+            )
+        rx, ry = (right - left) / 2, (bottom - top) / 2
+        cx, cy = left + rx, top + ry
+        if rx < 1e-6 or ry < 1e-6:  # flat ellipse: a segment
+            return _segment_distance(point, Vec2(left, top), Vec2(right, bottom)) <= reach
+        ratio = hypot((point.x - cx) / rx, (point.y - cy) / ry)
+        if filled:
+            return ratio <= 1 + reach / min(rx, ry)
+        return abs(ratio - 1) * min(rx, ry) <= reach
+    if len(points) == 1:
+        return hypot(point.x - first.x, point.y - first.y) <= reach
+    return any(
+        _segment_distance(point, points[i], points[i + 1]) <= reach for i in range(len(points) - 1)
+    )
+
+
+def _copy_placement(target: MapElement, source: MapElement, offset: Vec2 | None = None) -> None:
+    """Place `target` where `source` is, moved by `offset` (same element, two copies)."""
+    delta = offset or Vec2(0.0, 0.0)
+    if isinstance(target, DrawingElement) and isinstance(source, DrawingElement):
+        target.points = [Vec2(point.x + delta.x, point.y + delta.y) for point in source.points]
+    elif hasattr(target, "pos") and hasattr(source, "pos"):
+        target.pos = Vec2(source.pos.x + delta.x, source.pos.y + delta.y)

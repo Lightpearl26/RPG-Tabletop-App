@@ -46,7 +46,11 @@ class PlayerRuntimeWindow(QMainWindow):
         self.projection: dict[str, Any] | None = None
         self._pending_approval_id = ""
         self._has_pending = False
+        # Map files asked to the server and not received yet
         self._requested_assets: set[str] = set()
+        # Map files the server could not send: not asked again until "Recharger"
+        self._failed_assets: set[str] = set()
+        self._prepared_compiled = ""
         self._closing = False
         self._asset_request_timer = QTimer(self)
         self._asset_request_timer.setSingleShot(True)
@@ -225,6 +229,7 @@ class PlayerRuntimeWindow(QMainWindow):
         self._refresh_combat_widget_permissions()
         self.map_view.set_has_pending(self._has_pending or not connected)
         if not connected:
+            self._requested_assets.clear()  # whatever was in flight is lost
             self._clear_pending()
             self._close_all_dice_dialogs()
             if not self._closing:
@@ -298,6 +303,8 @@ class PlayerRuntimeWindow(QMainWindow):
     def _reconnect(self) -> None:
         self.controller.shutdown()
         self._requested_assets.clear()
+        self._failed_assets.clear()
+        self._prepared_compiled = ""
         self.projection = None
         self._apply_projection({})
         dialog = PlayerLoginDialog(self)
@@ -393,7 +400,14 @@ class PlayerRuntimeWindow(QMainWindow):
             self.chat_panel.append_log(DEBUG, text)
             self.statusBar().showMessage(text, 5000)
         elif command == "ASSET_CHUNK":
+            # Sent once per complete file (see RPGNetworkClient)
+            self._requested_assets.discard(str(args.get("path", "")))
             self.map_view.update()
+        elif command == "ASSET_FAILED":
+            relative = str(args.get("path", ""))
+            self._requested_assets.discard(relative)
+            self._failed_assets.add(relative)
+            self.chat_panel.append_log(DEBUG, f"Ressource indisponible : {relative} ({args.get('reason', '')})")
         elif command == "ASSET_DONE":
             self.map_view.update()
             self.statusBar().showMessage("Synchronisation des ressources de carte terminée", 4000)
@@ -609,7 +623,12 @@ class PlayerRuntimeWindow(QMainWindow):
         )
         self._refresh_combat_widget_permissions()
 
-        if isinstance(map_data, dict):
+        if isinstance(map_data, dict) and map_data.get("present", True) is False:
+            map_asset = map_data.get("asset", {})
+            map_name = str(map_asset.get("name", map_data.get("map_id", "Carte"))) if isinstance(map_asset, dict) else "Carte"
+            self.map_status.setText(f"{map_name} · ton personnage n'est pas sur cette carte")
+            self._schedule_visible_asset_request()
+        elif isinstance(map_data, dict):
             map_asset = map_data.get("asset", {})
             map_name = str(map_asset.get("name", map_data.get("map_id", "Carte"))) if isinstance(map_asset, dict) else "Carte"
             fov = map_data.get("fov", {}) if isinstance(map_data.get("fov"), dict) else {}
@@ -655,6 +674,8 @@ class PlayerRuntimeWindow(QMainWindow):
         session_root.mkdir(parents=True, exist_ok=True)
         self._cache_session_id = session_id
         self._requested_assets.clear()
+        self._failed_assets.clear()
+        self._prepared_compiled = ""
         self.controller.cache_root = session_root
         if self.controller.client is not None and self.controller.client.asset_receiver is not None:
             receiver = self.controller.client.asset_receiver
@@ -672,6 +693,13 @@ class PlayerRuntimeWindow(QMainWindow):
             self._request_missing_map_assets(self.projection["map"])
 
     def _prepare_map_cache(self, map_data: dict[str, Any]) -> None:
+        """
+        Keep the downloaded tiles that are still valid for this compilation.
+
+        Each tile has a hash in the compiled map: only the tiles whose hash
+        changed (or that disappeared) are deleted, so a map the GM edits and
+        saves again does not have to be downloaded again in full.
+        """
         map_id = str(map_data.get("map_id", ""))
         safe_id = PurePosixPath(map_id.replace("\\", "/"))
         if not map_id or safe_id.is_absolute() or len(safe_id.parts) != 1 or map_id in {".", ".."}:
@@ -680,22 +708,61 @@ class PlayerRuntimeWindow(QMainWindow):
         compiled = asset.get("compiled") if isinstance(asset, dict) else None
         if not isinstance(compiled, dict):
             return
-        signature = sha256(
+        signature = str(compiled.get("signature") or "") or sha256(
             json.dumps(compiled, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
+        cache_key = f"{self.controller.cache_root}|{map_id}|{signature}"
+        if cache_key == self._prepared_compiled:
+            return  # same compilation as the last sync: nothing to check
+        self._prepared_compiled = cache_key
+
+        tiles = compiled.get("tiles", {}) if isinstance(compiled.get("tiles"), dict) else {}
+        layout = {
+            "format": str(compiled.get("format", "")),
+            "tile_size": compiled.get("tile_size"),
+            "origin": compiled.get("origin", [0, 0]),
+        }
         map_root = self.controller.cache_root / "maps" / map_id
-        marker = map_root / ".compiled_signature"
-        previous = marker.read_text(encoding="utf-8").strip() if marker.is_file() else ""
-        if map_root.exists() and previous != signature:
-            shutil.rmtree(map_root, ignore_errors=True)
+        tiles_dir = map_root / "tiles"
+        index_file = map_root / ".tile_hashes.json"
+        try:
+            previous = json.loads(index_file.read_text(encoding="utf-8")) if index_file.is_file() else None
+        except (OSError, ValueError):
+            previous = None
+
+        removed = False
+        if not isinstance(previous, dict) or previous.get("layout") != layout:
+            # Unknown or different tiling (or a cache from an older version)
+            if tiles_dir.exists():
+                shutil.rmtree(tiles_dir, ignore_errors=True)
+                removed = True
+        else:
+            old_tiles = previous.get("tiles", {}) if isinstance(previous.get("tiles"), dict) else {}
+            suffix = layout["format"]
+            for key, old_hash in old_tiles.items():
+                if tiles.get(key) == old_hash or not all(part.isdigit() for part in str(key).split("_", 1)):
+                    continue
+                path = tiles_dir / f"{key}.{suffix}"
+                if path.is_file():
+                    try:
+                        path.unlink()
+                        removed = True
+                    except OSError:
+                        pass
+        (map_root / ".compiled_signature").unlink(missing_ok=True)  # old cache marker
+        map_root.mkdir(parents=True, exist_ok=True)
+        try:
+            index_file.write_text(json.dumps({"layout": layout, "tiles": tiles}), encoding="utf-8")
+        except OSError:
+            pass
+        if removed:
             self._requested_assets.clear()
             self.map_view.invalidate_cached_assets()
-        map_root.mkdir(parents=True, exist_ok=True)
-        marker.write_text(signature, encoding="utf-8")
 
     def _retry_map_assets(self) -> None:
         if self.projection and isinstance(self.projection.get("map"), dict):
             self._requested_assets.clear()
+            self._failed_assets.clear()
             self._request_missing_map_assets(self.projection["map"])
 
     def _forget_missing_asset_requests(self) -> None:
@@ -704,7 +771,18 @@ class PlayerRuntimeWindow(QMainWindow):
             if not local.is_file():
                 self._requested_assets.discard(relative)
 
+    def _local_asset(self, relative: str) -> Path:
+        return self.controller.cache_root / "maps" / Path(*PurePosixPath(relative).parts)
+
     def _request_missing_map_assets(self, map_data: dict[str, Any]) -> None:
+        """
+        Ask the server for the map files on screen that are not in the cache.
+
+        Only the tiles inside the viewport (itself limited to the field of view)
+        are asked for, nearest to the center first. When the view moves, the
+        files that left it and were not sent yet are dropped server-side
+        (`replace`), so the player never waits for tiles they cannot see.
+        """
         if not self.controller.is_connected:
             return
         map_id = str(map_data.get("map_id", ""))
@@ -714,25 +792,17 @@ class PlayerRuntimeWindow(QMainWindow):
         asset = map_data.get("asset", {})
         if not isinstance(asset, dict):
             asset = {}
-        wanted: list[dict[str, str]] = []
+        wanted: list[str] = []
 
-        # Request only compiled tiles intersecting the current viewport.
         compiled = asset.get("compiled")
-        if isinstance(compiled, dict):
+        if isinstance(compiled, dict) and self.map_view.on_map:
             tile_format = str(compiled.get("format", "webp"))
             if tile_format in {"webp", "png"}:
                 tiles = compiled.get("tiles", {}) if isinstance(compiled.get("tiles"), dict) else {}
-                visible_keys = self.map_view.visible_tile_keys()
-                for key in sorted(visible_keys):
+                for key in self.map_view.prioritized_tile_keys():
                     if key not in tiles or not all(part.isdigit() for part in key.split("_", 1)):
                         continue
-                    relative = f"{map_id}/tiles/{key}.{tile_format}"
-                    if relative in self._requested_assets:
-                        continue
-                    local = self.controller.cache_root / "maps" / Path(*PurePosixPath(relative).parts)
-                    if not local.is_file():
-                        self._requested_assets.add(relative)
-                        wanted.append({"namespace": "maps", "path": relative})
+                    wanted.append(f"{map_id}/tiles/{key}.{tile_format}")
 
         # Runtime-added image elements may reference files under this map's media/ folder.
         for element in map_data.get("elements", []):
@@ -741,15 +811,25 @@ class PlayerRuntimeWindow(QMainWindow):
             relative_asset = PurePosixPath(str(element["asset"]).replace("\\", "/"))
             if relative_asset.is_absolute() or ".." in relative_asset.parts:
                 continue
-            relative = f"{map_id}/{relative_asset.as_posix()}"
-            if relative in self._requested_assets:
-                continue
-            local = self.controller.cache_root / "maps" / Path(*PurePosixPath(relative).parts)
-            if not local.is_file():
-                self._requested_assets.add(relative)
-                wanted.append({"namespace": "maps", "path": relative})
-        if wanted:
-            self.controller.request_assets(wanted)
+            wanted.append(f"{map_id}/{relative_asset.as_posix()}")
+
+        wanted = [
+            relative for relative in dict.fromkeys(wanted)
+            if relative not in self._failed_assets and not self._local_asset(relative).is_file()
+        ]
+        wanted_set = set(wanted)
+        new = [relative for relative in wanted if relative not in self._requested_assets]
+        stale = {
+            relative for relative in self._requested_assets
+            if relative not in wanted_set and not self._local_asset(relative).is_file()
+        }
+        self._requested_assets = wanted_set
+        if stale:
+            self.controller.request_assets(
+                [{"namespace": "maps", "path": relative} for relative in wanted], replace=True
+            )
+        elif new:
+            self.controller.request_assets([{"namespace": "maps", "path": relative} for relative in new])
 
     # --------------------------------------------------------------- players
     def _refresh_players(self, players: Any) -> None:

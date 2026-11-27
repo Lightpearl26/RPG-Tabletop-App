@@ -13,7 +13,7 @@ from json import dumps, loads
 from typing import Any
 from uuid import uuid4
 
-PROTOCOL_VERSION = "2.1"
+PROTOCOL_VERSION = "2.2"
 
 
 class MessageType(str, Enum):
