@@ -120,6 +120,8 @@ class CampaignManagerWindow(QMainWindow):
         self._document_pages: dict[tuple[str, str], QWidget] = {}
         self._new_document_index = 0
         self._runtime_windows: list[QMainWindow] = []
+        # New resources asked from a running session: editor -> its window
+        self._created_for_session: dict[QWidget, QMainWindow] = {}
         self.overview = CampaignOverview(self.campaign)
         self._preloaded = False
         # The history of the campaign: the IDE shows the campaign or a session
@@ -813,6 +815,9 @@ class CampaignManagerWindow(QMainWindow):
     ) -> None:
         resource_id = Path(file_path).stem
         self._notify_runtimes(resource_type, resource_id)
+        window = self._created_for_session.pop(editor, None)
+        if window is not None and window.isVisible() and resource_type == "entities":
+            window.add_entity_from_file(resource_id)
         if resource_type != "sessions":
             try:
                 self.versions.save_point(f"{self._singular_title(resource_type)} « {resource_id} » enregistré")
@@ -941,6 +946,20 @@ class CampaignManagerWindow(QMainWindow):
             return "Map preview available." if card._preview_path else "No map preview found."
         return card.search_text()
 
+    def _create_for_session(self, window: RuntimeWindow, resource_type: str) -> None:
+        """
+        "Créer" menu of a running session: a new resource edited here, in that
+        session's context (a running session holds the context). A new entity
+        joins the game once saved; a new map shows up in its map menu.
+        """
+        self._on_resource_create_requested(resource_type)
+        page = self.documents.currentWidget()
+        if isinstance(page, ResourceEditor) and page.is_new:
+            self._created_for_session[page] = window
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
     def _on_resource_create_requested(self, resource_type: str) -> None:
         self.resource_create_requested.emit(resource_type)
         self._open_resource_document(
@@ -1059,6 +1078,9 @@ class CampaignManagerWindow(QMainWindow):
         self.start_session_requested.emit()
         self._runtime_windows.append(window)
         window.closed.connect(self._refresh_versions)
+        window.new_resource_requested.connect(
+            lambda resource_type, window=window: self._create_for_session(window, resource_type)
+        )
         window.assets_written.connect(self._on_runtime_assets_written)
         window.destroyed.connect(
             lambda _obj=None, window=window: (

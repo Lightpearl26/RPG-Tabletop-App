@@ -85,12 +85,27 @@ def test_round_trip_keeps_origin_and_mode():
     )
 
 
-def test_old_maps_read_as_fixed_at_zero_and_keep_their_hash():
+def test_old_maps_become_infinite_keep_their_frame_and_their_hash():
     old = {"version": 1, "id": "abc", "name": "Old", "size": [4096, 4096]}
     asset = MapAsset.from_dict(old)
-    assert not asset.infinite and (asset.origin_x, asset.origin_y) == (0, 0)
+    assert asset.infinite and (asset.origin_x, asset.origin_y) == (0, 0)
+    rect = asset.auto_rect()
+    assert rect.x <= 0 and rect.y <= 0 and rect.right >= 4096 and rect.bottom >= 4096
     fresh = MapAsset(id="abc", name="Old")
-    assert asset.source_hash() == fresh.source_hash()
+    assert asset.source_hash() == fresh.source_hash()  # no recompilation for nothing
+
+
+def test_the_background_image_of_an_old_map_stays_where_it_was():
+    from rpg_tabletop.assets.map import ImageElement
+
+    old = {"version": 1, "id": "abc", "name": "Old", "size": [2000, 1000],
+           "background": {"color": "#102030", "image_asset": "media/bg.png"}}
+    asset = MapAsset.from_dict(old)
+    image = asset.elements[0]
+    assert isinstance(image, ImageElement) and asset.background.image_asset is None
+    assert (image.pos.x, image.pos.y, image.width, image.height) == (0, 0, 2000, 1000)
+    again = MapAsset.from_dict(asset.to_dict())
+    assert len(again.elements) == 1 and again.kept_area == asset.kept_area
 
 
 def test_save_sizes_the_map_and_offsets_the_tiles(tmp_path):
@@ -99,15 +114,18 @@ def test_save_sizes_the_map_and_offsets_the_tiles(tmp_path):
     asset.elements.append(_rect_element(-600, -100, -500, 0))
     compiled = asset.save(tmp_path, tile_size=128, tile_format=tile_format)
 
-    assert (compiled.origin_x, compiled.origin_y) == (asset.origin_x, asset.origin_y)
-    assert (compiled.width, compiled.height) == (asset.width, asset.height)
     assert asset.origin_x == -704 and asset.origin_y == -192
     assert asset.width == 320 and asset.height == 320
+    # Tiles are counted from a multiple of the tile size and cover the whole map
+    assert (compiled.origin_x, compiled.origin_y) == (-768, -256)
+    assert compiled.origin_x % 128 == 0 and compiled.origin_y % 128 == 0
+    assert compiled.origin_x + compiled.width >= asset.origin_x + asset.width
+    assert compiled.origin_y + compiled.height >= asset.origin_y + asset.height
 
     # Read back: the map file and the compilation agree
     loaded = MapAsset.load(tmp_path)
     assert loaded.infinite and loaded.origin_x == -704 and loaded.width == 320
-    assert loaded.compiled is not None and loaded.compiled.origin_x == -704
+    assert loaded.compiled is not None and loaded.compiled.origin_x == -768
 
     # The red rectangle (-600..-500, -100..0) lands at 104..204, 92..192 from the corner
     image = asset.render_tile(0, 0, 128, MediaCache(tmp_path))
@@ -128,3 +146,70 @@ def test_fixed_maps_are_not_resized(tmp_path):
     asset.elements.append(_rect_element(-600, -100, -500, 0))
     asset.save(tmp_path, tile_size=256, tile_format=_tile_format())
     assert (asset.origin_x, asset.origin_y, asset.width, asset.height) == (0, 0, 512, 256)
+
+
+def _scene(tile_format):
+    asset = MapAsset(infinite=True)
+    for index in range(6):
+        x = index * 700
+        asset.elements.append(_rect_element(x, 0, x + 200, 300))
+    return asset
+
+
+def _full_build(asset, tmp_path, tile_format):
+    """The same scene compiled from scratch, for comparison."""
+    fresh = MapAsset.from_dict(asset.to_dict())
+    fresh.compiled = None
+    return fresh.save(tmp_path / "full", tile_size=256, tile_format=tile_format)
+
+
+def test_incremental_build_renders_only_the_changed_tiles_and_matches_a_full_build(tmp_path, monkeypatch):
+    tile_format = _tile_format()
+    asset = _scene(tile_format)
+    asset.save(tmp_path / "map", tile_size=256, tile_format=tile_format)
+
+    rendered = []
+    original = MapAsset.render_tile
+    monkeypatch.setattr(MapAsset, "render_tile",
+                        lambda self, c, r, *a, **k: rendered.append((c, r)) or original(self, c, r, *a, **k))
+    # Move one rectangle a little: only the tiles around it are drawn again
+    asset.elements[2] = _rect_element(1450, 0, 1650, 300)
+    asset.elements[2].id = "moved"
+    compiled = asset.save(tmp_path / "map", tile_size=256, tile_format=tile_format)
+    total = (compiled.width // 256) * (compiled.height // 256)
+    assert 0 < len(rendered) < total // 3
+
+    monkeypatch.setattr(MapAsset, "render_tile", original)
+    full = _full_build(asset, tmp_path, tile_format)
+    assert compiled.tiles == full.tiles and compiled.uniform == full.uniform
+    for key in compiled.tiles:  # every recorded tile has its file
+        assert (tmp_path / "map" / "tiles" / f"{key}.{tile_format}").is_file()
+
+
+def test_growing_to_the_left_keeps_the_tiles_already_made(tmp_path, monkeypatch):
+    tile_format = _tile_format()
+    asset = _scene(tile_format)
+    first = asset.save(tmp_path / "map", tile_size=256, tile_format=tile_format)
+
+    rendered = []
+    original = MapAsset.render_tile
+    monkeypatch.setattr(MapAsset, "render_tile",
+                        lambda self, c, r, *a, **k: rendered.append((c, r)) or original(self, c, r, *a, **k))
+    asset.elements.append(_rect_element(-2000, 0, -1800, 200))  # far to the left
+    compiled = asset.save(tmp_path / "map", tile_size=256, tile_format=tile_format)
+    assert compiled.origin_x < first.origin_x
+    assert len(rendered) < (compiled.width // 256) * (compiled.height // 256)
+
+    monkeypatch.setattr(MapAsset, "render_tile", original)
+    full = _full_build(asset, tmp_path, tile_format)
+    assert compiled.tiles == full.tiles and compiled.uniform == full.uniform
+
+
+def test_reordering_or_a_new_background_redraws_everything(tmp_path, monkeypatch):
+    tile_format = _tile_format()
+    asset = _scene(tile_format)
+    asset.save(tmp_path / "map", tile_size=256, tile_format=tile_format)
+    asset.background.color = "#334455"
+    compiled = asset.save(tmp_path / "map", tile_size=256, tile_format=tile_format)
+    full = _full_build(asset, tmp_path, tile_format)
+    assert compiled.tiles == full.tiles and compiled.uniform == full.uniform

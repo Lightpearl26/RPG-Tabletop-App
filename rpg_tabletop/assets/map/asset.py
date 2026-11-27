@@ -39,6 +39,7 @@ from .common import (
     PREVIEW_FILE,
     PREVIEW_MAX_PX,
     STAGING_DIR,
+    TILE_INDEX_FILE,
     TILES_DIR,
     WARNING,
     MapCompileCancelled,
@@ -116,6 +117,9 @@ class MapAsset:
     initial_tokens: list[InitialTokenPlacement] = field(default_factory=list)
     initial_gm_camera: CameraState = field(default_factory=CameraState)
     compiled: Optional[FlattenedMap] = None
+    # Area that always belongs to the map, content or not: the frame of a map
+    # made before every map was infinite (see `from_dict`)
+    kept_area: Optional[Rect] = None
 
     # ----- Hash --------------------------------------------------------------
 
@@ -173,6 +177,8 @@ class MapAsset:
         or still block in play), and so does every token. The background does not.
         """
         rects = [element.bounds() for element in self.elements]
+        if self.kept_area is not None:
+            rects.append(self.kept_area)
         for token in self.initial_tokens:
             # A rotated square stays inside the circle around it
             rect = self.token_rect(token)
@@ -371,6 +377,9 @@ class MapAsset:
             "initial_tokens": [token.to_dict() for token in self.initial_tokens],
             "initial_gm_camera": self.initial_gm_camera.to_dict(),
         }
+        if self.kept_area is not None:
+            area = self.kept_area
+            data["kept_area"] = [area.x, area.y, area.width, area.height]
         if self.compiled is not None:
             data["compiled"] = self.compiled.to_dict()
         return data
@@ -392,7 +401,8 @@ class MapAsset:
             width, height = data.get("size", [4096, 4096])
             origin_x, origin_y = data.get("origin", [0, 0])
             compiled = data.get("compiled")
-            return cls(
+            kept = data.get("kept_area")
+            asset = cls(
                 id=str(data.get("id") or uuid4().hex),
                 name=str(data.get("name", "New Map")),
                 width=int(width),
@@ -408,9 +418,36 @@ class MapAsset:
                 ],
                 initial_gm_camera=CameraState.from_dict(data.get("initial_gm_camera", {})),
                 compiled=FlattenedMap.from_dict(compiled) if compiled else None,
+                kept_area=Rect(*(float(v) for v in kept)) if kept else None,
             )
+            if not asset.infinite:
+                asset._become_infinite()
+            return asset
         except (TypeError, AttributeError) as error:
             raise ValueError(f"Invalid map data: {error}") from error
+
+    def _become_infinite(self) -> None:
+        """
+        Every map is infinite: a fixed map, read from an older file, becomes one
+        without anything moving. Its frame stays part of the map (`kept_area`)
+        and its background image, which covered that frame, becomes an image
+        placed under everything at the same place (as a background it would
+        stretch over the content area, which changes with the content).
+        Origin, size and compilation are unchanged until the next save.
+        """
+        frame = Rect(float(self.origin_x), float(self.origin_y), float(self.width), float(self.height))
+        self.infinite = True
+        self.kept_area = frame
+        if self.background.image_asset is not None:
+            from .elements import ImageElement
+
+            self.elements.insert(0, ImageElement(
+                asset=self.background.image_asset,
+                pos=Vec2(frame.x, frame.y),
+                width=frame.width,
+                height=frame.height,
+            ))
+            self.background.image_asset = None
 
     @classmethod
     def load(cls, map_dir: Path) -> MapAsset:
@@ -507,12 +544,16 @@ class MapAsset:
             | QPainter.RenderHint.TextAntialiasing
         )
 
-    def render_tile(self, column: int, row: int, tile_size: int, media: MediaCache) -> QImage:
+    def render_tile(self, column: int, row: int, tile_size: int, media: MediaCache,
+                    *, origin: Optional[tuple[int, int]] = None) -> QImage:
         """
         Render one tile, with its own image: memory use does not depend on map size.
+
+        `origin`: the corner of tile 0_0 (default: the map's origin; see `tile_grid`).
         """
-        origin_x = self.origin_x + column * tile_size
-        origin_y = self.origin_y + row * tile_size
+        grid_x, grid_y = origin if origin is not None else (self.origin_x, self.origin_y)
+        origin_x = grid_x + column * tile_size
+        origin_y = grid_y + row * tile_size
         image = self._new_image(tile_size, tile_size)
         painter = QPainter(image)
         try:
@@ -545,6 +586,61 @@ class MapAsset:
 
     # ----- Compilation -------------------------------------------------------
 
+    def tile_grid(self, tile_size: int) -> tuple[int, int, int, int]:
+        """
+        (origin x, origin y, columns, rows) of the tiles covering the map.
+
+        The tiles of an infinite map are counted from a multiple of the tile
+        size: when the map grows, the tiles already made keep their place and
+        their number, so only the new area has to be rendered.
+        """
+        if self.infinite:
+            gx = floor(self.origin_x / tile_size) * tile_size
+            gy = floor(self.origin_y / tile_size) * tile_size
+        else:
+            gx, gy = self.origin_x, self.origin_y
+        columns = max(1, ceil((self.origin_x + self.width - gx) / tile_size))
+        rows = max(1, ceil((self.origin_y + self.height - gy) / tile_size))
+        return gx, gy, columns, rows
+
+    def _scene_record(self) -> dict[str, Any]:
+        """What the pixels of the tiles depend on (stored next to them)."""
+        return {
+            "rect": [self.origin_x, self.origin_y, self.width, self.height],
+            "background": self.background.to_dict(),
+            "elements": [
+                element.to_dict() for element in self.elements
+                if element.visible and element.flattened
+            ],
+        }
+
+    @staticmethod
+    def _dirty_rects(before: dict[str, Any], after: dict[str, Any]) -> Optional[list[Rect]]:
+        """
+        Areas whose pixels may differ between two scene records; None when
+        everything may (background changed, elements reordered).
+        """
+        if before.get("background") != after.get("background"):
+            return None
+        old = {str(e.get("id")): e for e in before.get("elements", [])}
+        new = {str(e.get("id")): e for e in after.get("elements", [])}
+        common_old = [key for key in old if key in new]
+        common_new = [key for key in new if key in old]
+        if common_old != common_new:
+            return None  # an element moved above or below another one
+        rects: list[Rect] = []
+        for key in set(old) | set(new):
+            if old.get(key) == new.get(key):
+                continue
+            for data in (old.get(key), new.get(key)):
+                if data is None:
+                    continue
+                try:
+                    rects.append(MapElement.from_dict(data).bounds().inflate(2.0))
+                except ValueError:
+                    return None
+        return rects
+
     def _build(
         self,
         staging: Path,
@@ -553,13 +649,19 @@ class MapAsset:
         tile_format: str,
         previous: Optional[FlattenedMap],
         progress: Optional[Callable[[int, int], bool]],
-    ) -> tuple[FlattenedMap, bool]:
+    ) -> tuple[FlattenedMap, bool, Optional[set[str]]]:
         """
         Render the tiles and the preview into `staging`.
 
+        Only the tiles the change can reach are rendered: the record stored
+        with the tiles (tiles/_index.json) says which scene they show, the
+        difference with the current scene gives the areas to render again;
+        every other tile is taken from the previous compilation.
+
         Returns:
-            The compilation result and whether anything was rebuilt. When the
-            previous compilation is still valid nothing is rendered.
+            The compilation, whether anything was rebuilt, and, when the tile
+            grid did not move, the keys whose file must be replaced in place
+            (None: the whole tiles folder in `staging` replaces the old one).
         """
         if tile_size <= 0:
             raise ValueError("The tile size must be positive.")
@@ -576,24 +678,36 @@ class MapAsset:
             and (map_dir / TILES_DIR).is_dir()
             and (map_dir / PREVIEW_FILE).is_file()
         ):
-            return previous, False
+            return previous, False, None
 
-        columns, rows = ceil(self.width / tile_size), ceil(self.height / tile_size)
+        gx, gy, columns, rows = self.tile_grid(tile_size)
         total = columns * rows
         tiles_dir = staging / TILES_DIR
         tiles_dir.mkdir(parents=True)
         old_tiles_dir = map_dir / TILES_DIR
-        reusable = (
-            previous
-            if previous is not None
-            and previous.tile_size == tile_size
-            and previous.tile_format == tile_format
-            else None
-        )
+        scene = self._scene_record()
+
+        # The previous compilation, as recorded with its tiles
+        old: Optional[FlattenedMap] = None
+        dirty: Optional[list[Rect]] = None
+        old_rect: Optional[Rect] = None
+        try:
+            record = loads((old_tiles_dir / TILE_INDEX_FILE).read_text(encoding="utf-8"))
+            candidate = FlattenedMap.from_dict(record["compiled"])
+            if candidate.tile_size == tile_size and candidate.tile_format == tile_format:
+                dirty = self._dirty_rects(record["scene"], scene)
+                if dirty is not None:
+                    old = candidate
+                    old_rect = Rect(*(float(v) for v in record["scene"]["rect"]))
+        except (OSError, ValueError, KeyError, TypeError):
+            old = None
+        in_place = old is not None and (old.origin_x, old.origin_y) == (gx, gy)
+        new_rect = self.map_rect()
 
         media = MediaCache(map_dir)
         tiles: dict[str, str] = {}
         uniform: dict[str, str] = {}
+        rendered: set[str] = set()
 
         # Qt refuses to decode large images by default
         previous_limit = QImageReader.allocationLimit()
@@ -604,22 +718,24 @@ class MapAsset:
                 for column in range(columns):
                     if progress is not None and not progress(done, total):
                         raise MapCompileCancelled()
+                    done += 1
                     key = tile_key(column, row)
-                    image = self.render_tile(column, row, tile_size, media)
+                    area = Rect(float(gx + column * tile_size), float(gy + row * tile_size),
+                                float(tile_size), float(tile_size))
+                    if old is not None and self._reuse_tile(
+                        old, old_rect, new_rect, area, dirty, key, tiles, uniform,
+                        old_tiles_dir, tiles_dir, in_place,
+                    ):
+                        continue
+                    image = self.render_tile(column, row, tile_size, media, origin=(gx, gy))
                     raw = bytes(image.constBits())
                     first_pixel = raw[:4]
                     if raw == first_pixel * (len(raw) // 4):
                         uniform[key] = image.pixelColor(0, 0).name(QColor.NameFormat.HexArgb)
                     else:
-                        digest = sha256(raw).hexdigest()
-                        tiles[key] = digest
-                        target = tiles_dir / f"{key}.{tile_format}"
-                        old = old_tiles_dir / f"{key}.{tile_format}"
-                        if reusable is not None and reusable.tiles.get(key) == digest and old.is_file():
-                            copy2(old, target)
-                        else:
-                            _save_tile(image, target, tile_format)
-                    done += 1
+                        tiles[key] = sha256(raw).hexdigest()
+                        _save_tile(image, tiles_dir / f"{key}.{tile_format}", tile_format)
+                    rendered.add(key)
             if progress is not None:
                 progress(total, total)
 
@@ -632,16 +748,53 @@ class MapAsset:
         compiled = FlattenedMap(
             source_map_id=self.id,
             source_hash=source_hash,
-            width=self.width,
-            height=self.height,
-            origin_x=self.origin_x,
-            origin_y=self.origin_y,
+            width=columns * tile_size,
+            height=rows * tile_size,
+            origin_x=gx,
+            origin_y=gy,
             tile_size=tile_size,
             tile_format=tile_format,
             tiles=tiles,
             uniform=uniform,
         )
-        return compiled, True
+        (tiles_dir / TILE_INDEX_FILE).write_text(
+            dumps({"compiled": compiled.to_dict(), "scene": scene}, separators=(",", ":")), encoding="utf-8"
+        )
+        if in_place:
+            # Rendered tiles, plus the files of tiles that became uniform or left
+            rendered |= {key for key in old.tiles if key not in tiles}
+            rendered.add(TILE_INDEX_FILE)
+        return compiled, True, rendered if in_place else None
+
+    @staticmethod
+    def _reuse_tile(
+        old: FlattenedMap, old_rect: Rect, new_rect: Rect, area: Rect, dirty: list[Rect],
+        key: str, tiles: dict[str, str], uniform: dict[str, str],
+        old_tiles_dir: Path, tiles_dir: Path, in_place: bool,
+    ) -> bool:
+        """Take a tile from the previous compilation when nothing changed in it."""
+        if any(area.intersects(rect) for rect in dirty):
+            return False
+        # The scene is clipped to the map's area: it must cover the tile the same way
+        if _clip(area, old_rect) != _clip(area, new_rect):
+            return False
+        old_col = (area.x - old.origin_x) / old.tile_size
+        old_row = (area.y - old.origin_y) / old.tile_size
+        if old_col != int(old_col) or old_row != int(old_row) or old_col < 0 or old_row < 0:
+            return False
+        old_key = tile_key(int(old_col), int(old_row))
+        if old_key in old.uniform:
+            uniform[key] = old.uniform[old_key]
+            return True
+        if old_key not in old.tiles:
+            return False
+        source = old_tiles_dir / f"{old_key}.{old.tile_format}"
+        if not source.is_file():
+            return False
+        tiles[key] = old.tiles[old_key]
+        if not in_place:
+            copy2(source, tiles_dir / f"{key}.{old.tile_format}")
+        return True
 
     def _write(
         self,
@@ -668,7 +821,7 @@ class MapAsset:
         _remove(staging)
         staging.mkdir()
         try:
-            compiled, rebuilt = self._build(
+            compiled, rebuilt, changed_tiles = self._build(
                 staging,
                 map_dir,
                 tile_size,
@@ -678,7 +831,11 @@ class MapAsset:
             )
             self.compiled = compiled
             items: list[tuple[Path, Path]] = []
-            if rebuilt:
+            if rebuilt and changed_tiles is not None:
+                # Same tile grid: only the tiles that changed are replaced
+                _replace_tiles(staging / TILES_DIR, map_dir / TILES_DIR, changed_tiles, tile_format)
+                items.append((staging / PREVIEW_FILE, map_dir / PREVIEW_FILE))
+            elif rebuilt:
                 items.append((staging / TILES_DIR, map_dir / TILES_DIR))
                 items.append((staging / PREVIEW_FILE, map_dir / PREVIEW_FILE))
             if write_json:
@@ -735,3 +892,26 @@ class MapAsset:
             MapCompileCancelled: If `progress` returned False.
         """
         return self._write(map_dir, tile_size, tile_format, progress, write_json=True)
+
+
+def _clip(area: Rect, rect: Rect) -> Optional[tuple[float, float, float, float]]:
+    left, top = max(area.x, rect.x), max(area.y, rect.y)
+    right, bottom = min(area.right, rect.right), min(area.bottom, rect.bottom)
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
+
+
+def _replace_tiles(source_dir: Path, target_dir: Path, keys: set[str], tile_format: str) -> None:
+    """
+    Update a tiles folder in place: each listed tile is replaced by its new
+    file, or removed when it has none any more (uniform, or out of the map).
+    """
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for key in sorted(keys):
+        name = key if key == TILE_INDEX_FILE else f"{key}.{tile_format}"
+        source, target = source_dir / name, target_dir / name
+        if source.is_file():
+            source.replace(target)
+        else:
+            target.unlink(missing_ok=True)

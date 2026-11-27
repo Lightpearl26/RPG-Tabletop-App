@@ -19,6 +19,8 @@ MEDIA_DIR = "media"
 TILES_DIR = "tiles"
 PREVIEW_FILE = "preview.png"
 STAGING_DIR = ".staging"
+# Kept with the tiles: the compilation and the scene they show (incremental builds)
+TILE_INDEX_FILE = "_index.json"
 
 DEFAULT_TILE_SIZE = 512
 DEFAULT_TILE_FORMAT = "webp"

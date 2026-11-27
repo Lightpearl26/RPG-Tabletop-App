@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QTabWidget,
     QToolBar,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -54,6 +55,8 @@ class RuntimeWindow(QMainWindow):
     assets_written = Signal(list)
     # The window closed: the IDE may change the version of the files again
     closed = Signal()
+    # "Créer" menu: the IDE opens a new editor of this resource type
+    new_resource_requested = Signal(str)
 
     def __init__(
         self,
@@ -162,6 +165,7 @@ class RuntimeWindow(QMainWindow):
         restore = QAction("Restaurer la disposition", self)
         restore.triggered.connect(self._restore_default_layout)
         self.menuBar().addMenu("Affichage").addAction(restore)
+        self._build_create_menu()
 
     def _build_map_workspace(self) -> None:
         workspace = QWidget()
@@ -212,7 +216,121 @@ class RuntimeWindow(QMainWindow):
 
         layout.addWidget(self.map_tools)
         layout.addWidget(self.map_view, 1)
-        self.setCentralWidget(workspace)
+
+        # Two modes: play on the map, or edit the map itself. Edits are saved
+        # after a short pause; only the tiles they touch are compiled again,
+        # and the players receive them right away.
+        self.mode_tabs = QTabWidget()
+        self.mode_tabs.setObjectName("RuntimeModeTabs")
+        self.mode_tabs.setDocumentMode(True)
+        self.mode_tabs.addTab(workspace, "Jeu")
+        self._edit_page = QWidget()
+        edit_layout = QVBoxLayout(self._edit_page)
+        edit_layout.setContentsMargins(0, 0, 0, 0)
+        self.mode_tabs.addTab(self._edit_page, "Édition de la carte")
+        self.mode_tabs.currentChanged.connect(self._on_mode_changed)
+        self._map_editor = None
+        self._publish_timer = QTimer(self)
+        self._publish_timer.setSingleShot(True)
+        self._publish_timer.setInterval(600)
+        self._publish_timer.timeout.connect(self.publish_map_edits)
+        self.setCentralWidget(self.mode_tabs)
+
+    # ---------------------------------------------------------- edit mode
+    @property
+    def editing_map(self) -> bool:
+        return self.mode_tabs.currentWidget() is self._edit_page
+
+    def _on_mode_changed(self, _index: int) -> None:
+        if self.editing_map:
+            self._open_map_editor()
+        else:
+            self.publish_map_edits()
+
+    def _open_map_editor(self) -> None:
+        """The IDE's map editor, on the session's current map."""
+        map_id = self.runtime.active_map_id
+        if self._map_editor is not None and self._map_editor.resource_id == map_id:
+            return
+        self._close_map_editor()
+        layout = self._edit_page.layout()
+        if map_id is None:
+            label = QLabel("Aucune carte active : choisis une carte dans le menu « Carte ».")
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(label)
+            return
+        from rpg_tabletop.ui.campaign_manager.editors.map.editor import MapEditor
+
+        try:
+            editor = MapEditor(map_id, self.campaign, parent=self._edit_page)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Édition de la carte", f"Impossible d'ouvrir la carte : {exc}")
+            return
+        editor.modified_changed.connect(lambda _modified: self._publish_timer.start())
+        editor.workspace.canvas.history_changed.connect(lambda *_: self._publish_timer.start())
+        editor.workspace.map_changed.connect(self._publish_timer.start)
+        layout.addWidget(editor)
+        self._map_editor = editor
+
+    def _close_map_editor(self) -> None:
+        self.publish_map_edits()
+        layout = self._edit_page.layout()
+        while layout.count():
+            widget = layout.takeAt(0).widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._map_editor = None
+
+    def publish_map_edits(self) -> bool:
+        """
+        Save the edited map if it changed: incremental compilation, then the
+        players get the new version (they ask again only for the tiles that
+        changed). Returns whether something was published.
+        """
+        self._publish_timer.stop()
+        editor = self._map_editor
+        if editor is None or not editor.is_modified:
+            return False
+        from time import perf_counter
+
+        start = perf_counter()
+        try:
+            editor.save()
+        except (OSError, ValueError) as exc:
+            self.statusBar().showMessage(f"Carte non publiée : {exc}", 8000)
+            return False
+        self.on_asset_saved("maps", editor.resource_id)
+        self.statusBar().showMessage(
+            f"Carte publiée aux joueurs ({(perf_counter() - start) * 1000:.0f} ms).", 4000
+        )
+        return True
+
+    def _build_create_menu(self) -> None:
+        """New campaign resources from the session: edited in the IDE, in this session's context."""
+        menu = self.menuBar().addMenu("Créer")
+        for label, resource_type in (
+            ("Entité…", "entities"), ("Personnage…", "characters"), ("Objet…", "items"),
+            ("Sort…", "spells"), ("Carte…", "maps"),
+        ):
+            action = QAction(label, self)
+            action.triggered.connect(lambda _checked=False, rt=resource_type: self.new_resource_requested.emit(rt))
+            menu.addAction(action)
+
+    def add_entity_from_file(self, stem: str) -> bool:
+        """An entity created from this session joins the game."""
+        from rpg_tabletop.session.entity import Entity
+
+        try:
+            entity = Entity.from_name(stem.replace("_", " "))
+            if entity is None or str(entity.id) in self.runtime.entities:
+                return False
+            self.runtime.add_entity(entity)
+        except Exception as exc:  # noqa: BLE001 - shown to the GM
+            QMessageBox.warning(self, "Nouvelle entité", f"Impossible d'ajouter l'entité à la session : {exc}")
+            return False
+        self._runtime_changed()
+        self.statusBar().showMessage(f"Entité ajoutée à la session : {entity.name}", 6000)
+        return True
 
     def _set_map_tool(self, tool_value: Any) -> None:
         self.map_view.set_drawing_tool(tool_value)
@@ -445,6 +563,10 @@ class RuntimeWindow(QMainWindow):
             return
         self.map_view.reload_active_map(reset_camera=True)
         self._runtime_changed()
+        if self._map_editor is not None:
+            self._close_map_editor()
+            if self.editing_map:
+                self._open_map_editor()
 
     def _runtime_changed(self) -> None:
         self.refresh_all(force=True)
@@ -1011,6 +1133,7 @@ class RuntimeWindow(QMainWindow):
             return
         self._closing = True
         self.refresh_timer.stop()
+        self.publish_map_edits()
         self._settings.setValue("dock_state", self.saveState())
         self._settings.setValue("geometry", self.saveGeometry())
         for sheet in list(self._sheets.values()):
