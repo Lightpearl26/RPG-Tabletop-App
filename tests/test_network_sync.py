@@ -114,12 +114,12 @@ def test_big_asset_transfer_does_not_block_pings_or_commands(tmp_path):
             for start in range(0, 40, 4):
                 await client.request_assets(refs[start:start + 4])
             pings = []
-            for _ in range(80):
+            for _ in range(200):
                 await asyncio.sleep(0.05)
                 ping = server.clients["bob"].ping_ms
                 if ping is not None:
                     pings.append(ping)
-                if any(getattr(m, "command", "") == "ASSET_DONE" for m in received):
+                if any(getattr(m, "command", "") == "ASSET_DONE" for m in received) and len(pings) >= 3:
                     break
             assert client.is_connected and "bob" in server.clients
             done = [m for m in received if getattr(m, "command", "") == ServerCommand.ASSET_CHUNK.value]
@@ -304,3 +304,145 @@ def test_the_server_only_gives_the_tiles_of_the_field_of_view(compiled_map):
     assert ask("tile:other:1_1").status is AssetStatus.DENIED   # not the GM's map
     assert ask("tile:m:1_1", who="ghost").status is AssetStatus.DENIED  # no token on the map
     assert ask("media:m:map.json").status is AssetStatus.DENIED  # GM files are not reachable
+
+
+# ---------------------------------------------------------------- protocol 3
+
+def test_only_changed_sections_are_synced(tmp_path):
+    projection = {"entity": {"name": "Hero", "hp": 10}, "map": {"tokens": [1, 2]}, "combat": {"active": False}}
+    gateway = StubGateway(projection=projection)
+
+    async def scenario():
+        port = _free_port()
+        server = RPGNetworkServer(_settings(tmp_path, port), gateway=gateway, player_bindings={"bob": "e1"})
+        await server.start()
+        syncs = []
+        client = _client(port, tmp_path, on_message=lambda m: syncs.append(m) if getattr(
+            m, "command", "") == "RUNTIME_SYNC" else None)
+        try:
+            await client.connect()
+            await asyncio.sleep(0.1)
+            projection["map"] = {"tokens": [1, 2, 3]}
+            await server.broadcast_runtime_sync()
+            await asyncio.sleep(0.1)
+            await server.broadcast_runtime_sync()  # nothing changed: nothing sent
+            await asyncio.sleep(0.1)
+        finally:
+            await client.disconnect()
+            await server.stop()
+        return syncs, client
+
+    syncs, client = run(scenario())
+    assert len(syncs) == 2
+    assert client.last_projection == projection
+    # The interface always gets the whole projection, the wire only the change
+    assert syncs[1].args["projection"]["map"] == {"tokens": [1, 2, 3]}
+    assert syncs[1].args["projection"]["entity"] == {"name": "Hero", "hp": 10}
+
+
+def test_runtime_calls_go_through_the_executor(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    calls = []
+    gateway = StubGateway()
+    original = gateway.handle
+
+    def handle(username, message):
+        calls.append(threading.current_thread().name)
+        return original(username, message)
+
+    gateway.handle = handle
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="qt-like")
+
+    async def scenario():
+        port = _free_port()
+        server = RPGNetworkServer(_settings(tmp_path, port), gateway=gateway, runtime_executor=pool.submit)
+        await server.start()
+        client = _client(port, tmp_path)
+        try:
+            await client.connect()
+            await client.send(CommandMessage("MOVE_REQUEST", {"target": [0, 0]}))
+            await asyncio.sleep(0.2)
+        finally:
+            await client.disconnect()
+            await server.stop()
+
+    run(scenario())
+    pool.shutdown()
+    assert calls and all(name.startswith("qt-like") for name in calls)
+
+
+def test_an_old_player_app_is_told_to_update(tmp_path):
+    import json
+    import ssl
+
+    async def scenario():
+        port = _free_port()
+        server = RPGNetworkServer(_settings(tmp_path, port), gateway=StubGateway())
+        await server.start()
+        try:
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            reader, writer = await asyncio.open_connection("127.0.0.1", port, ssl=context)
+            writer.write(b'{"version":"2.3","id":"1","type":"CMD","command":"AUTH","args":{}}\n')
+            await writer.drain()
+            line = await asyncio.wait_for(reader.readline(), 5)
+            writer.close()
+            return json.loads(line)
+        finally:
+            await server.stop()
+
+    answer = run(scenario())
+    assert answer["type"] == "ERROR" and answer["error_type"] == "VERSION_MISMATCH"
+
+
+def test_frames_compress_json_and_carry_raw_bytes():
+    from rpg_tabletop.net.protocol import FLAG_BLOB, FLAG_ZLIB, decode_frame
+
+    message = CommandMessage("RUNTIME_SYNC", {"projection": {"text": "abc" * 2000}}, blob=b"\x00\xff" * 10)
+    frame = message.encode_frame()
+    assert frame[4] & FLAG_ZLIB and frame[4] & FLAG_BLOB
+    assert len(frame) < 1000  # 6 KB of JSON compressed, 20 raw bytes
+    back = decode_frame(frame[4:])
+    assert back.args == message.args and back.blob == message.blob
+
+
+def test_freehand_simplification_keeps_the_shape():
+    from rpg_tabletop.core.geometry import simplify_polyline
+
+    line = [(float(x), 0.0) for x in range(1000)] + [(999.0, float(y)) for y in range(1, 500)]
+    kept = simplify_polyline(line, 0.5)
+    assert [line[i] for i in kept] == [(0.0, 0.0), (999.0, 0.0), (999.0, 499.0)]
+
+
+def test_preview_only_without_field_of_view_and_thumbnails_for_tokens(compiled_map, tmp_path):
+    from PySide6.QtGui import QColor, QImage
+    from rpg_tabletop.assets.map import MapAsset
+    from rpg_tabletop.net.asset_service import answer_asset
+    from rpg_tabletop.net.assets import parse_ref
+    from rpg_tabletop.net.projection import token_image_id
+
+    runtime = compiled_map
+    assert answer_asset(runtime, "hero", parse_ref("preview:m")).status is AssetStatus.DENIED
+
+    map_dir = runtime.campaign.map_path("m")
+    asset = MapAsset.load(map_dir)
+    asset.grid.enabled = False
+    asset.save(map_dir, tile_size=256, tile_format=asset.compiled.tile_format)
+    preview = answer_asset(runtime, "hero", parse_ref("preview:m"))
+    assert preview.path is not None and preview.read()[:4] == b"\x89PNG"
+    # Without a grid every tile may be asked for
+    assert answer_asset(runtime, "hero", parse_ref("tile:m:3_3")).status is not AssetStatus.DENIED
+
+    picture = tmp_path / "hero.png"
+    image = QImage(1200, 900, QImage.Format.Format_ARGB32)
+    image.fill(QColor("blue"))
+    image.save(str(picture))
+    token = runtime.active_map.tokens[0]
+    runtime.entities["hero"] = SimpleNamespace(token=picture)
+    runtime.visible_tokens_for = lambda entity_id: [token]
+    answer = answer_asset(runtime, "hero", parse_ref(f"token:{token_image_id(picture)}"))
+    thumbnail = QImage.fromData(answer.read())
+    assert max(thumbnail.width(), thumbnail.height()) == 256

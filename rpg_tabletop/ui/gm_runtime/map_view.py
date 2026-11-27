@@ -16,7 +16,9 @@ from PySide6.QtWidgets import QMenu, QWidget
 from rpg_tabletop.assets.map import (
     DrawingElement, DrawTool, MapAsset, MapElement, MediaCache, Rect, Vec2,
 )
-from rpg_tabletop.core.geometry import GridGeometry, area_cells, chebyshev, line_cells
+from rpg_tabletop.core.geometry import (
+    GridGeometry, area_cells, chebyshev, line_cells, simplify_polyline,
+)
 from rpg_tabletop.session.models import SessionToken
 from rpg_tabletop.session.runtime import SessionRuntime
 from .tokens import TOKEN_ENTITY_MIME
@@ -79,15 +81,19 @@ class RuntimeMapView(QWidget):
             return
         try:
             map_dir = self.runtime.campaign.map_path(self.runtime.active_map_id)
-            self.asset = MapAsset.load(map_dir)
-            self.media = MediaCache(map_dir)
-        except (OSError, ValueError) as exc:
+            # Read again only when map.json changed (the runtime keeps it by
+            # modification time); this runs after every change in the session.
+            asset = self.runtime._active_map_asset()
+            if asset is not self.asset or self.media is None or self.media.base_dir != map_dir:
+                self.media = MediaCache(map_dir)
+            self.asset = asset
+            self._token_images.clear()  # a token picture may have been edited
+        except (OSError, ValueError, RuntimeError) as exc:
             self.asset = None
             self.media = None
             self.status_message.emit(f"Impossible de charger la carte : {exc}")
             self.update()
             return
-        self._token_images.clear()
         if reset_camera and self.runtime.active_map is not None:
             state = self.runtime.active_map.gm_camera
             self.center = Vec2(state.center.x, state.center.y)
@@ -528,6 +534,8 @@ class RuntimeMapView(QWidget):
         if not points:
             self.update()
             return
+        if tool is DrawTool.FREEHAND:
+            points = _simplified_stroke(points, self.zoom)
         try:
             self.runtime.add_map_element(DrawingElement(
                 tool=tool,
@@ -993,3 +1001,18 @@ def _copy_placement(target: MapElement, source: MapElement, offset: Vec2 | None 
         target.points = [Vec2(point.x + delta.x, point.y + delta.y) for point in source.points]
     elif hasattr(target, "pos") and hasattr(source, "pos"):
         target.pos = Vec2(source.pos.x + delta.x, source.pos.y + delta.y)
+
+
+# A freehand stroke records a point per mouse move; every point is sent to the
+# players in each sync. Keep what changes the shape by more than ~1 screen px.
+MAX_STROKE_POINTS = 2000
+
+
+def _simplified_stroke(points: list[Vec2], zoom: float) -> list[Vec2]:
+    epsilon = max(0.5, 1.0 / max(zoom, 0.05))
+    raw = [(point.x, point.y) for point in points]
+    kept = simplify_polyline(raw, epsilon)
+    while len(kept) > MAX_STROKE_POINTS:
+        epsilon *= 2
+        kept = simplify_polyline(raw, epsilon)
+    return [points[index] for index in kept]

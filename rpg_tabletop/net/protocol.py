@@ -1,19 +1,35 @@
 # -*- coding: utf-8 -*-
-"""Versioned JSON-lines protocol used by RPG Tabletop App.
+"""Versioned protocol used by RPG Tabletop App.
 
-Transport: TCP + TLS 1.3.  Each application message is one UTF-8 JSON object
-terminated by ``\n``.  This intentionally keeps the framing from the legacy
-runtime while adding correlation IDs and explicit protocol versioning.
+Transport: TCP + TLS 1.3. Since protocol 3.0 each message is a binary frame:
+
+    length   uint32, big-endian: number of bytes after this field
+    flags    uint8:  0x01 the JSON part is zlib-compressed
+                     0x02 a binary attachment follows the JSON part
+    jsonlen  uint32, big-endian, only with 0x02: size of the JSON part
+    json     UTF-8 JSON object (the message), compressed above 1 KB
+    blob     raw bytes (file chunks): no base64, no compression
+
+Before 3.0 messages were JSON lines; a JSON line received where a frame is
+expected is recognised (it starts with "{") so the old peer can be told.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
 from json import dumps, loads
+import struct
 from typing import Any
 from uuid import uuid4
+import zlib
 
-PROTOCOL_VERSION = "2.3"
+PROTOCOL_VERSION = "3.0"
+
+FLAG_ZLIB = 0x01
+FLAG_BLOB = 0x02
+# JSON parts smaller than this are not worth compressing
+COMPRESS_ABOVE = 1024
+DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024
 
 
 class MessageType(str, Enum):
@@ -47,6 +63,8 @@ class NetworkMessage:
     message_id: str = field(default_factory=lambda: uuid4().hex)
     reply_to: str | None = None
     protocol_version: str = PROTOCOL_VERSION
+    # Binary attachment (file chunk), sent raw after the JSON part
+    blob: bytes | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -63,6 +81,21 @@ class NetworkMessage:
         return dumps(
             self.to_dict(), ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
+
+    def encode_frame(self) -> bytes:
+        """The message as one binary frame (see the module docstring)."""
+        body = self.encode()
+        flags = 0
+        if len(body) > COMPRESS_ABOVE:
+            packed = zlib.compress(body, 6)
+            if len(packed) < len(body):
+                body, flags = packed, flags | FLAG_ZLIB
+        if self.blob is not None:
+            flags |= FLAG_BLOB
+            payload = struct.pack(">BI", flags, len(body)) + body + bytes(self.blob)
+        else:
+            payload = struct.pack(">B", flags) + body
+        return struct.pack(">I", len(payload)) + payload
 
 
 class LogMessage(NetworkMessage):
@@ -175,7 +208,7 @@ class ErrorMessage(NetworkMessage):
 
 
 def _meta(meta: dict[str, Any]) -> dict[str, Any]:
-    allowed = {"message_id", "reply_to", "protocol_version"}
+    allowed = {"message_id", "reply_to", "protocol_version", "blob"}
     return {key: value for key, value in meta.items() if key in allowed}
 
 
@@ -186,6 +219,31 @@ def _common(data: dict[str, Any]) -> dict[str, Any]:
         "reply_to": str(raw_reply) if raw_reply is not None else None,
         "protocol_version": str(data.get("version") or "1.0"),
     }
+
+
+def decode_frame(payload: bytes) -> NetworkMessage:
+    """Decode the bytes of one frame after its length field."""
+    if not payload:
+        raise ValueError("Protocol error: empty frame")
+    flags = payload[0]
+    blob = None
+    if flags & FLAG_BLOB:
+        if len(payload) < 5:
+            raise ValueError("Protocol error: truncated frame")
+        (json_len,) = struct.unpack(">I", payload[1:5])
+        if json_len > len(payload) - 5:
+            raise ValueError("Protocol error: truncated frame")
+        body, blob = payload[5:5 + json_len], payload[5 + json_len:]
+    else:
+        body = payload[1:]
+    if flags & FLAG_ZLIB:
+        try:
+            body = zlib.decompress(body)
+        except zlib.error as exc:
+            raise ValueError(f"Protocol error: bad compressed data: {exc}") from exc
+    message = decode(body)
+    message.blob = blob
+    return message
 
 
 def decode(raw: bytes) -> NetworkMessage:

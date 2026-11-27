@@ -355,6 +355,11 @@ def build_player_runtime_projection(
     if entity_id not in runtime.entities:
         raise KeyError(f"Unknown entity: {entity_id}")
 
+    with runtime.visibility_scope():
+        return _build_projection(runtime, entity_id)
+
+
+def _build_projection(runtime: SessionRuntime, entity_id: str) -> dict[str, Any]:
     permissions = runtime.player_permissions(entity_id)
     return {
         "session": {

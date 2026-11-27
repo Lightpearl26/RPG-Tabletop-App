@@ -35,11 +35,14 @@ class ServerSettings:
     relay: RelaySettings = field(default_factory=RelaySettings)
     enable_firewall_setup: bool = True
     enable_upnp: bool = True
-    heartbeat_interval: float = 30.0
-    heartbeat_timeout: float = 90.0
+    # A ping every 5 s; a player silent for 20 s is considered gone (the
+    # client gives up on a silent server after ClientSettings.idle_timeout)
+    heartbeat_interval: float = 5.0
+    heartbeat_timeout: float = 20.0
     rate_limit_messages: int = 5
     rate_limit_window: float = 1.0
-    stream_line_limit_bytes: int = 4 * 1024 * 1024
+    stream_line_limit_bytes: int = 4 * 1024 * 1024  # unused since protocol 3.0 (kept for saved settings)
+    max_message_bytes: int = 8 * 1024 * 1024
     max_pending_per_player: int = 1
 
     def validate(self) -> None:
@@ -96,5 +99,9 @@ class ClientSettings:
     server_hostname: str = "rpg-tabletop-server"
     ca_file: str = ""
     expected_fingerprint: str = ""
-    stream_line_limit_bytes: int = 4 * 1024 * 1024
+    stream_line_limit_bytes: int = 4 * 1024 * 1024  # unused since protocol 3.0
     trust_on_first_use: bool = False
+    max_message_bytes: int = 8 * 1024 * 1024
+    # No message at all from the server for this long: the connection is dead
+    # (the server sends a heartbeat every few seconds)
+    idle_timeout: float = 25.0

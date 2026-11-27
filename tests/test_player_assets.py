@@ -137,3 +137,47 @@ def test_view_paints_cached_tiles_without_errors(window, capfd):
         tiles.record(key, version="v1", color="#ff334455")
     window.map_view.grab()
     assert "Traceback" not in capfd.readouterr().err
+
+
+def test_without_grid_a_far_view_asks_for_the_overview_only(window):
+    projection = _projection()
+    projection["map"]["fov"] = None
+    projection["map"]["asset"]["grid"]["enabled"] = False
+    window._apply_projection(projection)
+    window.map_view.fit_map()
+    window._request_current_visible_assets()
+    refs = [ref for ref in _refs(window) if not ref.startswith("token:")]
+    assert refs == ["preview:big"]
+
+    window.sent.clear()
+    window._requested_assets.clear()
+    window.map_view.zoom = 1.0  # close up: tiles again
+    window._request_current_visible_assets()
+    assert all(ref.startswith(("tile:", "token:")) for ref in _refs(window))
+
+
+def test_lost_connection_retries_with_growing_delays_until_a_refusal(window, monkeypatch):
+    attempts = []
+    monkeypatch.setattr(window.controller, "shutdown", lambda: None)
+    monkeypatch.setattr(window.controller, "connect", lambda settings, label="connect": attempts.append(label))
+
+    window._on_connection_lost()
+    assert window._reconnect_timer.isActive() and window._reconnect_timer.interval() == 1000
+    window._auto_reconnect()
+    assert attempts == ["reconnect"]
+    window._on_operation_finished("reconnect", None, OSError("refused"))
+    assert window._reconnect_timer.interval() == 2000
+    window._on_operation_finished("reconnect", None, OSError("refused"))
+    assert window._reconnect_timer.interval() == 4000
+
+    monkeypatch.setattr("rpg_tabletop.ui.player.window.QMessageBox.warning", lambda *args: None)
+    window._on_operation_finished("reconnect", None, PermissionError("Invalid password"))
+    assert not window._reconnect_timer.isActive() and window._reconnect_attempt == 0
+
+
+def test_replaced_connection_does_not_reconnect(window):
+    from rpg_tabletop.net.protocol import ErrorMessage, ErrorType
+
+    window._on_network_message(ErrorMessage(ErrorType.CLOSED, "Replaced by a new connection"))
+    window._on_connection_lost()
+    assert not window._reconnect_timer.isActive()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
+import shutil
 from typing import Any
 
 from PySide6.QtCore import QStandardPaths, QTimer, Qt, QSettings
@@ -14,7 +15,7 @@ from PySide6.QtWidgets import (
 
 from rpg_tabletop.net import ClientSettings
 from rpg_tabletop.net.assets import parse_ref
-from rpg_tabletop.net.protocol import ChatMessage, CommandMessage, ErrorMessage
+from rpg_tabletop.net.protocol import ChatMessage, CommandMessage, ErrorMessage, ErrorType
 from .connection import PlayerNetworkController
 from .dialogs import DiceRollDialog, InitiativeRollDialog, PlayerLoginDialog, TokenInspectDialog
 from .map_view import PlayerMapView
@@ -40,7 +41,7 @@ class PlayerRuntimeWindow(QMainWindow):
             asset_cache = Path(base or (Path.home() / ".rpg_tabletop")) / "player_cache"
         self._base_asset_cache = Path(asset_cache)
         self.controller = PlayerNetworkController(self._base_asset_cache, self)
-        self._cache_session_id = ""
+        self._cache_key = ""
         self.projection: dict[str, Any] | None = None
         self._pending_approval_id = ""
         self._has_pending = False
@@ -53,6 +54,13 @@ class PlayerRuntimeWindow(QMainWindow):
         self._asset_request_timer.setSingleShot(True)
         self._asset_request_timer.setInterval(250)
         self._asset_request_timer.timeout.connect(self._request_current_visible_assets)
+        # Automatic reconnection after a lost link: 1, 2, 4, 8, 16 then 30 s
+        self._reconnect_attempt = 0
+        # Replaced by another connection with the same name: do not fight back
+        self._replaced = False
+        self._reconnect_timer = QTimer(self)
+        self._reconnect_timer.setSingleShot(True)
+        self._reconnect_timer.timeout.connect(self._auto_reconnect)
 
         self.setObjectName("PlayerRuntimeWindow")
         self.setWindowTitle("RPG Tabletop — Joueur")
@@ -209,6 +217,7 @@ class PlayerRuntimeWindow(QMainWindow):
         self.combat_widget.end_turn_requested.connect(self.controller.request_end_turn)
         self.chat_panel.send_requested.connect(self.controller.send_chat)
         self.map_view.character_sheet_requested.connect(self._open_character_sheet)
+        self.controller.connection_lost.connect(self._on_connection_lost)
 
     # --------------------------------------------------------------- connection
     def connect_to_server(self) -> None:
@@ -218,6 +227,41 @@ class PlayerRuntimeWindow(QMainWindow):
         except Exception as exc:
             self.connection_label.setText("Connexion impossible")
             QMessageBox.critical(self, "Connexion", str(exc))
+
+    # ------------------------------------------------------------ reconnection
+    def _on_connection_lost(self) -> None:
+        if self._replaced:
+            self.connection_label.setText("Connecté depuis une autre fenêtre")
+            return
+        if not self._closing:
+            self._schedule_reconnect()
+
+    def _schedule_reconnect(self) -> None:
+        self._reconnect_attempt += 1
+        delay = min(30, 2 ** (self._reconnect_attempt - 1))
+        text = f"Connexion perdue — nouvel essai dans {delay} s (essai {self._reconnect_attempt})"
+        self.connection_label.setText(text)
+        self.statusBar().showMessage(text, delay * 1000)
+        self._reconnect_timer.start(delay * 1000)
+
+    def _stop_auto_reconnect(self) -> None:
+        self._reconnect_timer.stop()
+        self._reconnect_attempt = 0
+
+    def _auto_reconnect(self) -> None:
+        if self._closing or self._replaced:
+            return
+        self.controller.shutdown()
+        self.connection_label.setText(f"Reconnexion à {self.settings.host}:{self.settings.port}…")
+        try:
+            self.controller.connect(self.settings, label="reconnect")
+        except Exception:  # noqa: BLE001 - try again later
+            self._schedule_reconnect()
+
+    @staticmethod
+    def _fatal_connection_error(error: Any) -> bool:
+        """Errors that another try will not fix: refused login, other version, other certificate."""
+        return isinstance(error, PermissionError) or "fingerprint mismatch" in str(error).casefold()
 
     def _on_connection_changed(self, connected: bool, message: str) -> None:
         self.connection_label.setText("Connecté" if connected else message)
@@ -234,6 +278,18 @@ class PlayerRuntimeWindow(QMainWindow):
 
     def _on_operation_finished(self, label: str, result: Any, error: Any) -> None:
         if self._closing:
+            return
+        if label == "reconnect":
+            if error is None:
+                self._stop_auto_reconnect()
+                self.chat_panel.append_message("Système", "Reconnecté au serveur MJ.", system=True)
+                self._on_connected()
+            elif self._fatal_connection_error(error):
+                self._stop_auto_reconnect()
+                self.connection_label.setText("Reconnexion refusée")
+                QMessageBox.warning(self, "Connexion au MJ", str(error))
+            else:
+                self._schedule_reconnect()
             return
         if label == "connect":
             if error is not None:
@@ -265,21 +321,7 @@ class PlayerRuntimeWindow(QMainWindow):
                         return
                 QMessageBox.warning(self, "Connexion au MJ", str(error))
                 return
-            client = self.controller.client
-            if client is not None and client.peer_fingerprint:
-                trust = QSettings("RPGTabletop", "PlayerRuntime")
-                trust.setValue(
-                    PlayerLoginDialog.trust_key(self.settings.host, self.settings.port),
-                    client.peer_fingerprint,
-                )
-            self.controller.connection_changed.emit(True, "Connecté")
-            self.statusBar().showMessage("Connecté au serveur MJ — authentification réussie", 5000)
-            if self.projection and isinstance(self.projection.get("map"), dict):
-                self._schedule_visible_asset_request()
-            if not self.controller.bound_entity_id:
-                self.chat_panel.append_message(
-                    "Système", "Connecté. En attente que le MJ associe ton joueur à une Entity.", system=True
-                )
+            self._on_connected()
             return
         if error is not None:
             self.statusBar().showMessage(f"{label} : {error}", 8000)
@@ -297,7 +339,26 @@ class PlayerRuntimeWindow(QMainWindow):
         elif label == "end_turn":
             self.statusBar().showMessage("Demande de fin de tour envoyée au MJ", 4000)
 
+    def _on_connected(self) -> None:
+        client = self.controller.client
+        if client is not None and client.peer_fingerprint:
+            trust = QSettings("RPGTabletop", "PlayerRuntime")
+            trust.setValue(
+                PlayerLoginDialog.trust_key(self.settings.host, self.settings.port),
+                client.peer_fingerprint,
+            )
+        self.controller.connection_changed.emit(True, "Connecté")
+        self.statusBar().showMessage("Connecté au serveur MJ — authentification réussie", 5000)
+        if self.projection and isinstance(self.projection.get("map"), dict):
+            self._schedule_visible_asset_request()
+        if not self.controller.bound_entity_id:
+            self.chat_panel.append_message(
+                "Système", "Connecté. En attente que le MJ associe ton joueur à une Entity.", system=True
+            )
+
     def _reconnect(self) -> None:
+        self._stop_auto_reconnect()
+        self._replaced = False
         self.controller.shutdown()
         self._requested_assets.clear()
         self._failed_assets.clear()
@@ -310,6 +371,7 @@ class PlayerRuntimeWindow(QMainWindow):
         self.connect_to_server()
 
     def _disconnect(self) -> None:
+        self._stop_auto_reconnect()
         self.controller.shutdown()
         self.connection_label.setText("Déconnecté")
         self.statusBar().showMessage("Déconnecté du serveur MJ")
@@ -320,6 +382,9 @@ class PlayerRuntimeWindow(QMainWindow):
             self.chat_panel.append_message(message.sender, message.message)
             return
         if isinstance(message, ErrorMessage):
+            if message.error_type is ErrorType.CLOSED:
+                self._replaced = True
+                self._stop_auto_reconnect()
             self._forget_missing_asset_requests()
             self.chat_panel.append_log(ERROR, message.reason, "Réseau")
             self.statusBar().showMessage(message.reason, 8000)
@@ -557,7 +622,7 @@ class PlayerRuntimeWindow(QMainWindow):
         session = projection.get("session", {}) if isinstance(projection.get("session"), dict) else {}
         combat = projection.get("combat", {}) if isinstance(projection.get("combat"), dict) else {}
         map_data = projection.get("map")
-        self._set_session_cache(str(session.get("id", "")))
+        self._set_server_cache()
         if isinstance(map_data, dict):
             self._open_tile_cache(map_data)
         if self._sheet is not None and self._sheet.isVisible():
@@ -656,23 +721,32 @@ class PlayerRuntimeWindow(QMainWindow):
         self._sheet.raise_()
         self._sheet.activateWindow()
 
-    def _set_session_cache(self, session_id: str) -> None:
-        """Isolate downloaded map files between sessions/campaigns."""
-        safe_id = PurePosixPath(str(session_id).replace("\\", "/"))
-        if not session_id or safe_id.is_absolute() or len(safe_id.parts) != 1 or session_id in {".", ".."}:
+    def _set_server_cache(self) -> None:
+        """
+        One cache per GM server (identified by its certificate), shared by all
+        its sessions and campaigns: a tile is reused whenever its hash matches,
+        so the same map is not downloaded again for every session.
+        """
+        client = self.controller.client
+        fingerprint = "".join(
+            char for char in (client.peer_fingerprint if client is not None else "").lower()
+            if char in "0123456789abcdef"
+        )[:24]
+        key = fingerprint or f"{self.settings.host}_{self.settings.port}".replace(":", "_").replace("/", "_")
+        if not key or key == self._cache_key:
             return
-        if session_id == self._cache_session_id:
-            return
-        session_root = self._base_asset_cache / "sessions" / session_id
-        session_root.mkdir(parents=True, exist_ok=True)
-        self._cache_session_id = session_id
+        root = self._base_asset_cache / "servers" / key
+        root.mkdir(parents=True, exist_ok=True)
+        # Caches of older versions, one per session: replaced by this one
+        shutil.rmtree(self._base_asset_cache / "sessions", ignore_errors=True)
+        self._cache_key = key
         self._requested_assets.clear()
         self._failed_assets.clear()
-        self.controller.cache_root = session_root
+        self.controller.cache_root = root
         if self.controller.client is not None and self.controller.client.asset_receiver is not None:
-            self.controller.client.asset_receiver.reset(session_root)
+            self.controller.client.asset_receiver.reset(root)
         self.map_view.tiles.close()
-        self.map_view.set_cache_root(session_root)
+        self.map_view.set_cache_root(root)
 
     def _schedule_visible_asset_request(self) -> None:
         if self.projection and isinstance(self.projection.get("map"), dict):
@@ -708,9 +782,12 @@ class PlayerRuntimeWindow(QMainWindow):
             ref = parse_ref(raw_ref)
         except ValueError:
             return
-        if ref.kind == "tile" and self.map_view.tiles.map_root == self.controller.cache_root / "maps" / ref.map_id:
+        same_map = self.map_view.tiles.map_root == self.controller.cache_root / "maps" / ref.map_id
+        if ref.kind == "tile" and same_map:
             self.map_view.tiles.record(ref.name, version=str(args.get("version", "")),
                                        file_hash=str(args.get("hash", "")))
+        elif ref.kind == "preview" and same_map:
+            self.map_view.tiles.record_preview(str(args.get("version", "")))
         self.map_view.forget_file(str(args.get("file", "")))
 
     def _asset_status(self, args: dict[str, Any]) -> None:
@@ -726,12 +803,17 @@ class PlayerRuntimeWindow(QMainWindow):
             self._failed_assets.add(raw_ref)
             self.chat_panel.append_log(DEBUG, f"Ressource indisponible : {raw_ref} {args.get('reason', '')}")
             return
-        if status == "denied" or ref.kind != "tile":
+        if status == "denied" or ref.kind not in {"tile", "preview"}:
             return  # out of view now: asked again if it comes back on screen
         tiles = self.map_view.tiles
         if tiles.map_root != self.controller.cache_root / "maps" / ref.map_id:
             return
         version = str(args.get("version", ""))
+        if ref.kind == "preview":
+            if status == "unchanged":
+                tiles.record_preview(version)
+                self.map_view.update()
+            return
         if status == "unchanged":
             tiles.record(ref.name, version=version, file_hash=str(args.get("hash", "")))
         elif status == "uniform":
@@ -769,7 +851,11 @@ class PlayerRuntimeWindow(QMainWindow):
 
         asset = map_data.get("asset", {})
         compiled = asset.get("compiled") if isinstance(asset, dict) else None
-        if isinstance(compiled, dict) and self.map_view.on_map:
+        if isinstance(compiled, dict) and self.map_view.uses_preview():
+            have = self.map_view.tiles.preview_request()
+            if have is not None:
+                wanted[f"preview:{map_id}"] = have
+        elif isinstance(compiled, dict) and self.map_view.on_map:
             for key in self.map_view.prioritized_tile_keys():
                 have = self.map_view.tiles.request_for(key)
                 if have is not None:
@@ -815,6 +901,7 @@ class PlayerRuntimeWindow(QMainWindow):
     # ---------------------------------------------------------------- lifecycle
     def closeEvent(self, event: QCloseEvent) -> None:
         self._closing = True
+        self._reconnect_timer.stop()
         self.map_view.tiles.save()
         self.controller.shutdown()
         super().closeEvent(event)

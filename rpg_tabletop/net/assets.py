@@ -8,13 +8,15 @@ checks against what that player may see right now (net.asset_service):
     tile:<map_id>:<col>_<row>     one tile of the GM's current map
     token:<image id>              the picture of a token the player sees
     media:<map_id>:<path>         an image used by an annotation the player sees
+    preview:<map_id>              the whole map in 512 px, for maps without a
+                                  field of view (no grid) seen from far away
 
-A file is sent as ASSET_CHUNK messages (64 KB of data each, base64). Outcomes
-without a file are one ASSET_STATUS message (see AssetStatus).
+A file is sent as ASSET_CHUNK messages, 64 KB each, the bytes as the frame's
+binary attachment (protocol.FLAG_BLOB). Outcomes without a file are one
+ASSET_STATUS message (see AssetStatus).
 """
 from __future__ import annotations
 
-import base64
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path, PurePosixPath
@@ -34,13 +36,15 @@ class AssetStatus(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class AssetRef:
-    kind: str       # "tile", "token" or "media"
+    kind: str       # "tile", "token", "media" or "preview"
     map_id: str     # "" for tokens
     name: str       # tile key, image id or map-relative path
 
     def __str__(self) -> str:
         if self.kind == "token":
             return f"token:{self.name}"
+        if self.kind == "preview":
+            return f"preview:{self.map_id}"
         return f"{self.kind}:{self.map_id}:{self.name}"
 
     @property
@@ -50,6 +54,8 @@ class AssetRef:
             return PurePosixPath("maps", self.map_id, "tiles", self.name)
         if self.kind == "token":
             return PurePosixPath("tokens", self.name)
+        if self.kind == "preview":
+            return PurePosixPath("maps", self.map_id, "preview")
         return PurePosixPath("maps", self.map_id, self.name)
 
 
@@ -65,6 +71,10 @@ def parse_ref(raw: Any) -> AssetRef:
         if not rest or not all(char in "0123456789abcdef" for char in rest) or len(rest) != 64:
             raise ValueError(f"Invalid token picture reference: {text!r}")
         return AssetRef("token", "", rest)
+    if kind == "preview":
+        if not _safe_part(rest):
+            raise ValueError(f"Invalid preview reference: {text!r}")
+        return AssetRef("preview", rest, "preview")
     if kind not in {"tile", "media"}:
         raise ValueError(f"Unknown asset reference: {text!r}")
     map_id, _, name = rest.partition(":")
@@ -82,20 +92,15 @@ def parse_ref(raw: Any) -> AssetRef:
 
 
 def file_chunks(
-    ref: AssetRef, path: Path, extra: dict[str, Any], *, chunk_bytes: int = DEFAULT_CHUNK_BYTES
-) -> Iterator[dict[str, Any]]:
-    """The ASSET_CHUNK payloads of one file (read at once: tiles are small)."""
-    raw = Path(path).read_bytes()
+    ref: AssetRef, raw: bytes, extra: dict[str, Any], *, chunk_bytes: int = DEFAULT_CHUNK_BYTES
+) -> Iterator[tuple[dict[str, Any], bytes]]:
+    """(ASSET_CHUNK arguments, bytes) of each piece of a file."""
     count = max(1, (len(raw) + chunk_bytes - 1) // chunk_bytes)
     for index in range(count):
-        yield {
-            "ref": str(ref),
-            "index": index,
-            "count": count,
-            "size": len(raw),
-            "data": base64.b64encode(raw[index * chunk_bytes:(index + 1) * chunk_bytes]).decode("ascii"),
-            **extra,
-        }
+        yield (
+            {"ref": str(ref), "index": index, "count": count, "size": len(raw), **extra},
+            raw[index * chunk_bytes:(index + 1) * chunk_bytes],
+        )
 
 
 class AssetReceiver:
@@ -110,7 +115,7 @@ class AssetReceiver:
             self.cache_root = Path(cache_root)
         self._buffers.clear()
 
-    def receive_chunk(self, payload: dict[str, Any]) -> Path | None:
+    def receive_chunk(self, payload: dict[str, Any], data: bytes) -> Path | None:
         """Store one chunk; return the file once complete. Raises ValueError on bad data."""
         ref = parse_ref(payload.get("ref"))
         index, count = int(payload["index"]), int(payload["count"])
@@ -122,7 +127,7 @@ class AssetReceiver:
         buffer = self._buffers.get(key)
         if buffer is None:
             return None  # the start of this file was lost (cache switched)
-        buffer[index] = base64.b64decode(str(payload["data"]).encode("ascii"), validate=True)
+        buffer[index] = bytes(data)
         if len(buffer) != count:
             return None
         raw = b"".join(buffer[i] for i in range(count))

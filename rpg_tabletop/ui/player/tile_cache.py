@@ -106,6 +106,25 @@ class TileCache:
             return None
         return str(entry["h"]) if has_file else ""
 
+    # ----------------------------------------------------------- preview
+    PREVIEW_KEY = "@preview"
+
+    def preview_file(self) -> Path | None:
+        return None if self.map_root is None else self.map_root / "preview"
+
+    def preview_request(self) -> str | None:
+        """None: the cached overview is current. Otherwise "have" for the request."""
+        entry = self.entries.get(self.PREVIEW_KEY)
+        path = self.preview_file()
+        has_file = path is not None and path.is_file()
+        if entry is not None and entry.get("v") == self.version and has_file:
+            return None
+        return str(entry.get("v", "")) if entry is not None and has_file else ""
+
+    def record_preview(self, version: str) -> None:
+        self.entries[self.PREVIEW_KEY] = {"v": version}
+        self._dirty = True
+
     def record(self, key: str, *, version: str, file_hash: str | None = None,
                color: str | None = None, empty: bool = False) -> None:
         if file_hash is not None:

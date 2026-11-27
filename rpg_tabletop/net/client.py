@@ -68,7 +68,7 @@ class RPGNetworkClient:
             except Exception:
                 pass
             raise
-        self.connection = NetworkConnection(reader, writer)
+        self.connection = NetworkConnection(reader, writer, max_frame_bytes=self.settings.max_message_bytes)
         self.is_connected = True
         self._read_task = asyncio.create_task(self._read_loop())
 
@@ -110,7 +110,9 @@ class RPGNetworkClient:
         assert self.connection is not None
         try:
             while self.connection.is_active:
-                message = await self.connection.receive()
+                # The server sends a heartbeat every few seconds: silence this
+                # long means a dead link (sleeping laptop, broken relay...)
+                message = await asyncio.wait_for(self.connection.receive(), self.settings.idle_timeout)
                 if message.protocol_version != PROTOCOL_VERSION:
                     raise RuntimeError(
                         f"Protocol mismatch: server={message.protocol_version}, client={PROTOCOL_VERSION}"
@@ -133,7 +135,7 @@ class RPGNetworkClient:
                     self.on_message(message)
         except asyncio.CancelledError:
             raise
-        except (ConnectionError, OSError, RuntimeError, ValueError, ssl.SSLError):
+        except (asyncio.TimeoutError, ConnectionError, OSError, RuntimeError, ValueError, ssl.SSLError):
             pass
         finally:
             self.is_connected = False
@@ -150,7 +152,7 @@ class RPGNetworkClient:
             return None
         args = message.args
         try:
-            stored = self.asset_receiver.receive_chunk(args)
+            stored = self.asset_receiver.receive_chunk(args, message.blob or b"")
         except (KeyError, TypeError, ValueError, OSError) as exc:
             # A damaged or unwritable file is not a reason to drop the connection
             return CommandMessage(ServerCommand.ASSET_STATUS.value, {
@@ -169,10 +171,18 @@ class RPGNetworkClient:
             self.bound_entity_id = str(message.args.get("entity_id", "")) or None
         elif message.command == ServerCommand.ENTITY_UNBOUND.value:
             self.bound_entity_id = None
+            self.last_projection = {}
         elif message.command == ServerCommand.RUNTIME_SYNC.value:
             projection = message.args.get("projection", {})
             if isinstance(projection, dict):
+                if message.args.get("partial"):
+                    # Only the sections that changed: keep the others
+                    merged = dict(self.last_projection)
+                    merged.update(projection)
+                    projection = merged
                 self.last_projection = projection
+                # The interface always receives the complete projection
+                message.content["args"] = {"projection": projection}
         elif message.command == ServerCommand.PLAYER_LIST.value:
             for name in message.args.get("players", []):
                 self.players[str(name)] = None

@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from contextlib import suppress
+from concurrent.futures import Future
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field
+from hashlib import sha1
 import hmac
+import json
 import socket
 from time import monotonic
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 
 from .assets import file_chunks, parse_ref
 from .commands import ClientCommand, ServerCommand
 from .config import ServerSettings
-from .connection import NetworkConnection
+from .connection import LegacyPeerError, NetworkConnection
 from .firewall import FirewallResult, ensure_windows_firewall_rule
 from .gateway import GatewayResult, RuntimeNetworkGateway
 from .models import PendingRequest
@@ -30,6 +33,10 @@ LogCallback = Callable[[str], None]
 PendingCallback = Callable[[PendingRequest], None]
 ClientCallback = Callable[[str], None]
 ChatCallback = Callable[[str, str], None]
+T = TypeVar("T")
+# Runs a function where the SessionRuntime lives (the GM's Qt thread) and
+# returns a concurrent Future of its result.
+RuntimeExecutor = Callable[[Callable[[], Any]], Future]
 
 # Asset requests are queued and streamed by a background task per player, so a
 # big map never blocks the reading of that player's messages (pongs included).
@@ -60,6 +67,8 @@ class ServerClientSession:
     asset_wakeup: asyncio.Event = field(default_factory=asyncio.Event)
     asset_task: asyncio.Task[None] | None = None
     assets_sent: int = 0
+    # Digest of each projection section last sent: only changed sections go out
+    sent_sections: dict[str, str] = field(default_factory=dict)
 
 
 class RPGNetworkServer:
@@ -76,8 +85,12 @@ class RPGNetworkServer:
         on_client_disconnected: ClientCallback | None = None,
         on_chat: ChatCallback | None = None,
         on_initiative=None,
+        runtime_executor: RuntimeExecutor | None = None,
     ) -> None:
         settings.validate()
+        # Every access to the gateway and the SessionRuntime goes through
+        # run_on_runtime: the GM interface changes them on its own thread.
+        self.runtime_executor = runtime_executor
         self.settings = settings
         self.gateway = gateway
         self.player_bindings = dict(player_bindings or {})
@@ -121,6 +134,18 @@ class RPGNetworkServer:
 
     def _log(self, message: str) -> None:
         self.on_log(str(message))
+
+    async def run_on_runtime(self, function: Callable[[], T]) -> T:
+        """
+        Call `function` where the SessionRuntime lives.
+
+        The runtime is not thread-safe and the GM interface changes it on the Qt
+        thread: player requests, projections and asset checks run there too,
+        one after the other, instead of racing with the GM on the network thread.
+        """
+        if self.runtime_executor is None:
+            return function()
+        return await asyncio.wrap_future(self.runtime_executor(function))
 
     @staticmethod
     def local_ip() -> str:
@@ -220,11 +245,21 @@ class RPGNetworkServer:
         task = asyncio.current_task()
         if task is not None:
             self._client_tasks.add(task)
-        connection = NetworkConnection(reader, writer)
+        connection = NetworkConnection(reader, writer, max_frame_bytes=self.settings.max_message_bytes)
         peer = writer.get_extra_info("peername") or ("?", 0)
         session: ServerClientSession | None = None
         try:
-            auth = await asyncio.wait_for(connection.receive(), timeout=15.0)
+            try:
+                auth = await asyncio.wait_for(connection.receive(), timeout=15.0)
+            except LegacyPeerError:
+                # A player app older than 3.0: tell it in its own format to update
+                reason = f"Protocol {PROTOCOL_VERSION} required: update the player app"
+                await connection.send_legacy_line(json.dumps({
+                    "version": PROTOCOL_VERSION, "id": "legacy", "type": "ERROR",
+                    "error_type": ErrorType.VERSION_MISMATCH.value, "reason": reason,
+                }).encode("utf-8"))
+                self._log(f"[connect] peer={peer} uses an older player app")
+                return
             if auth.protocol_version != PROTOCOL_VERSION:
                 await connection.send(ErrorMessage(
                     ErrorType.VERSION_MISMATCH,
@@ -291,8 +326,9 @@ class RPGNetworkServer:
         self.clients[username] = session
         try:
             if bound and self.gateway is not None:
+                gateway = self.gateway
                 try:
-                    self.gateway.bind(username, bound)
+                    await self.run_on_runtime(lambda: gateway.bind(username, bound))
                 except (KeyError, ValueError) as exc:
                     self.clients.pop(username, None)
                     await connection.send(ErrorMessage(ErrorType.AUTH_REJECTED, str(exc), reply_to=request.message_id))
@@ -317,7 +353,7 @@ class RPGNetworkServer:
                 )
             if bound and self.gateway is not None:
                 try:
-                    message = self._runtime_sync_message(session)
+                    message = await self._full_sync_message(session)
                 except Exception as exc:  # noqa: BLE001 - the next sync will catch up
                     self._log(f"[auth] username={username!r} first sync failed: {type(exc).__name__}: {exc}")
                 else:
@@ -327,68 +363,120 @@ class RPGNetworkServer:
             # already in use" until the heartbeat timeout otherwise).
             if self.clients.get(username) is session:
                 self.clients.pop(username, None)
-                if self.gateway is not None and self.gateway.entity_for(username) == bound:
-                    self.gateway.unbind(username)
+                gateway = self.gateway
+                if gateway is not None and bound:
+                    with suppress(Exception):
+                        await self.run_on_runtime(
+                            lambda: gateway.entity_for(username) == bound and gateway.unbind(username)
+                        )
             raise
         self._log(f"[auth] accepted username={username!r} peer={peer} entity={bound!r}")
         if self.on_client_connected is not None:
             self.on_client_connected(username)
         return session
 
-    def _runtime_sync_message(
+    def _sync_message(
         self,
         session: ServerClientSession,
-        projection: dict[str, Any] | None = None,
+        projection: dict[str, Any],
         *,
+        full: bool = False,
         reply_to: str | None = None,
-    ) -> CommandMessage:
-        if projection is None:
-            if self.gateway is None:
-                raise RuntimeError("No RuntimeNetworkGateway is connected")
-            projection = self.gateway.projection_for(session.username)
-        return CommandMessage(ServerCommand.RUNTIME_SYNC.value, {"projection": projection}, reply_to=reply_to)
+    ) -> CommandMessage | None:
+        """
+        RUNTIME_SYNC with the sections of the projection that changed since the
+        last one sent on this connection, or None when nothing changed.
+
+        {"projection": {<changed sections>}, "partial": true}: the client keeps
+        the previous value of every section that is absent (RPGNetworkClient).
+        A full sync ("partial": false) restarts from scratch.
+        """
+        digests = {
+            key: sha1(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+            for key, value in projection.items()
+        }
+        if full:
+            changed = list(projection)
+        else:
+            changed = [key for key, digest in digests.items() if session.sent_sections.get(key) != digest]
+            if not changed and set(session.sent_sections) == set(digests):
+                return None
+        session.sent_sections = digests
+        return CommandMessage(
+            ServerCommand.RUNTIME_SYNC.value,
+            {"projection": {key: projection[key] for key in changed}, "partial": not full},
+            reply_to=reply_to,
+        )
+
+    async def _full_sync_message(self, session: ServerClientSession) -> CommandMessage:
+        gateway = self.gateway
+        if gateway is None:
+            raise RuntimeError("No RuntimeNetworkGateway is connected")
+        projection = await self.run_on_runtime(lambda: gateway.projection_for(session.username))
+        message = self._sync_message(session, projection, full=True)
+        assert message is not None
+        return message
+
+    def _for_session(self, session: ServerClientSession, message: NetworkMessage) -> NetworkMessage | None:
+        """A RUNTIME_SYNC built by the gateway (reply to a request): sent in full."""
+        if (
+            isinstance(message, CommandMessage)
+            and message.command == ServerCommand.RUNTIME_SYNC.value
+            and isinstance(message.args.get("projection"), dict)
+        ):
+            return self._sync_message(session, message.args["projection"], full=True, reply_to=message.reply_to)
+        return message
 
     async def bind_player(self, username: str, entity_id: str) -> None:
         if username not in self.clients:
             raise KeyError(f"Player is not connected: {username}")
-        if self.gateway is None:
+        gateway = self.gateway
+        if gateway is None:
             raise RuntimeError("No RuntimeNetworkGateway is connected")
-        self.gateway.bind(username, entity_id)
+        await self.run_on_runtime(lambda: gateway.bind(username, entity_id))
         self.player_bindings[username] = entity_id
         session = self.clients[username]
         session.bound_entity_id = entity_id
         await session.connection.send(CommandMessage(ServerCommand.ENTITY_BOUND.value, {"entity_id": entity_id}))
-        await session.connection.send(self._runtime_sync_message(session))
+        await session.connection.send(await self._full_sync_message(session))
 
     async def request_initiative(self, username: str, entity_id: str) -> None:
         """Ask a player for the d20 initiative of their entity."""
-        if self.gateway is None:
+        gateway = self.gateway
+        if gateway is None:
             raise RuntimeError("No RuntimeNetworkGateway is connected")
         session = self.clients.get(username)
         if session is None:
             raise KeyError(f"Player is not connected: {username}")
-        self.gateway.expect_initiative(username, entity_id)
-        entity = self.gateway.runtime.entities.get(str(entity_id))
+
+        def expect() -> str:
+            gateway.expect_initiative(username, entity_id)
+            entity = gateway.runtime.entities.get(str(entity_id))
+            return entity.name if entity is not None else ""
+
+        name = await self.run_on_runtime(expect)
         await session.connection.send(CommandMessage(
-            ServerCommand.INITIATIVE_REQUEST.value,
-            {"entity_id": str(entity_id), "name": entity.name if entity is not None else ""},
+            ServerCommand.INITIATIVE_REQUEST.value, {"entity_id": str(entity_id), "name": name},
         ))
 
     async def cancel_initiative(self, username: str) -> None:
         """Withdraw an initiative request the player has not answered."""
-        if self.gateway is None or not self.gateway.forget_initiative(username):
+        gateway = self.gateway
+        if gateway is None or not await self.run_on_runtime(lambda: gateway.forget_initiative(username)):
             return
         session = self.clients.get(username)
         if session is not None:
             await session.connection.send(CommandMessage(ServerCommand.INITIATIVE_CANCELLED.value, {}))
 
     async def unbind_player(self, username: str) -> None:
-        if self.gateway is not None:
-            self.gateway.unbind(username)
+        gateway = self.gateway
+        if gateway is not None:
+            await self.run_on_runtime(lambda: gateway.unbind(username))
         self.player_bindings.pop(username, None)
         session = self.clients.get(username)
         if session is not None:
             session.bound_entity_id = None
+            session.sent_sections = {}
             await session.connection.send(CommandMessage(ServerCommand.ENTITY_UNBOUND.value, {}))
 
     def _rate_limited(self, session: ServerClientSession) -> bool:
@@ -449,8 +537,11 @@ class RPGNetworkServer:
                     ErrorType.INVALID_STATE, "No game runtime is connected", reply_to=message.message_id
                 ))
                 continue
+            gateway = self.gateway
             try:
-                result = self.gateway.handle(session.username, message)
+                result = await self.run_on_runtime(
+                    lambda message=message: gateway.handle(session.username, message)
+                )
             except Exception as exc:  # noqa: BLE001 - a bad request must not cut the player off
                 self._log(
                     f"[session] username={session.username!r} {message.command} failed: "
@@ -528,21 +619,23 @@ class RPGNetworkServer:
                     ))
                     continue
                 # Checked now, against the session as it is when the file leaves
-                answer = gateway.asset_answer(session.username, ref, have)
-                if answer.path is None:
+                answer = await self.run_on_runtime(
+                    lambda ref=ref, have=have: gateway.asset_answer(session.username, ref, have)
+                )
+                if answer.status is not None:
                     await session.connection.send(CommandMessage(
                         ServerCommand.ASSET_STATUS.value, answer.status_args()
                     ))
                     continue
                 try:
-                    chunks = await asyncio.to_thread(lambda: list(file_chunks(ref, answer.path, answer.extra)))
-                except OSError:
+                    raw = await asyncio.to_thread(answer.read)
+                except (OSError, ValueError):
                     await session.connection.send(CommandMessage(
                         ServerCommand.ASSET_STATUS.value, {"ref": raw_ref, "status": "missing"}
                     ))
                     continue
-                for chunk in chunks:
-                    await session.connection.send(CommandMessage(ServerCommand.ASSET_CHUNK.value, chunk))
+                for args, data in file_chunks(ref, raw, answer.extra):
+                    await session.connection.send(CommandMessage(ServerCommand.ASSET_CHUNK.value, args, blob=data))
                 session.assets_sent += 1
         except asyncio.CancelledError:
             raise
@@ -554,7 +647,9 @@ class RPGNetworkServer:
         session = self.clients.get(username)
         if session is not None:
             for reply in result.replies:
-                await session.connection.send(reply)
+                outgoing = self._for_session(session, reply)
+                if outgoing is not None:
+                    await session.connection.send(outgoing)
         for recipient, message in result.outbox:
             target = self.clients.get(recipient)
             if target is None:
@@ -580,16 +675,18 @@ class RPGNetworkServer:
             ))
 
     async def approve_pending(self, approval_id: str) -> PendingRequest:
-        if self.gateway is None:
+        gateway = self.gateway
+        if gateway is None:
             raise RuntimeError("No RuntimeNetworkGateway is connected")
-        pending, result = self.gateway.approve(approval_id)
+        pending, result = await self.run_on_runtime(lambda: gateway.approve(approval_id))
         await self._apply_gateway_result(pending.username, result)
         return pending
 
     async def reject_pending(self, approval_id: str, *, reason: str = "") -> PendingRequest:
-        if self.gateway is None:
+        gateway = self.gateway
+        if gateway is None:
             raise RuntimeError("No RuntimeNetworkGateway is connected")
-        pending, result = self.gateway.reject(approval_id, reason=reason)
+        pending, result = await self.run_on_runtime(lambda: gateway.reject(approval_id, reason=reason))
         await self._apply_gateway_result(pending.username, result)
         return pending
 
@@ -613,20 +710,46 @@ class RPGNetworkServer:
         return pending
 
     async def broadcast_runtime_sync(self) -> None:
-        if self.gateway is None:
+        """Send each bound player what changed in their projection (nothing if nothing did)."""
+        gateway = self.gateway
+        if gateway is None:
             return
+        sessions = [
+            session for session in list(self.clients.values())
+            if session.bound_entity_id is not None or gateway.entity_for(session.username) is not None
+        ]
+        if not sessions:
+            return
+
+        def build() -> list[tuple[ServerClientSession, dict[str, Any] | None]]:
+            built = []
+            scope = getattr(getattr(gateway, "runtime", None), "visibility_scope", None)
+            with scope() if scope is not None else nullcontext():
+                built = _build_all()
+            return built
+
+        def _build_all() -> list[tuple[ServerClientSession, dict[str, Any] | None]]:
+            built = []
+            for session in sessions:
+                if gateway.entity_for(session.username) is None:
+                    continue
+                try:
+                    built.append((session, gateway.projection_for(session.username)))
+                except (KeyError, PermissionError, RuntimeError):
+                    continue
+                except Exception as exc:  # noqa: BLE001 - one bad projection must not stop the others
+                    self._log(
+                        f"[sync] username={session.username!r} projection failed: {type(exc).__name__}: {exc}"
+                    )
+            return built
+
         sends = []
-        for username, session in list(self.clients.items()):
-            if self.gateway.entity_for(username) is None:
+        for session, projection in await self.run_on_runtime(build):
+            if self.clients.get(session.username) is not session or projection is None:
                 continue
-            try:
-                message = self._runtime_sync_message(session)
-            except (KeyError, PermissionError, RuntimeError):
-                continue
-            except Exception as exc:  # noqa: BLE001 - one bad projection must not stop the others
-                self._log(f"[sync] username={username!r} projection failed: {type(exc).__name__}: {exc}")
-                continue
-            sends.append(self._safe_send(session, message))
+            message = self._sync_message(session, projection)
+            if message is not None:
+                sends.append(self._safe_send(session, message))
         if sends:
             await asyncio.gather(*sends)
 
@@ -644,6 +767,9 @@ class RPGNetworkServer:
             await asyncio.wait_for(session.connection.send(message), timeout)
             return True
         except (asyncio.TimeoutError, ConnectionError, OSError, RuntimeError):
+            return False
+        except ValueError as exc:  # too large to be sent: the player keeps the connection
+            self._log(f"[send] username={session.username!r} {exc}")
             return False
 
     async def _heartbeat_loop(self) -> None:
@@ -695,13 +821,19 @@ class RPGNetworkServer:
             await session.connection.close()
             return
         self.clients.pop(username, None)
-        if self.gateway is not None:
-            pending = self.gateway.pending_for(username)
-            if pending is not None:
-                with suppress(Exception):
-                    self.gateway.cancel(username, pending.approval_id)
-            self.gateway.forget_initiative(username)
-            self.gateway.unbind(username)
+        gateway = self.gateway
+        if gateway is not None:
+            def forget() -> None:
+                if username in self.clients:
+                    return  # reconnected meanwhile: the new connection keeps its binding
+                pending = gateway.pending_for(username)
+                if pending is not None:
+                    with suppress(Exception):
+                        gateway.cancel(username, pending.approval_id)
+                gateway.forget_initiative(username)
+                gateway.unbind(username)
+            with suppress(Exception):
+                await self.run_on_runtime(forget)
         await session.connection.close()
         if announce:
             await self.broadcast(CommandMessage(ServerCommand.PLAYER_LEFT.value, {"username": username}))

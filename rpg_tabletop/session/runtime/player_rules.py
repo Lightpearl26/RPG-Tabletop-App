@@ -4,7 +4,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from contextlib import contextmanager
+from typing import Any, Iterator, Sequence
 
 from rpg_tabletop.assets.map import (
     MapAsset,
@@ -90,15 +91,40 @@ class PlayerRulesMixin:
             offset_y=grid.offset_y,
         )
 
+    @contextmanager
+    def visibility_scope(self) -> Iterator[None]:
+        """
+        Remember who sees what until the end of the block.
+
+        Building one player projection asks `visible_tokens_for` again for the
+        map, the combat carousel and every token's public view (each of them a
+        line-of-sight check against every token). Nothing changes meanwhile, so
+        each observer is computed once.
+        """
+        if getattr(self, "_visibility_memo", None) is not None:
+            yield
+            return
+        self._visibility_memo = {}
+        try:
+            yield
+        finally:
+            self._visibility_memo = None
+
     def visible_tokens_for(self, observer_entity_id: str) -> list[SessionToken]:
         """Tokens visible inside the PER radius. Hidden tokens stay GM-only."""
         state = self._require_active_map()
         observer_entity_id = str(observer_entity_id)
+        memo = getattr(self, "_visibility_memo", None)
+        if memo is not None and observer_entity_id in memo:
+            return list(memo[observer_entity_id])
         observer = state.token_for_entity(observer_entity_id)
         if observer is None:
             return []
 
-        context = map_context(self)
+        try:
+            context = map_context(self)
+        except RuntimeError:
+            context = None  # no grid: no vision rule, every token that is not hidden
         visible: list[SessionToken] = []
         for token in state.tokens:
             if token.entity_id == observer_entity_id:
@@ -107,8 +133,10 @@ class PlayerRulesMixin:
             if token.hidden:
                 continue
             # PER radius, and walls hide what is behind them
-            if sees(self, context, observer, token):
+            if context is None or sees(self, context, observer, token):
                 visible.append(token)
+        if memo is not None:
+            memo[observer_entity_id] = list(visible)
         return visible
 
     def can_inspect_token(self, observer_entity_id: str, token_id: str) -> bool:

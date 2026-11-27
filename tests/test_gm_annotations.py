@@ -94,3 +94,39 @@ def test_eraser_removes_only_what_it_touches(view):
     assert len(view.runtime.active_map.elements) == 1
     QTest.mouseClick(view, Qt.MouseButton.LeftButton, pos=_screen(view, 300, 150))
     assert view.runtime.active_map.elements == []
+
+
+def test_runtime_executor_runs_network_calls_on_the_qt_thread(app):
+    import threading
+    from rpg_tabletop.ui.gm_runtime.bridge import RuntimeExecutor
+
+    executor = RuntimeExecutor()
+    seen = []
+    futures = []
+    worker = threading.Thread(target=lambda: futures.append(
+        executor.submit(lambda: seen.append(threading.current_thread()) or 42)))
+    worker.start()
+    worker.join()
+    for _ in range(50):
+        app.processEvents()
+        if futures and futures[0].done():
+            break
+    assert futures[0].result(timeout=1) == 42
+    assert seen == [threading.main_thread()]
+
+
+def test_map_is_not_read_again_from_disk_after_each_change(view):
+    asset = view.asset
+    view.runtime.add_map_element(DrawingElement(tool=DrawTool.LINE, points=[Vec2(0, 0), Vec2(5, 5)]))
+    view.reload_active_map()
+    assert view.asset is asset
+
+
+def test_long_freehand_strokes_are_simplified(view):
+    view.set_drawing_tool(DrawTool.FREEHAND.value)
+    QTest.mousePress(view, Qt.MouseButton.LeftButton, pos=_screen(view, 10, 300))
+    for x in range(11, 400):
+        QTest.mouseMove(view, _screen(view, x, 300))
+    QTest.mouseRelease(view, Qt.MouseButton.LeftButton, pos=_screen(view, 400, 300))
+    stroke = view.runtime.active_map.elements[-1]
+    assert len(stroke.points) <= 3

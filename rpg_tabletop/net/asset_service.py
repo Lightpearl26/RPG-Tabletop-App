@@ -11,14 +11,37 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from rpg_tabletop.assets.map.common import PREVIEW_FILE
+from rpg_tabletop.assets.map.media import reduced_image
 from rpg_tabletop.core.geometry import tiles_in_box
 from rpg_tabletop.session.runtime import SessionRuntime
 from .assets import AssetRef, AssetStatus
 from .projection import (
     compiled_version, element_visible, player_view_box, token_image_id,
 )
+
+
+# Tokens are drawn a few dozen pixels wide: their picture is sent at most this big
+TOKEN_THUMBNAIL_SIDE = 256
+# path -> (mtime_ns, size, bytes)
+_THUMBNAILS: dict[str, tuple[int, int, bytes]] = {}
+
+
+def token_thumbnail(path: Path, max_side: int = TOKEN_THUMBNAIL_SIDE) -> bytes:
+    """The token picture reduced to `max_side` pixels, kept until the file changes."""
+    path = Path(path)
+    stat = path.stat()
+    key = str(path)
+    cached = _THUMBNAILS.get(key)
+    if cached is not None and cached[:2] == (stat.st_mtime_ns, stat.st_size):
+        return cached[2]
+    data = reduced_image(path.read_bytes(), max_side)
+    if len(_THUMBNAILS) >= 128:
+        _THUMBNAILS.pop(next(iter(_THUMBNAILS)))
+    _THUMBNAILS[key] = (stat.st_mtime_ns, stat.st_size, data)
+    return data
 
 
 @dataclass(slots=True)
@@ -29,6 +52,16 @@ class AssetAnswer:
     path: Path | None = None
     # Sent with the chunks or the status (hash, version, color...)
     extra: dict[str, Any] = field(default_factory=dict)
+    # Produces the bytes instead of reading `path` (token thumbnails); called
+    # off the network loop, in a worker thread
+    loader: Callable[[], bytes] | None = None
+
+    def read(self) -> bytes:
+        if self.loader is not None:
+            return self.loader()
+        if self.path is None:
+            raise ValueError("Nothing to send")
+        return Path(self.path).read_bytes()
 
     def status_args(self) -> dict[str, Any]:
         return {"ref": str(self.ref), "status": self.status.value if self.status else "", **self.extra}
@@ -42,6 +75,8 @@ def answer_asset(runtime: SessionRuntime, entity_id: str | None, ref: AssetRef, 
             return _tile(runtime, entity_id, ref, have)
         if ref.kind == "token":
             return _token(runtime, entity_id, ref, have)
+        if ref.kind == "preview":
+            return _preview(runtime, entity_id, ref, have)
         return _media(runtime, entity_id, ref)
     except (KeyError, RuntimeError, ValueError, OSError):
         return AssetAnswer(ref, AssetStatus.MISSING)
@@ -91,7 +126,9 @@ def _token(runtime: SessionRuntime, entity_id: str, ref: AssetRef, have: str) ->
             continue
         if have and have == ref.name:
             return AssetAnswer(ref, AssetStatus.UNCHANGED, extra={"hash": ref.name})
-        return AssetAnswer(ref, path=Path(entity.token), extra={"hash": ref.name})
+        picture = Path(entity.token)
+        return AssetAnswer(ref, path=picture, extra={"hash": ref.name},
+                           loader=lambda: token_thumbnail(picture))
     return AssetAnswer(ref, AssetStatus.DENIED)
 
 
@@ -112,3 +149,21 @@ def _media(runtime: SessionRuntime, entity_id: str, ref: AssetRef) -> AssetAnswe
             return AssetAnswer(ref, AssetStatus.MISSING)
         return AssetAnswer(ref, path=path)
     return AssetAnswer(ref, AssetStatus.DENIED)
+
+
+def _preview(runtime: SessionRuntime, entity_id: str, ref: AssetRef, have: str) -> AssetAnswer:
+    """The whole map at low resolution: only where the player may see the whole map."""
+    if ref.map_id != runtime.active_map_id:
+        return AssetAnswer(ref, AssetStatus.DENIED)
+    if player_view_box(runtime, entity_id) is not None:
+        return AssetAnswer(ref, AssetStatus.DENIED)  # absent, or limited by a field of view
+    compiled = runtime._active_map_asset().compiled
+    if compiled is None:
+        return AssetAnswer(ref, AssetStatus.MISSING)
+    version = compiled_version(compiled)
+    if have and have == version:
+        return AssetAnswer(ref, AssetStatus.UNCHANGED, extra={"version": version, "hash": version})
+    path = runtime.campaign.map_path(ref.map_id) / PREVIEW_FILE
+    if not path.is_file():
+        return AssetAnswer(ref, AssetStatus.MISSING)
+    return AssetAnswer(ref, path=path, extra={"version": version, "hash": version})

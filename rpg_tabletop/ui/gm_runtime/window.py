@@ -35,7 +35,7 @@ from rpg_tabletop.session.runtime import SessionRuntime
 from rpg_tabletop.session.targeting import TargetingError, targeting_spec
 from rpg_tabletop.ui.theme.stylesheets import CAMPAIGN_MANAGER_STYLESHEET, GM_RUNTIME_STYLESHEET
 from rpg_tabletop.ui.common.chat_panel import DEBUG, ERROR, INFO, WARNING, ChatPanel, network_log_level
-from .bridge import RuntimeNetworkBridge
+from .bridge import RuntimeExecutor, RuntimeNetworkBridge
 from .combat import CombatPanel
 from .journal import JournalPanel
 from .map_view import RuntimeMapView
@@ -68,6 +68,7 @@ class RuntimeWindow(QMainWindow):
         self.network_loop: AsyncioLoopThread | None = None
         self.server: RPGNetworkServer | None = None
         self.bridge = RuntimeNetworkBridge(self)
+        self.runtime_executor = RuntimeExecutor(self)
         # One request list for the whole session: player requests (through the
         # server) and the actions the GM makes entities do, server or not.
         self.gateway = RuntimeNetworkGateway(
@@ -625,7 +626,9 @@ class RuntimeWindow(QMainWindow):
         self._show_requests()
 
     async def _gm_action_async(self, entity_id: str, intent: ActionIntent) -> PendingRequest:
-        pending, result = self.gateway.submit_gm_action(entity_id, intent)
+        pending, result = await self.server.run_on_runtime(
+            lambda: self.gateway.submit_gm_action(entity_id, intent)
+        )
         await self.server.deliver(result)
         return pending
 
@@ -684,6 +687,7 @@ class RuntimeWindow(QMainWindow):
                 on_client_disconnected=self.bridge.on_client_disconnected,
                 on_chat=self.bridge.on_chat,
                 on_initiative=self.bridge.on_initiative,
+                runtime_executor=self.runtime_executor.submit,
             )
             self._server_starting = True
             self._server_stopping = False
@@ -892,12 +896,14 @@ class RuntimeWindow(QMainWindow):
                 self.statusBar().showMessage(who + message, 10000)
 
     async def _approve_async(self, approval_id: str):
-        pending, result = self.gateway.approve(approval_id)
+        pending, result = await self.server.run_on_runtime(lambda: self.gateway.approve(approval_id))
         await self.server.deliver(result, pending.username)
         return pending, result
 
     async def _reject_async(self, approval_id: str, reason: str):
-        pending, result = self.gateway.reject(approval_id, reason=reason)
+        pending, result = await self.server.run_on_runtime(
+            lambda: self.gateway.reject(approval_id, reason=reason)
+        )
         await self.server.deliver(result, pending.username)
         return pending, result
 

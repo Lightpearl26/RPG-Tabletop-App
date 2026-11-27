@@ -18,6 +18,8 @@ class PlayerNetworkController(QObject):
 
     message_received = Signal(object)
     connection_changed = Signal(bool, str)
+    # The link dropped without the player asking for it (the window reconnects)
+    connection_lost = Signal()
     operation_finished = Signal(str, object, object)
 
     def __init__(self, asset_cache: str | Path, parent: QObject | None = None) -> None:
@@ -38,7 +40,7 @@ class PlayerNetworkController(QObject):
     def bound_entity_id(self) -> str | None:
         return self.client.bound_entity_id if self.client is not None else None
 
-    def connect(self, settings: ClientSettings) -> None:
+    def connect(self, settings: ClientSettings, *, label: str = "connect") -> None:
         if self.loop_thread is not None:
             raise RuntimeError("A network connection attempt is already active")
         self._generation += 1
@@ -52,7 +54,7 @@ class PlayerNetworkController(QObject):
             on_message=self.message_received.emit,
             on_disconnect=lambda: self._on_disconnect(generation),
         )
-        self._submit("connect", self._connect_with_timeout())
+        self._submit(label, self._connect_with_timeout())
 
     async def _connect_with_timeout(self):
         if self.client is None:
@@ -70,6 +72,7 @@ class PlayerNetworkController(QObject):
     def _on_disconnect(self, generation: int) -> None:
         if generation == self._generation and not self._intentional_disconnect:
             self.connection_changed.emit(False, "Connexion interrompue")
+            self.connection_lost.emit()
 
     def _submit(self, label: str, coroutine: Coroutine[Any, Any, Any]) -> Future[Any] | None:
         if self.loop_thread is None or not self.loop_thread.is_running:

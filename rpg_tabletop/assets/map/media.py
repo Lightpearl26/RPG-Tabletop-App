@@ -94,3 +94,25 @@ def media_size(map_dir: Path, asset: Path) -> tuple[int, int]:
     """
     size = QImageReader(str(_resolve_asset(map_dir, asset))).size()
     return (size.width(), size.height()) if size.isValid() else (0, 0)
+
+
+def reduced_image(raw: bytes, max_side: int) -> bytes:
+    """
+    An image no larger than `max_side` pixels (PNG), or `raw` itself when it is
+    already small or cannot be read. Safe in a worker thread.
+    """
+    from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt
+
+    image = QImage.fromData(raw)
+    if image.isNull() or max(image.width(), image.height()) <= max_side:
+        return raw
+    scaled = image.scaled(
+        max_side, max_side, Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    data = QByteArray()
+    buffer = QBuffer(data)
+    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    scaled.save(buffer, "PNG")
+    buffer.close()
+    return bytes(data.data()) or raw

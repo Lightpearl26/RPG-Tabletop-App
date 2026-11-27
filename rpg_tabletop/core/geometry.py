@@ -335,3 +335,35 @@ def tiles_in_box(
         for row in range(int(first_row), int(last_row) + 1)
         for col in range(int(first_col), int(last_col) + 1)
     ]
+
+
+def simplify_polyline(points: Sequence[Point], epsilon: float) -> list[int]:
+    """
+    Indices of the points to keep so that the line moves by at most `epsilon`
+    (Ramer-Douglas-Peucker, iterative). The first and last points are kept.
+    """
+    count = len(points)
+    if count <= 2 or epsilon <= 0:
+        return list(range(count))
+    keep = [False] * count
+    keep[0] = keep[-1] = True
+    stack = [(0, count - 1)]
+    while stack:
+        first, last = stack.pop()
+        (ax, ay), (bx, by) = points[first], points[last]
+        dx, dy = bx - ax, by - ay
+        length = hypot(dx, dy)
+        farthest, distance = -1, epsilon
+        for index in range(first + 1, last):
+            px, py = points[index]
+            if length == 0:
+                d = hypot(px - ax, py - ay)
+            else:
+                d = abs(dy * (px - ax) - dx * (py - ay)) / length
+            if d > distance:
+                farthest, distance = index, d
+        if farthest >= 0:
+            keep[farthest] = True
+            stack.append((first, farthest))
+            stack.append((farthest, last))
+    return [index for index, kept in enumerate(keep) if kept]

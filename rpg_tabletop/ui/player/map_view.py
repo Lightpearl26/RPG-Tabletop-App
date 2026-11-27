@@ -32,6 +32,9 @@ class PlayerMapView(QWidget):
 
     MIN_ZOOM = 0.05
     MAX_ZOOM = 6.0
+    # Without a field of view (no grid), a map shown this small (in screen
+    # pixels) is drawn from its 512 px overview instead of its tiles
+    PREVIEW_SCREEN_PX = 768
 
     def __init__(self, cache_root: str | Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -227,9 +230,22 @@ class PlayerMapView(QWidget):
         """False when the player's entity has no token on the GM's current map."""
         return self.map_data is not None and self.map_data.get("present", True) is not False
 
+    def uses_preview(self) -> bool:
+        """Whole map visible and small on screen: the overview is enough."""
+        if not self.on_map or self._fov_rect() is not None:
+            return False
+        compiled = (self._asset_data() or {}).get("compiled")
+        if not isinstance(compiled, dict):
+            return False
+        try:
+            width, height = (float(value) for value in compiled.get("size", [0, 0]))
+        except (TypeError, ValueError):
+            return False
+        return max(width, height) * self.zoom <= self.PREVIEW_SCREEN_PX
+
     def visible_tile_keys(self) -> set[str]:
         """Keys of the compiled tiles the view shows (itself limited to the field of view)."""
-        if not self.on_map or self.width() <= 0 or self.height() <= 0:
+        if not self.on_map or self.width() <= 0 or self.height() <= 0 or self.uses_preview():
             return set()
         compiled = (self._asset_data() or {}).get("compiled")
         if not isinstance(compiled, dict):
@@ -557,6 +573,9 @@ class PlayerMapView(QWidget):
             return
         tile_size = max(1, int(compiled.get("tile_size", 512)))
         ox, oy = self._origin(compiled)
+        if self.uses_preview():
+            self._draw_preview(painter, compiled)
+            return
         for key in self.visible_tile_keys():
             col, row = (int(part) for part in key.split("_", 1))
             rect = QRectF(ox + col * tile_size, oy + row * tile_size, tile_size, tile_size)
@@ -573,6 +592,24 @@ class PlayerMapView(QWidget):
                 painter.fillRect(rect, QColor("#252b36"))
                 painter.setPen(QPen(QColor("#3b4553"), 1.0 / max(self.zoom, 0.05)))
                 painter.drawRect(rect)
+
+    def _draw_preview(self, painter: QPainter, compiled: dict[str, Any]) -> None:
+        ox, oy = self._origin(compiled)
+        try:
+            width, height = (float(value) for value in compiled.get("size", [0, 0]))
+        except (TypeError, ValueError):
+            return
+        rect = QRectF(ox, oy, width, height)
+        path = self.tiles.preview_file()
+        image = self._tile_cache.get(path) if path is not None else None
+        if image is None and path is not None and path.is_file():
+            image = QImage(str(path))
+            if not image.isNull():
+                self._tile_cache[path] = image
+        if image is not None and not image.isNull():
+            painter.drawImage(rect, image)
+        else:
+            painter.fillRect(rect, QColor("#252b36"))
 
     def _tile_image(self, key: str) -> QImage | None:
         path = self.tiles.tile_file(key)
