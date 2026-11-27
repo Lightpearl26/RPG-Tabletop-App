@@ -527,7 +527,15 @@ class PlayerMapView(QWidget):
                 painter.scale(self.zoom, self.zoom)
                 painter.translate(-self.center.x, -self.center.y)
                 fov = self._fov_rect()
-                play_rect = map_rect.intersected(fov) if fov is not None else map_rect
+                if asset.get("infinite"):
+                    # An infinite map has no edge: its size only frames the
+                    # content. Grid, tokens and annotations go on beyond it, as
+                    # on the GM's screen; only the field of view limits them.
+                    play_rect = fov if fov is not None else self._view_rect()
+                    token_rect = play_rect
+                else:
+                    play_rect = map_rect.intersected(fov) if fov is not None else map_rect
+                    token_rect = map_rect
 
                 painter.fillRect(map_rect, QColor("#1e1e2e"))
                 painter.save()
@@ -554,14 +562,14 @@ class PlayerMapView(QWidget):
                 try:
                     painter.setClipRect(play_rect)
                     self._draw_movement_range(painter)
-                    self._draw_grid(painter, map_rect)
+                    self._draw_grid(painter, play_rect)
                     self._draw_targeting_preview(painter)
                 finally:
                     painter.restore()
 
                 painter.save()
                 try:
-                    painter.setClipRect(map_rect)
+                    painter.setClipRect(token_rect)
                     self._draw_tokens(painter)
                     self._draw_target_marker(painter)
                 finally:
@@ -758,9 +766,12 @@ class PlayerMapView(QWidget):
             if picture is not None:
                 clipath = QPainterPath()
                 clipath.addEllipse(rect)
-                painter.setClipPath(clipath)
+                painter.save()
+                # Within the area clip, not instead of it (it used to be dropped
+                # for every token drawn after this one)
+                painter.setClipPath(clipath, Qt.ClipOperation.IntersectClip)
                 painter.drawImage(rect, picture)
-                painter.setClipping(False)
+                painter.restore()
             else:
                 initials = "".join(part[:1] for part in name.split())[:2].upper() or "?"
                 painter.setPen(QColor("#f4f4f5"))

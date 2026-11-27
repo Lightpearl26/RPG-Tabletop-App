@@ -216,6 +216,8 @@ def _map_view(runtime: SessionRuntime, entity_id: str) -> dict[str, Any] | None:
         "name": asset.name,
         "size": [asset.width, asset.height],
         "origin": [asset.origin_x, asset.origin_y],
+        # Infinite: `size`/`origin` only frame the content; play goes on beyond
+        "infinite": bool(getattr(asset, "infinite", False)),
         "grid": asset.grid.to_dict(),
         "compiled": None,
     }

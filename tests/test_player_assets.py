@@ -197,3 +197,31 @@ def test_gm_annotations_outside_the_map_area_are_drawn(window):
     image = view.grab().toImage()
     point = view.world_to_screen(Vec2(-60, 110))
     assert image.pixelColor(int(point.x()), int(point.y())).name() == "#ff0000"
+
+
+def test_infinite_map_has_no_edge_for_the_player(window):
+    from PySide6.QtGui import QColor
+    from rpg_tabletop.assets.map import DrawingElement, DrawTool, Vec2
+
+    projection = _projection(x=1000.0)
+    # Infinite map sized to an empty content: 2 x 2 cells around the origin
+    asset = projection["map"]["asset"]
+    asset.update({"infinite": True, "size": [128, 128], "origin": [-64, -64]})
+    asset["compiled"].update({"size": [128, 128], "origin": [-64, -64]})
+    asset["grid"].update({"color": "#00ff00", "opacity": 1.0})
+    projection["map"]["fov"]["origin"] = [500.0, 500.0]
+    projection["map"]["tokens"][0]["pos"] = [500.0, 500.0]
+    rect = DrawingElement(tool=DrawTool.RECT, points=[Vec2(300, 300), Vec2(700, 700)],
+                          stroke_width=12, stroke_color="#ff0000")
+    projection["map"]["elements"] = [rect.to_dict()]
+    window._apply_projection(projection)
+    view = window.map_view
+    image = view.grab().toImage()
+
+    def color(x, y):
+        point = view.world_to_screen(Vec2(x, y))
+        return image.pixelColor(int(point.x()), int(point.y())).name()
+
+    assert color(300, 500) == "#ff0000"   # the GM's rectangle, far from the map's area
+    line = QColor(color(640, 400))
+    assert line.green() > 200 and line.red() < 40   # the grid goes on beyond the area
