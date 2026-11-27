@@ -127,14 +127,12 @@ class RuntimeWindow(QMainWindow):
         bar.setMovable(False)
         self.addToolBar(bar)
         bar.addWidget(QLabel("Carte :"))
-        self.map_combo = QComboBox()
+        self.map_combo = _MapCombo()
         self.map_combo.setMinimumWidth(210)
-        self.map_combo.addItem("— Aucune carte —", None)
-        for path in sorted(self.campaign.maps_path.iterdir()) if self.campaign.maps_path.is_dir() else []:
-            if path.is_dir() and (path / "map.json").is_file():
-                self.map_combo.addItem(path.name, path.name)
-        idx = self.map_combo.findData(self.runtime.active_map_id)
-        self.map_combo.setCurrentIndex(max(0, idx))
+        # The list is read again each time it opens: maps created, renamed or
+        # deleted in the IDE during the session show up without restarting
+        self.map_combo.about_to_open = self._refresh_map_list
+        self._refresh_map_list()
         self.map_combo.currentIndexChanged.connect(self._map_selected)
         bar.addWidget(self.map_combo)
 
@@ -385,9 +383,33 @@ class RuntimeWindow(QMainWindow):
             self.statusBar().showMessage(f"Entités ajoutées : {', '.join(added)}", 6000)
             self._runtime_changed()
 
+    def _refresh_map_list(self) -> None:
+        """Fill the map menu from the campaign folder, keeping the active map selected."""
+        maps_path = self.campaign.maps_path
+        names = sorted(
+            path.name for path in (maps_path.iterdir() if maps_path.is_dir() else [])
+            if path.is_dir() and (path / "map.json").is_file()
+        )
+        active = self.runtime.active_map_id
+        current = [self.map_combo.itemData(index) for index in range(1, self.map_combo.count())]
+        if current == names and self.map_combo.currentData() == active:
+            return
+        self.map_combo.blockSignals(True)
+        try:
+            self.map_combo.clear()
+            self.map_combo.addItem("— Aucune carte —", None)
+            for name in names:
+                self.map_combo.addItem(name, name)
+            if active is not None and active not in names:
+                self.map_combo.addItem(f"{active} (introuvable)", active)
+            self.map_combo.setCurrentIndex(max(0, self.map_combo.findData(active)))
+        finally:
+            self.map_combo.blockSignals(False)
+
     def on_asset_saved(self, resource_type: str, resource_id: str) -> None:
         """Called by the IDE each time an asset is saved."""
         if resource_type == "maps":
+            self._refresh_map_list()
             if resource_id == self.runtime.active_map_id:
                 self.map_view.reload_active_map(reset_camera=False)
                 self.broadcast_runtime_sync()
@@ -977,3 +999,14 @@ class RuntimeWindow(QMainWindow):
             self.server = None
         self._shutdown_network_runner()
         event.accept()
+
+
+class _MapCombo(QComboBox):
+    """A combo box that refreshes its items right before showing them."""
+
+    about_to_open = None
+
+    def showPopup(self) -> None:  # noqa: N802 - Qt API
+        if callable(self.about_to_open):
+            self.about_to_open()
+        super().showPopup()

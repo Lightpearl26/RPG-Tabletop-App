@@ -181,3 +181,19 @@ def test_replaced_connection_does_not_reconnect(window):
     window._on_network_message(ErrorMessage(ErrorType.CLOSED, "Replaced by a new connection"))
     window._on_connection_lost()
     assert not window._reconnect_timer.isActive()
+
+
+def test_gm_annotations_outside_the_map_area_are_drawn(window):
+    from rpg_tabletop.assets.map import DrawingElement, DrawTool, Vec2
+
+    projection = _projection(x=100.0)
+    # A line drawn left of the map's area (x < 0), inside the field of view
+    line = DrawingElement(tool=DrawTool.LINE, points=[Vec2(-60, 60), Vec2(-60, 160)],
+                          stroke_width=10, stroke_color="#ff0000")
+    projection["map"]["elements"] = [line.to_dict()]
+    projection["map"]["fov"]["origin"] = [100.0, 100.0]
+    window._apply_projection(projection)
+    view = window.map_view
+    image = view.grab().toImage()
+    point = view.world_to_screen(Vec2(-60, 110))
+    assert image.pixelColor(int(point.x()), int(point.y())).name() == "#ff0000"

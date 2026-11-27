@@ -534,6 +534,15 @@ class PlayerMapView(QWidget):
                 try:
                     painter.setClipRect(play_rect)
                     self._draw_compiled_tiles(painter, asset, map_rect)
+                finally:
+                    painter.restore()
+                # The GM's annotations can be drawn beyond the map's area (an
+                # infinite map only covers its content): limited to the field
+                # of view only, as the GM sees them
+                painter.save()
+                try:
+                    if fov is not None:
+                        painter.setClipRect(fov)
                     self._draw_runtime_elements(painter)
                 finally:
                     painter.restore()
