@@ -30,6 +30,7 @@ from rpg_tabletop.net.config import RelaySettings, ServerSettings, TLSSettings
 from rpg_tabletop.net.protocol import ChatMessage
 from rpg_tabletop.net.runner import AsyncioLoopThread
 from rpg_tabletop.net.server import RPGNetworkServer, create_runtime_server
+from rpg_tabletop.session import branches as session_branches
 from rpg_tabletop.session.journal import Session
 from rpg_tabletop.session.runtime import SessionRuntime
 from rpg_tabletop.session.targeting import TargetingError, targeting_spec
@@ -51,6 +52,8 @@ from .add_entities import AddEntitiesDialog
 class RuntimeWindow(QMainWindow):
     # File stems of the entity assets written at a session save
     assets_written = Signal(list)
+    # The window closed: the IDE may change the version of the files again
+    closed = Signal()
 
     def __init__(
         self,
@@ -516,6 +519,32 @@ class RuntimeWindow(QMainWindow):
         self.assets_written.emit([str(info["file"]) for info in written.values()])
         return sorted(str(info["name"]) for info in written.values())
 
+    def _record_point(self) -> None:
+        """A point of the session's branch at this journal position (versions history)."""
+        try:
+            session_branches.record_save(self.campaign, self.runtime.session.name, self.runtime.seq)
+        except Exception as exc:  # noqa: BLE001 - the session itself is saved
+            self.statusBar().showMessage(f"Historique des versions non mis à jour : {exc}", 8000)
+
+    def sync_assets_from_files(self) -> int:
+        """
+        Bring the files of the session's branch into the game: assets changed
+        while the session was closed, or by a merge. Returns the number of
+        changes recorded.
+        """
+        recorded = 0
+        for resource_type, kind in RESOURCE_KINDS.items():
+            directory = self.campaign.root / resource_type
+            for path in sorted(directory.glob("*.json")) if directory.is_dir() else []:
+                try:
+                    if self.runtime.sync_asset(kind, path.stem) is not None:
+                        recorded += 1
+                except Exception:  # noqa: BLE001 - an invalid file is shown by the IDE
+                    continue
+        if recorded:
+            self._runtime_changed()
+        return recorded
+
     def save_session(self) -> None:
         written = self._write_entity_assets()
         try:
@@ -523,6 +552,7 @@ class RuntimeWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Sauvegarder la session", str(exc))
             return
+        self._record_point()
         message = f"Session sauvegardée : {path}"
         if written:
             message += f"  •  fichiers mis à jour : {', '.join(written)}"
@@ -988,6 +1018,7 @@ class RuntimeWindow(QMainWindow):
         self._write_entity_assets()
         try:
             self.runtime.save()
+            self._record_point()
         except Exception:
             pass
         if self.server is not None and self.network_loop is not None:
@@ -998,6 +1029,7 @@ class RuntimeWindow(QMainWindow):
                 pass
             self.server = None
         self._shutdown_network_runner()
+        self.closed.emit()
         event.accept()
 
 

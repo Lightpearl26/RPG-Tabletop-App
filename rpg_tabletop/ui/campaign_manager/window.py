@@ -14,6 +14,7 @@ from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QDockWidget,
     QFileDialog,
     QFrame,
@@ -51,6 +52,8 @@ from rpg_tabletop.assets.campaign_library import (
 )
 from rpg_tabletop.assets.references import ReferenceUpdate
 from rpg_tabletop.core.paths import default_campaign_dir
+from rpg_tabletop.assets.versioning import CAMPAIGN, Changes, VersionStore, VersioningError
+from rpg_tabletop.session import branches as session_branches
 from rpg_tabletop.session import store as session_store
 from rpg_tabletop.ui.campaign_manager.editors.base import ResourceEditor
 from rpg_tabletop.ui.campaign_manager.editors.character import CharacterEditor
@@ -79,6 +82,7 @@ from rpg_tabletop.ui.theme.stylesheets import CAMPAIGN_MANAGER_STYLESHEET
 from .browser import ResourceBrowser
 from .document import ResourceDocument
 from .overview import RESOURCE_SECTIONS, CampaignOverview
+from .versions import ConflictDialog, HistoryDialog, VersionBar, context_label
 
 # Every editor derives from ResourceEditor, which rewrites the references to a renamed
 # resource in all the other assets (see rpg_tabletop.assets.references) and reports unsaved changes.
@@ -118,6 +122,9 @@ class CampaignManagerWindow(QMainWindow):
         self._runtime_windows: list[QMainWindow] = []
         self.overview = CampaignOverview(self.campaign)
         self._preloaded = False
+        # The history of the campaign: the IDE shows the campaign or a session
+        self.versions: VersionStore = session_branches.versions(self.campaign)
+        self._version_state = self._current_version_state()
 
         self.setObjectName("CampaignManager")
         self.setWindowTitle(f"Campaign Manager - {self.campaign.name}")
@@ -157,6 +164,15 @@ class CampaignManagerWindow(QMainWindow):
         toolbar.addWidget(self.campaign_name_label)
         toolbar.addWidget(self.campaign_path_label)
         toolbar.addSeparator()
+        self.version_bar = VersionBar(self)
+        self.version_bar.context_requested.connect(self._on_context_requested)
+        self.version_bar.new_session_requested.connect(self._on_new_version_session)
+        self.version_bar.push_requested.connect(self._on_push_session)
+        self.version_bar.pull_requested.connect(self._on_pull_campaign)
+        self.version_bar.merge_requested.connect(self._on_merge_session)
+        self.version_bar.history_requested.connect(self._on_history)
+        toolbar.addWidget(self.version_bar)
+        self.version_bar.refresh(self.versions)
 
         spacer = QWidget()
         spacer.setSizePolicy(
@@ -587,6 +603,8 @@ class CampaignManagerWindow(QMainWindow):
 
     def load_campaign(self, campaign: Campaign) -> None:
         """Switch the window to `campaign`, discarding all open pages without asking."""
+        if campaign is not self.campaign or getattr(self, "versions", None) is None:
+            self.versions = session_branches.versions(campaign)
         self.campaign = campaign
         for page in self._category_pages.values():
             page.deleteLater()
@@ -619,6 +637,8 @@ class CampaignManagerWindow(QMainWindow):
         self.navigation.setCurrentRow(0)
         self.documents.setCurrentWidget(self.overview)
         self._preload_categories()
+        self._version_state = self._current_version_state()
+        self._refresh_versions()
 
     def _connect_signals(self) -> None:
         self.navigation.currentRowChanged.connect(self._on_navigation_changed)
@@ -793,6 +813,12 @@ class CampaignManagerWindow(QMainWindow):
     ) -> None:
         resource_id = Path(file_path).stem
         self._notify_runtimes(resource_type, resource_id)
+        if resource_type != "sessions":
+            try:
+                self.versions.save_point(f"{self._singular_title(resource_type)} « {resource_id} » enregistré")
+                self._version_state = self._current_version_state()
+            except (OSError, VersioningError) as error:
+                self.statusBar().showMessage(f"Historique non mis à jour : {error}", 6000)
         self._document_pages = {
             key: page
             for key, page in self._document_pages.items()
@@ -823,14 +849,26 @@ class CampaignManagerWindow(QMainWindow):
         for w in self._runtime_windows:
             if w.isVisible() and w.runtime.session.name == name:
                 w.raise_(); w.activateWindow(); return
+        # The game runs on the session's version of the files
+        if not self._checkout_for_session(name):
+            return
         try:
             window = RuntimeWindow.open_saved(self.campaign, self.campaign.session_path(name))
         except Exception as error:
             self.statusBar().showMessage(f"Impossible d'ouvrir {name} : {error}", 6000); return
         self._show_runtime_window(window)   # à extraire de _on_start_session_clicked
+        # What changed in the session's files while it was closed (merges, edits)
+        recorded = window.sync_assets_from_files()
+        if recorded:
+            self.statusBar().showMessage(f"{recorded} asset(s) mis à jour dans la session {name}.", 6000)
 
     def _on_sessions_changed(self) -> None:
         self._refresh_category("sessions"); self.overview.refresh_counts()
+        # Restoring or deleting a session can change the files (its branch)
+        if self._current_version_state() != self._version_state:
+            self.load_campaign(self.campaign)
+        else:
+            self._refresh_versions()
 
     def _on_resource_renamed(
         self,
@@ -1020,6 +1058,7 @@ class CampaignManagerWindow(QMainWindow):
     def _show_runtime_window(self, window: RuntimeWindow) -> None:
         self.start_session_requested.emit()
         self._runtime_windows.append(window)
+        window.closed.connect(self._refresh_versions)
         window.assets_written.connect(self._on_runtime_assets_written)
         window.destroyed.connect(
             lambda _obj=None, window=window: (
@@ -1031,6 +1070,7 @@ class CampaignManagerWindow(QMainWindow):
         window.raise_()
         window.activateWindow()
         self.overview.refresh_counts()
+        self._refresh_versions()
         self.statusBar().showMessage(f"Session lancée : {window.runtime.session.name}", 5000)
 
     def _on_runtime_assets_written(self, stems: list) -> None:
@@ -1065,6 +1105,222 @@ class CampaignManagerWindow(QMainWindow):
                 "écrits par la session.",
             )
 
+    # ----------------------------------------------------------- versions
+    def _current_version_state(self) -> tuple[str, str | None]:
+        try:
+            current = self.versions.current()
+            return current, self.versions.tip(current)
+        except (OSError, VersioningError, ValueError):
+            return "", None
+
+    def _running_session(self) -> str | None:
+        for window in self._runtime_windows:
+            if window.isVisible():
+                return window.runtime.session.name
+        return None
+
+    def _refresh_versions(self) -> None:
+        if hasattr(self, "version_bar"):
+            self.version_bar.refresh(self.versions, self._running_session())
+            self.setWindowTitle(
+                f"Campaign Manager - {self.campaign.name} — {context_label(self.versions.current())}"
+            )
+
+    def _files_will_change(self) -> bool:
+        """Open editors would show stale files: save or discard their changes first."""
+        return self._confirm_close(self._open_editors())
+
+    def _files_changed(self, changes: Changes | None, *, notify_runtimes: bool = True) -> None:
+        """After an operation rewrote files: reload the IDE and tell a running game."""
+        if changes is None or changes.paths:
+            self.load_campaign(self.campaign)
+        if notify_runtimes and changes is not None:
+            for resource_type, resource_id in sorted(changes.resources()):
+                self._notify_runtimes(resource_type, resource_id)
+        self._version_state = self._current_version_state()
+        self._refresh_versions()
+
+    def _checkout_for_session(self, name: str) -> bool:
+        """Put the files on the session's branch before its game opens."""
+        running = self._running_session()
+        if running is not None and running != name:
+            QMessageBox.information(
+                self, "Session en cours",
+                f"La session « {running} » est en cours. Les fichiers de la campagne ne peuvent "
+                "montrer qu'une version à la fois : ferme-la avant d'ouvrir une autre session.",
+            )
+            return False
+        if self.versions.has_session(name) and self.versions.current() == name:
+            return True
+        if not self._files_will_change():
+            return False
+        try:
+            changes = session_branches.checkout(self.campaign, name)
+        except (OSError, VersioningError) as error:
+            QMessageBox.warning(self, "Session", f"Impossible de passer sur la session « {name} » : {error}")
+            return False
+        self._files_changed(changes, notify_runtimes=False)
+        return True
+
+    def _on_context_requested(self, session: str) -> None:
+        if session == self.versions.current():
+            return
+        if self._running_session() is not None or not self._files_will_change():
+            self._refresh_versions()
+            return
+        try:
+            changes = self.versions.switch(session)
+        except (OSError, VersioningError) as error:
+            QMessageBox.warning(self, "Contexte", str(error))
+            self._refresh_versions()
+            return
+        self._files_changed(changes, notify_runtimes=False)
+        self.statusBar().showMessage(f"Contexte : {context_label(session)}", 5000)
+
+    def _ask_session_name(self, title: str, suggestion: str) -> str | None:
+        name, accepted = QInputDialog.getText(self, title, "Nom de la session :",
+                                              text=session_store.unique_name(self.campaign, suggestion))
+        name = session_store.normalize_name(name.strip()) if accepted and name.strip() else ""
+        if not name:
+            return None
+        if self.versions.has_session(name) or self.campaign.session_path(name).exists():
+            QMessageBox.warning(self, title, f"La session « {name} » existe déjà.")
+            return None
+        return name
+
+    def _on_new_version_session(self) -> None:
+        source = self.versions.current()
+        name = self._ask_session_name(f"Nouvelle session depuis {context_label(source).lower()}", "Nouvelle session")
+        if name is None:
+            return
+        try:
+            session_store.create(self.campaign, name, entities=[], map_id=None)
+        except (OSError, ValueError, VersioningError) as error:
+            QMessageBox.warning(self, "Nouvelle session", str(error))
+            return
+        self._on_sessions_changed()
+        if self._running_session() is None:
+            self._on_context_requested(name)
+        self.statusBar().showMessage(f"Session « {name} » créée depuis {context_label(source).lower()}.", 6000)
+
+    def _on_push_session(self) -> None:
+        session = self.versions.current()
+        if session == CAMPAIGN:
+            return
+        answer = QMessageBox.question(
+            self, "Envoyer dans la campagne",
+            f"La campagne va devenir exactement la session « {session} » : tous ses assets "
+            "(entités, objets, sorts, personnages, cartes) remplacent ceux de la campagne.\n\n"
+            "Les autres sessions ne changent pas ; elles pourront récupérer la campagne.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.versions.push(session)
+        except (OSError, VersioningError) as error:
+            QMessageBox.warning(self, "Envoyer dans la campagne", str(error))
+            return
+        self._files_changed(Changes())
+        self.statusBar().showMessage(f"La campagne est maintenant la session « {session} ».", 6000)
+
+    def _on_pull_campaign(self) -> None:
+        session = self.versions.current()
+        if session == CAMPAIGN or not self._files_will_change():
+            return
+        try:
+            changes, conflicts = self.versions.pull(session)
+        except (OSError, VersioningError) as error:
+            QMessageBox.warning(self, "Récupérer la campagne", str(error))
+            return
+        self._files_changed(changes)
+        message = f"{len(changes.assets)} asset(s) repris de la campagne."
+        if conflicts:
+            listing = "\n".join(f"- {c.asset} : {', '.join(c.fields) or 'version entière'}" for c in conflicts)
+            QMessageBox.information(
+                self, "Récupérer la campagne",
+                f"{message}\n\nConflits tranchés en faveur de la campagne :\n{listing}",
+            )
+        self.statusBar().showMessage(message, 6000)
+
+    def _on_merge_session(self) -> None:
+        target = self.versions.current()
+        sources = [name for name in self.versions.sessions() if name != target]
+        if target == CAMPAIGN or not sources:
+            return
+        source, accepted = QInputDialog.getItem(
+            self, "Fusionner une session", f"Reprendre dans « {target} » les changements de :", sources, 0, False
+        )
+        if not accepted or not self._files_will_change():
+            return
+
+        def resolve(conflicts):
+            dialog = ConflictDialog(self.versions, conflicts, target, source, self)
+            return dialog.choices() if dialog.exec() == QDialog.DialogCode.Accepted else None
+
+        try:
+            changes, conflicts = self.versions.merge(source, target, resolve)
+        except (OSError, VersioningError) as error:
+            QMessageBox.warning(self, "Fusionner une session", str(error))
+            return
+        self._files_changed(changes)
+        self.statusBar().showMessage(
+            f"« {source} » fusionnée dans « {target} » ({len(changes.assets)} asset(s), "
+            f"{len(conflicts)} conflit(s) résolu(s)).", 8000,
+        )
+
+    def _on_history(self) -> None:
+        session = self.versions.current()
+        running = self._running_session()
+        dialog = HistoryDialog(self.versions, session, can_reset=running != session, parent=self)
+        dialog.branch_requested.connect(lambda point: self._branch_from_point(session, point))
+        dialog.reset_requested.connect(lambda point: self._reset_to_point(session, point))
+        dialog.exec()
+
+    def _branch_from_point(self, session: str, point_id: str) -> None:
+        name = self._ask_session_name("Nouvelle session depuis ce point", f"{session or 'Campagne'} (bis)")
+        if name is None:
+            return
+        point = self.versions.point(point_id)
+        seq = point.meta.get("session_seq")
+        try:
+            if session != CAMPAIGN and isinstance(seq, int) and self.campaign.session_path(session).exists():
+                # Same moment of the game: the journal is cut there too
+                self.versions.create_session(name, point=point_id)
+                session_store.branch(self.campaign, session, name, seq)
+            else:
+                self.versions.create_session(name, point=point_id)
+                session_store.create(self.campaign, name, entities=[], map_id=None)
+        except (OSError, ValueError, VersioningError) as error:
+            QMessageBox.warning(self, "Nouvelle session", str(error))
+            return
+        self._on_sessions_changed()
+        self.statusBar().showMessage(f"Session « {name} » créée depuis le point choisi.", 6000)
+
+    def _reset_to_point(self, session: str, point_id: str) -> None:
+        point = self.versions.point(point_id)
+        answer = QMessageBox.question(
+            self, "Revenir à ce point",
+            f"{context_label(session)} revient au point « {point.message} » ({point.time[:19].replace('T', ' ')}).\n"
+            "Tout ce qui a été fait après est abandonné dans ce contexte.",
+        )
+        if answer != QMessageBox.StandardButton.Yes or not self._files_will_change():
+            return
+        seq = point.meta.get("session_seq")
+        try:
+            if session != CAMPAIGN and isinstance(seq, int) and self.campaign.session_path(session).exists():
+                from rpg_tabletop.session.journal import Session
+                journal = Session.load(self.campaign.session_path(session))
+                if seq < journal.current_seq:
+                    # The journal of the game goes back to the same moment (a copy is kept)
+                    session_store.restore(self.campaign, session, seq)
+            self.versions.reset(session, point_id)
+        except (OSError, ValueError, VersioningError) as error:
+            QMessageBox.warning(self, "Revenir à ce point", str(error))
+            return
+        self._on_sessions_changed()
+        self._files_changed(None, notify_runtimes=False)
+        self.statusBar().showMessage(f"{context_label(session)} est revenue au point choisi.", 6000)
+
     def _on_start_session_clicked(self) -> None:
         name, accepted = QInputDialog.getText(
             self,
@@ -1074,6 +1330,15 @@ class CampaignManagerWindow(QMainWindow):
         )
         name = name.strip()
         if not accepted or not name:
+            return
+        # A new session is a new branch, from what the IDE shows now
+        try:
+            if not self.versions.has_session(name):
+                self.versions.create_session(name, source=self.versions.current())
+        except VersioningError as error:
+            QMessageBox.warning(self, "Nouvelle session", str(error))
+            return
+        if not self._checkout_for_session(name):
             return
         runtime_window = RuntimeWindow.start_new(self.campaign, name)
 

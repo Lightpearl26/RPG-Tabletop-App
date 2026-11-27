@@ -26,6 +26,7 @@ from typing import Iterator, Optional, Sequence
 from uuid import uuid4
 
 from rpg_tabletop.assets.campaign import Campaign
+from . import branches as _branches
 from .entity import Entity
 from .journal import SESSION_FILE, Session
 from .runtime import SessionRuntime
@@ -304,6 +305,11 @@ def create(
     target = campaign.session_path(name)
     if target.exists():
         raise FileExistsError(f"A session already uses this folder: {target}")
+    # The session is a branch of the campaign history, started from the
+    # files as they are now (the campaign or the current session)
+    store = _branches.versions(campaign)
+    if not store.has_session(name):
+        store.create_session(name, source=store.current())
     runtime = SessionRuntime.start_new(
         name, campaign, entities=_load_entities(entities), initial_map_id=map_id
     )
@@ -422,11 +428,14 @@ def branch(
     Save the session as it was after event `seq` (default: now) under a new name.
     """
     session = Session.load(campaign.session_path(name))
-    return _save_as_new(
-        campaign,
-        truncate(session, session.current_seq if seq is None else seq),
-        new_name,
-    )
+    seq = session.current_seq if seq is None else seq
+    store = _branches.ensure_branch(campaign, name)
+    target = _save_as_new(campaign, truncate(session, seq), new_name)
+    # Its assets start where the source session's were at that moment
+    point = _branches.point_at(store, name, seq) if seq < session.current_seq else None
+    if not store.has_session(target.name):
+        store.create_session(target.name, source=name, point=point)
+    return target
 
 
 def duplicate(campaign: Campaign, name: str, new_name: str) -> Path:
@@ -460,6 +469,11 @@ def restore(
         else None
     )
     truncate(session, seq).save(directory)
+    # The assets go back too, to the point saved at that moment (if any)
+    store = _branches.ensure_branch(campaign, name)
+    point = _branches.point_at(store, name, int(seq))
+    if point is not None and point != store.tip(name):
+        store.reset(name, point)
     return backup
 
 
@@ -483,6 +497,9 @@ def rename(campaign: Campaign, name: str, new_name: str) -> Path:
     except BaseException:
         target.rename(source)
         raise
+    store = _branches.versions(campaign)
+    if store.has_session(name):
+        store.rename_session(name, new_name)
     return target
 
 def delete(campaign: Campaign, name: str) -> None:
@@ -496,3 +513,8 @@ def delete(campaign: Campaign, name: str) -> None:
     shutil.rmtree(trash, ignore_errors=True)
     source.rename(trash)
     shutil.rmtree(trash, ignore_errors=True)
+    store = _branches.versions(campaign)
+    if store.has_session(name):
+        if store.current() == name:
+            store.switch(_branches.CAMPAIGN)  # back on the campaign's files
+        store.delete_session(name)
