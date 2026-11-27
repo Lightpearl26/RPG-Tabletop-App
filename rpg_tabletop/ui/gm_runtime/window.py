@@ -23,7 +23,6 @@ from PySide6.QtWidgets import (
 
 from rpg_tabletop.assets.map import DrawTool
 from rpg_tabletop.core.paths import adopt_legacy_certificate, server_certificate_files
-from rpg_tabletop.net.assets import AssetCatalog
 from rpg_tabletop.net.commands import ActionIntent, ActionKind, TargetSelection
 from rpg_tabletop.net.gateway import GM_USER, GatewayResult, RuntimeNetworkGateway
 from rpg_tabletop.net.models import PendingRequest, PendingStatus
@@ -667,15 +666,6 @@ class RuntimeWindow(QMainWindow):
             enable_upnp=self.network_panel.upnp.isChecked(),
         )
 
-    def _asset_catalog(self) -> AssetCatalog:
-        catalog = AssetCatalog()
-        if self.campaign.maps_path.is_dir():
-            catalog.register_root("maps", self.campaign.maps_path)
-        token_dir = self.campaign.character_path / "tokens"
-        if token_dir.is_dir():
-            catalog.register_root("character_tokens", token_dir)
-        return catalog
-
     def start_server(self) -> None:
         if self.server is not None:
             return
@@ -688,7 +678,6 @@ class RuntimeWindow(QMainWindow):
                 self.runtime,
                 settings,
                 gateway=self.gateway,
-                asset_catalog=self._asset_catalog(),
                 on_log=self.bridge.on_log,
                 on_pending_updated=self.bridge.on_pending_updated,
                 on_client_connected=self.bridge.on_client_connected,

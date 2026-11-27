@@ -11,7 +11,7 @@ import socket
 from time import monotonic
 from typing import Any, Callable
 
-from .assets import AssetCatalog
+from .assets import file_chunks, parse_ref
 from .commands import ClientCommand, ServerCommand
 from .config import ServerSettings
 from .connection import NetworkConnection
@@ -23,7 +23,6 @@ from .protocol import (
     NetworkMessage, PingMessage,
 )
 from .relay import RelayEndpoint, VPSRelay
-from .sync_cache import compact_projection
 from .tls import build_server_ssl_context, certificate_fingerprint, ensure_server_certificate
 from .upnp import UPnPPortMapping, UPnPStatus
 
@@ -34,9 +33,7 @@ ChatCallback = Callable[[str, str], None]
 
 # Asset requests are queued and streamed by a background task per player, so a
 # big map never blocks the reading of that player's messages (pongs included).
-ASSET_COMMANDS = frozenset({
-    ClientCommand.ASSET_MANIFEST_REQUEST.value, ClientCommand.ASSET_REQUEST.value,
-})
+ASSET_COMMANDS = frozenset({ClientCommand.ASSET_REQUEST.value})
 MAX_ASSET_ITEMS_PER_REQUEST = 1024
 MAX_ASSET_QUEUE = 4096
 # A message to one player may not hold the others back longer than this
@@ -58,14 +55,11 @@ class ServerClientSession:
     last_ping_id: int | None = None
     ping_ms: int | None = None
     recent_messages: deque[float] = field(default_factory=deque)
-    # Assets waiting to be streamed, as (namespace, path)
-    asset_queue: deque[tuple[str, str]] = field(default_factory=deque)
+    # Assets waiting to be answered: reference -> hash of the copy the player has
+    asset_queue: dict[str, str] = field(default_factory=dict)
     asset_wakeup: asyncio.Event = field(default_factory=asyncio.Event)
     asset_task: asyncio.Task[None] | None = None
     assets_sent: int = 0
-    # Heavy projection parts this connection already received (net.sync_cache)
-    sent_images: set[str] = field(default_factory=set)
-    sent_compiled: set[str] = field(default_factory=set)
 
 
 class RPGNetworkServer:
@@ -74,7 +68,6 @@ class RPGNetworkServer:
         settings: ServerSettings,
         *,
         gateway: RuntimeNetworkGateway | None = None,
-        asset_catalog: AssetCatalog | None = None,
         player_bindings: dict[str, str] | None = None,
         on_log: LogCallback | None = None,
         on_pending: PendingCallback | None = None,
@@ -87,7 +80,6 @@ class RPGNetworkServer:
         settings.validate()
         self.settings = settings
         self.gateway = gateway
-        self.asset_catalog = asset_catalog
         self.player_bindings = dict(player_bindings or {})
         self.on_log = on_log or (lambda _message: None)
         self.on_pending = on_pending
@@ -350,23 +342,11 @@ class RPGNetworkServer:
         *,
         reply_to: str | None = None,
     ) -> CommandMessage:
-        """A RUNTIME_SYNC for this player, without what their connection already has."""
         if projection is None:
             if self.gateway is None:
                 raise RuntimeError("No RuntimeNetworkGateway is connected")
             projection = self.gateway.projection_for(session.username)
-        compact = compact_projection(projection, session.sent_images, session.sent_compiled)
-        return CommandMessage(ServerCommand.RUNTIME_SYNC.value, {"projection": compact}, reply_to=reply_to)
-
-    def _for_session(self, session: ServerClientSession, message: NetworkMessage) -> NetworkMessage:
-        """Compact the RUNTIME_SYNC messages the gateway built for this player."""
-        if (
-            isinstance(message, CommandMessage)
-            and message.command == ServerCommand.RUNTIME_SYNC.value
-            and isinstance(message.args.get("projection"), dict)
-        ):
-            return self._runtime_sync_message(session, message.args["projection"], reply_to=message.reply_to)
-        return message
+        return CommandMessage(ServerCommand.RUNTIME_SYNC.value, {"projection": projection}, reply_to=reply_to)
 
     async def bind_player(self, username: str, entity_id: str) -> None:
         if username not in self.clients:
@@ -483,19 +463,15 @@ class RPGNetworkServer:
             await self._apply_gateway_result(session.username, result)
 
     async def _handle_asset_command(self, session: ServerClientSession, request: CommandMessage) -> None:
-        if self.asset_catalog is None:
+        """
+        ASSET_REQUEST {"items": [{"ref": "...", "have": "<hash>"}], "replace": bool}
+
+        Only queued here; each reference is checked and answered by the
+        player's asset task when its turn comes.
+        """
+        if self.gateway is None:
             await session.connection.send(ErrorMessage(
-                ErrorType.INVALID_STATE, "Asset service is disabled", reply_to=request.message_id
-            ))
-            return
-        if request.command == ClientCommand.ASSET_MANIFEST_REQUEST.value:
-            namespaces = request.args.get("namespaces")
-            if namespaces is not None and not isinstance(namespaces, list):
-                raise ValueError("namespaces must be a list")
-            entries = await asyncio.to_thread(self.asset_catalog.manifest, namespaces)
-            manifest = [entry.to_dict() for entry in entries]
-            await session.connection.send(CommandMessage(
-                ServerCommand.ASSET_MANIFEST.value, {"manifest": manifest}, reply_to=request.message_id
+                ErrorType.INVALID_STATE, "No game runtime is connected", reply_to=request.message_id
             ))
             return
         items = request.args.get("items", [])
@@ -505,32 +481,27 @@ class RPGNetworkServer:
         # files it no longer needs are dropped instead of being sent anyway.
         if request.args.get("replace"):
             session.asset_queue.clear()
-        queued = set(session.asset_queue)
         for item in items:
             if not isinstance(item, dict):
                 continue
-            key = (str(item.get("namespace", "")), str(item.get("path", "")))
-            if not key[0] or not key[1] or key in queued:
+            ref = str(item.get("ref", ""))
+            if not ref or ref in session.asset_queue:
                 continue
             if len(session.asset_queue) >= MAX_ASSET_QUEUE:
                 break
-            session.asset_queue.append(key)
-            queued.add(key)
+            session.asset_queue[ref] = str(item.get("have") or "")[:128]
         if session.asset_task is None or session.asset_task.done():
             session.asset_task = asyncio.create_task(self._asset_worker(session))
         session.asset_wakeup.set()
 
     async def _asset_worker(self, session: ServerClientSession) -> None:
         """
-        Stream the queued assets of one player, one chunk per message.
+        Answer the queued references of one player, in order.
 
-        Each chunk takes the connection's send lock on its own, so heartbeats,
-        syncs and replies go out between two chunks instead of after the whole
-        map, and the player's own messages keep being read meanwhile.
+        A file goes as one ASSET_CHUNK per 64 KB, each taking the connection's
+        send lock on its own: heartbeats, syncs and replies go out between two
+        chunks, and the player's own messages keep being read meanwhile.
         """
-        catalog = self.asset_catalog
-        if catalog is None:
-            return
         try:
             while self.is_running and session.connection.is_active:
                 if not session.asset_queue:
@@ -543,13 +514,31 @@ class RPGNetworkServer:
                     if not session.asset_queue:
                         await session.asset_wakeup.wait()
                     continue
-                namespace, path = session.asset_queue.popleft()
+                raw_ref = next(iter(session.asset_queue))
+                have = session.asset_queue.pop(raw_ref)
+                gateway = self.gateway
+                if gateway is None:
+                    return
                 try:
-                    chunks = await asyncio.to_thread(lambda: list(catalog.chunks(namespace, path)))
-                except (KeyError, ValueError, OSError) as exc:
+                    ref = parse_ref(raw_ref)
+                except ValueError as exc:
                     await session.connection.send(CommandMessage(
-                        ServerCommand.ASSET_FAILED.value,
-                        {"namespace": namespace, "path": path, "reason": str(exc)},
+                        ServerCommand.ASSET_STATUS.value,
+                        {"ref": raw_ref, "status": "denied", "reason": str(exc)},
+                    ))
+                    continue
+                # Checked now, against the session as it is when the file leaves
+                answer = gateway.asset_answer(session.username, ref, have)
+                if answer.path is None:
+                    await session.connection.send(CommandMessage(
+                        ServerCommand.ASSET_STATUS.value, answer.status_args()
+                    ))
+                    continue
+                try:
+                    chunks = await asyncio.to_thread(lambda: list(file_chunks(ref, answer.path, answer.extra)))
+                except OSError:
+                    await session.connection.send(CommandMessage(
+                        ServerCommand.ASSET_STATUS.value, {"ref": raw_ref, "status": "missing"}
                     ))
                     continue
                 for chunk in chunks:
@@ -565,12 +554,12 @@ class RPGNetworkServer:
         session = self.clients.get(username)
         if session is not None:
             for reply in result.replies:
-                await session.connection.send(self._for_session(session, reply))
+                await session.connection.send(reply)
         for recipient, message in result.outbox:
             target = self.clients.get(recipient)
             if target is None:
                 continue
-            await self._safe_send(target, self._for_session(target, message))
+            await self._safe_send(target, message)
         if result.broadcast_sync:
             await self.broadcast_runtime_sync()
 
@@ -727,7 +716,6 @@ def create_runtime_server(
     *,
     action_preparer=None,
     action_executor=None,
-    asset_catalog: AssetCatalog | None = None,
     player_bindings: dict[str, str] | None = None,
     gateway: RuntimeNetworkGateway | None = None,
     **server_callbacks,
@@ -748,7 +736,6 @@ def create_runtime_server(
     server = RPGNetworkServer(
         settings,
         gateway=gateway,
-        asset_catalog=asset_catalog,
         player_bindings=player_bindings,
         **server_callbacks,
     )

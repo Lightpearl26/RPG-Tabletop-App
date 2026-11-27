@@ -12,13 +12,13 @@ import pytest
 
 pytest.importorskip("cryptography")
 
-from rpg_tabletop.net.assets import AssetCatalog  # noqa: E402
+from rpg_tabletop.net.asset_service import AssetAnswer  # noqa: E402
+from rpg_tabletop.net.assets import AssetStatus  # noqa: E402
 from rpg_tabletop.net.client import RPGNetworkClient  # noqa: E402
 from rpg_tabletop.net.commands import ServerCommand  # noqa: E402
 from rpg_tabletop.net.config import ClientSettings, ServerSettings, TLSSettings  # noqa: E402
 from rpg_tabletop.net.protocol import CommandMessage  # noqa: E402
 from rpg_tabletop.net.server import RPGNetworkServer  # noqa: E402
-from rpg_tabletop.net.sync_cache import compact_projection, expand_projection  # noqa: E402
 
 
 def _free_port() -> int:
@@ -45,7 +45,8 @@ def _client(port: int, tmp_path, name="bob", **kwargs) -> RPGNetworkClient:
 class StubGateway:
     """Just enough of RuntimeNetworkGateway for the server."""
 
-    def __init__(self, projection=None, fail=False):
+    def __init__(self, projection=None, fail=False, files=None):
+        self.files = files or {}  # tile key -> file the player may have
         self.on_pending = None
         self.runtime = SimpleNamespace(entities={})
         self._bindings: dict[str, str] = {}
@@ -72,6 +73,12 @@ class StubGateway:
     def forget_initiative(self, username):
         return False
 
+    def asset_answer(self, username, ref, have=""):
+        path = self.files.get(ref.name) if ref.kind == "tile" and ref.map_id == "m" else None
+        if path is None:
+            return AssetAnswer(ref, AssetStatus.DENIED)
+        return AssetAnswer(ref, path=path, extra={"hash": ref.name, "version": "v1"})
+
     def handle(self, username, message):
         raise AttributeError("unexpected bug in a handler")
 
@@ -80,39 +87,44 @@ def run(coro):
     return asyncio.run(asyncio.wait_for(coro, 60))
 
 
+def _tile_files(tmp_path, count, size):
+    root = tmp_path / "maps" / "m" / "tiles"
+    root.mkdir(parents=True)
+    files = {}
+    for index in range(count):
+        path = root / f"{index}_0.webp"
+        path.write_bytes(os.urandom(size))
+        files[f"{index}_0"] = path
+    return files
+
+
 def test_big_asset_transfer_does_not_block_pings_or_commands(tmp_path):
-    root = tmp_path / "maps"
-    (root / "m" / "tiles").mkdir(parents=True)
-    files = []
-    for index in range(40):
-        (root / "m" / "tiles" / f"{index}_0.webp").write_bytes(os.urandom(300_000))
-        files.append({"namespace": "maps", "path": f"m/tiles/{index}_0.webp"})
-    catalog = AssetCatalog()
-    catalog.register_root("maps", root)
+    files = _tile_files(tmp_path, 40, 300_000)
 
     async def scenario():
         port = _free_port()
-        server = RPGNetworkServer(_settings(tmp_path, port), asset_catalog=catalog, gateway=StubGateway())
+        server = RPGNetworkServer(_settings(tmp_path, port), gateway=StubGateway(files=files))
         await server.start()
         received = []
         client = _client(port, tmp_path, on_message=received.append)
         try:
             await client.connect()
+            refs = [{"ref": f"tile:m:{index}_0"} for index in range(40)]
             # Several requests in a row: queued, not counted by the rate limit
             for start in range(0, 40, 4):
-                await client.request_assets(files[start:start + 4])
+                await client.request_assets(refs[start:start + 4])
             pings = []
-            for _ in range(60):
+            for _ in range(80):
                 await asyncio.sleep(0.05)
                 ping = server.clients["bob"].ping_ms
                 if ping is not None:
                     pings.append(ping)
-                if sum(1 for m in received if getattr(m, "command", "") == "ASSET_DONE"):
+                if any(getattr(m, "command", "") == "ASSET_DONE" for m in received):
                     break
             assert client.is_connected and "bob" in server.clients
             done = [m for m in received if getattr(m, "command", "") == ServerCommand.ASSET_CHUNK.value]
             assert len(done) == 40  # one interface message per complete file
-            assert all(m.args.get("complete") for m in done)
+            assert all(m.args.get("complete") and m.args.get("version") == "v1" for m in done)
             assert pings and max(pings) < 1500
         finally:
             await client.disconnect()
@@ -121,38 +133,37 @@ def test_big_asset_transfer_does_not_block_pings_or_commands(tmp_path):
     run(scenario())
     cache = tmp_path / "cache-bob" / "maps" / "m" / "tiles"
     assert len(list(cache.iterdir())) == 40
+    assert (cache / "7_0").read_bytes() == files["7_0"].read_bytes()
 
 
 def test_replace_drops_assets_that_left_the_screen(tmp_path):
-    root = tmp_path / "maps"
-    (root / "m").mkdir(parents=True)
-    for index in range(200):
-        (root / "m" / f"{index}.bin").write_bytes(os.urandom(80_000))
-    catalog = AssetCatalog()
-    catalog.register_root("maps", root)
+    files = _tile_files(tmp_path, 200, 80_000)
 
     async def scenario():
         port = _free_port()
-        server = RPGNetworkServer(_settings(tmp_path, port), asset_catalog=catalog)
+        server = RPGNetworkServer(_settings(tmp_path, port), gateway=StubGateway(files=files))
         await server.start()
-        client = _client(port, tmp_path)
+        statuses = []
+        client = _client(port, tmp_path, on_message=statuses.append)
         try:
             await client.connect()
-            await client.request_assets([{"namespace": "maps", "path": f"m/{i}.bin"} for i in range(200)])
+            await client.request_assets([{"ref": f"tile:m:{i}_0"} for i in range(200)])
             await asyncio.sleep(0.05)
-            await client.request_assets([{"namespace": "maps", "path": "m/199.bin"}], replace=True)
+            await client.request_assets([{"ref": "tile:m:199_0"}, {"ref": "tile:other:0_0"}], replace=True)
             for _ in range(100):
                 await asyncio.sleep(0.05)
-                if (tmp_path / "cache-bob" / "maps" / "m" / "199.bin").is_file():
+                if (tmp_path / "cache-bob" / "maps" / "m" / "tiles" / "199_0").is_file():
                     break
             await asyncio.sleep(0.3)
         finally:
             await client.disconnect()
             await server.stop()
+        denied = [m.args for m in statuses if getattr(m, "command", "") == "ASSET_STATUS"]
+        assert {"ref": "tile:other:0_0", "status": "denied"} in denied
 
     run(scenario())
-    received = list((tmp_path / "cache-bob" / "maps" / "m").iterdir())
-    assert (tmp_path / "cache-bob" / "maps" / "m" / "199.bin") in received
+    received = list((tmp_path / "cache-bob" / "maps" / "m" / "tiles").iterdir())
+    assert (tmp_path / "cache-bob" / "maps" / "m" / "tiles" / "199_0") in received
     assert len(received) < 100
 
 
@@ -225,26 +236,6 @@ def test_a_handler_bug_or_a_burst_does_not_disconnect(tmp_path):
     run(scenario())
 
 
-def test_heavy_projection_parts_are_sent_once_per_connection():
-    compiled = {"signature": "abc", "tiles": {"0_0": "h"}, "format": "webp"}
-    token = {"id": "t", "image": "ff00", "image_id": "img1"}
-    projection = {"map": {"asset": {"compiled": compiled}, "tokens": [dict(token)]}}
-    images, compiled_seen = set(), set()
-
-    first = compact_projection(projection, images, compiled_seen)
-    second = compact_projection(projection, images, compiled_seen)
-    assert first["map"]["tokens"][0]["image"] == "ff00"
-    assert "image" not in second["map"]["tokens"][0]
-    assert second["map"]["asset"]["compiled"] == {"signature": "abc", "cached": True}
-    assert projection["map"]["asset"]["compiled"] is compiled  # source untouched
-
-    client_images, client_compiled = {}, {}
-    expand_projection(first, client_images, client_compiled)
-    expanded = expand_projection(second, client_images, client_compiled)
-    assert expanded["map"]["tokens"][0]["image"] == "ff00"
-    assert expanded["map"]["asset"]["compiled"] == compiled
-
-
 def test_player_without_token_on_the_gm_map_gets_no_map_content():
     pytest.importorskip("PySide6")
     from rpg_tabletop.assets.map import MapAsset, Vec2
@@ -262,3 +253,54 @@ def test_player_without_token_on_the_gm_map_gets_no_map_content():
     assert view["present"] is False
     assert view["asset"]["compiled"] is None and view["fov"] is None
     assert view["tokens"] == [] and view["elements"] == []
+
+
+@pytest.fixture
+def compiled_map(tmp_path):
+    pytest.importorskip("PySide6")
+    from PySide6.QtGui import QGuiApplication
+    from rpg_tabletop.assets.map import DrawingElement, DrawTool, MapAsset, Vec2, supported_tile_formats
+    from rpg_tabletop.session.models import SessionMapState, SessionToken
+
+    QGuiApplication.instance() or QGuiApplication([])
+    if not supported_tile_formats():
+        pytest.skip("No tile format available")
+    map_dir = tmp_path / "campaign-maps" / "m"
+    asset = MapAsset(width=1024, height=1024)
+    asset.elements.append(DrawingElement(
+        tool=DrawTool.RECT, points=[Vec2(300, 300), Vec2(400, 400)], stroke_width=0, fill_color="#ff0000",
+    ))
+    asset.save(map_dir, tile_size=256, tile_format=supported_tile_formats()[-1])
+    state = SessionMapState.from_asset("m", asset)
+    state.tokens.append(SessionToken(entity_id="hero", pos=Vec2(330, 330)))
+    runtime = SimpleNamespace(
+        active_map_id="m", active_map=state, entities={},
+        _active_map_asset=lambda: MapAsset.load(map_dir),
+        vision_radius_cells=lambda entity_id: 2,
+        visible_tokens_for=lambda entity_id: [],
+        campaign=SimpleNamespace(map_path=lambda map_id: map_dir.parent / map_id),
+    )
+    return runtime
+
+
+def test_the_server_only_gives_the_tiles_of_the_field_of_view(compiled_map):
+    from rpg_tabletop.net.asset_service import answer_asset
+    from rpg_tabletop.net.assets import parse_ref
+    from rpg_tabletop.net.projection import _map_view
+
+    runtime = compiled_map
+    structure = _map_view(runtime, "hero")["asset"]["compiled"]
+    assert set(structure) == {"version", "size", "origin", "tile_size", "format"}  # no tile list
+
+    def ask(ref, have="", who="hero"):
+        return answer_asset(runtime, who, parse_ref(ref), have)
+
+    drawn = ask("tile:m:1_1")
+    assert drawn.path is not None and drawn.path.is_file()
+    assert drawn.extra["version"] == structure["version"]
+    assert ask("tile:m:1_1", have=drawn.extra["hash"]).status is AssetStatus.UNCHANGED
+    assert ask("tile:m:0_0").status is AssetStatus.UNIFORM
+    assert ask("tile:m:3_3").status is AssetStatus.DENIED       # outside the field of view
+    assert ask("tile:other:1_1").status is AssetStatus.DENIED   # not the GM's map
+    assert ask("tile:m:1_1", who="ghost").status is AssetStatus.DENIED  # no token on the map
+    assert ask("media:m:map.json").status is AssetStatus.DENIED  # GM files are not reachable

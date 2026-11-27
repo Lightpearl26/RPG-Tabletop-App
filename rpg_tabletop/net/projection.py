@@ -12,13 +12,13 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+from rpg_tabletop.core.geometry import vision_square
 from rpg_tabletop.core.rules import PLAYER_STAT_NAMES, RESOURCE_BAR_STATS
 from rpg_tabletop.core.stats import PRIVATE_STATS
 from rpg_tabletop.session.models import SessionToken
 from rpg_tabletop.session.runtime import SessionRuntime
 from rpg_tabletop.session.targeting import targeting_options
 from rpg_tabletop.assets.item import Item
-from .sync_cache import compiled_signature
 
 
 STAT_NAMES = PLAYER_STAT_NAMES  # mental_health / drug_health are GM-only
@@ -108,48 +108,74 @@ def _own_entity_view(runtime: SessionRuntime, entity_id: str) -> dict[str, Any]:
     }
 
 
-# path -> (mtime_ns, size, image id, hex): a sync is built after every change
-# and for every player, so the picture is read again only when its file changes.
-_TOKEN_IMAGES: dict[str, tuple[int, int, str, str]] = {}
-# signature -> compiled map dict, shared by every projection (never mutated)
-_COMPILED: dict[str, dict[str, Any]] = {}
+# path -> (mtime_ns, size, image id): a sync is built after every change and for
+# every player, so a picture is hashed again only when its file changes.
+_TOKEN_IMAGES: dict[str, tuple[int, int, str]] = {}
 
 
-def _token_image(path: Any) -> tuple[str | None, str | None]:
-    """(image id, hex) of a token picture, (None, None) when there is none."""
+def token_image_id(path: Any) -> str | None:
+    """SHA-256 of a token picture (what the player asks for), None without one."""
     if not path:
-        return None, None
+        return None
     path = Path(path)
     try:
         stat = path.stat()
     except OSError:
-        return None, None
+        return None
     key = str(path)
     cached = _TOKEN_IMAGES.get(key)
     if cached is not None and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
-        return cached[2], cached[3]
+        return cached[2]
     try:
-        raw = path.read_bytes()
+        image_id = sha256(path.read_bytes()).hexdigest()
     except OSError:
-        return None, None
-    image_id = sha256(raw).hexdigest()
-    hex_data = raw.hex()
-    _TOKEN_IMAGES[key] = (stat.st_mtime_ns, stat.st_size, image_id, hex_data)
-    return image_id, hex_data
-
-
-def _compiled_view(asset) -> dict[str, Any] | None:
-    if asset.compiled is None:
         return None
-    compiled = asset.compiled.to_dict()
-    signature = compiled_signature(compiled)
-    cached = _COMPILED.get(signature)
-    if cached is None:
-        compiled["signature"] = signature
-        if len(_COMPILED) >= 8:
-            _COMPILED.pop(next(iter(_COMPILED)))
-        _COMPILED[signature] = cached = compiled
-    return cached
+    _TOKEN_IMAGES[key] = (stat.st_mtime_ns, stat.st_size, image_id)
+    return image_id
+
+
+def compiled_version(compiled) -> str:
+    """Changes whenever any tile may have changed (pixels, tiling, area)."""
+    return (
+        f"{compiled.source_hash}:{compiled.tile_size}:{compiled.tile_format}:"
+        f"{compiled.width}x{compiled.height}:{compiled.origin_x},{compiled.origin_y}"
+    )
+
+
+def player_view_box(runtime: SessionRuntime, entity_id: str):
+    """
+    What a player may see of the GM's current map.
+
+    Returns False when the entity has no token on it (nothing visible), None
+    when there is no field of view (no grid: the whole map), otherwise the
+    (left, top, right, bottom) square of the field of view in pixels.
+    """
+    state = runtime.active_map
+    if state is None or runtime.active_map_id is None:
+        return False
+    own_token = state.token_for_entity(str(entity_id))
+    if own_token is None:
+        return False
+    grid = runtime._active_map_asset().grid
+    radius = runtime.vision_radius_cells(entity_id)
+    if not grid.enabled or grid.cell_size <= 0 or radius <= 0:
+        return None
+    return vision_square(
+        float(grid.cell_size), float(grid.offset_x), float(grid.offset_y),
+        own_token.pos.x, own_token.pos.y, int(radius),
+    )
+
+
+def element_visible(element, box) -> bool:
+    if box is None:
+        return True
+    if box is False:
+        return False
+    bounds = element.bounds()
+    return (
+        bounds.x < box[2] and bounds.x + bounds.width > box[0]
+        and bounds.y < box[3] and bounds.y + bounds.height > box[1]
+    )
 
 
 def _token_view(runtime: SessionRuntime, observer_id: str, token: SessionToken) -> dict[str, Any]:
@@ -159,7 +185,6 @@ def _token_view(runtime: SessionRuntime, observer_id: str, token: SessionToken) 
     except (KeyError, PermissionError):
         summary = {}
     entity = runtime.entities[str(token.entity_id)]
-    image_id, raw = _token_image(entity.token)
     return {
         "id": token.id,
         "entity_id": token.entity_id,
@@ -169,63 +194,66 @@ def _token_view(runtime: SessionRuntime, observer_id: str, token: SessionToken) 
         "opacity": token.opacity,
         "self": token.entity_id == observer_id,
         "public": summary,
-        "image": raw,
-        # Lets the server send each picture once per connection (net.sync_cache)
-        "image_id": image_id,
+        # The picture itself is downloaded on demand: ASSET_REQUEST "token:<id>"
+        "image_id": token_image_id(entity.token),
     }
 
 
 def _map_view(runtime: SessionRuntime, entity_id: str) -> dict[str, Any] | None:
+    """
+    The structure of the GM's current map, never the tiles themselves.
+
+    The player works out which tiles its field of view needs, takes those it
+    has from its cache and asks the server for the others (net.asset_service).
+    """
     if runtime.active_map_id is None or runtime.active_map is None:
         return None
 
     asset = runtime._active_map_asset()  # projection is trusted server-side code
-    own_token = runtime.active_map.token_for_entity(entity_id)
-    if own_token is None:
+    box = player_view_box(runtime, entity_id)
+    structure = {
+        "id": asset.id,
+        "name": asset.name,
+        "size": [asset.width, asset.height],
+        "origin": [asset.origin_x, asset.origin_y],
+        "grid": asset.grid.to_dict(),
+        "compiled": None,
+    }
+    if box is False:
         # The GM's current map is the only one that counts. A player whose
-        # entity has no token on it sees nothing of it: no tiles (without a
-        # token there is no field of view, so the whole map would otherwise be
-        # visible and downloaded), no tokens, no annotations. The token keeps
-        # its position on the other maps, stored in the session journal.
+        # entity has no token on it sees nothing of it. The token keeps its
+        # position on the other maps, stored in the session journal.
         return {
-            "map_id": runtime.active_map_id,
-            "present": False,
-            "asset": {
-                "id": asset.id,
-                "name": asset.name,
-                "size": [asset.width, asset.height],
-                "origin": [asset.origin_x, asset.origin_y],
-                "grid": asset.grid.to_dict(),
-                "compiled": None,
-            },
-            "fov": None,
-            "tokens": [],
-            "elements": [],
+            "map_id": runtime.active_map_id, "present": False, "asset": structure,
+            "fov": None, "tokens": [], "elements": [],
         }
-    fov_origin = own_token.pos.to_list()
 
-    compiled = _compiled_view(asset)
+    compiled = asset.compiled
+    if compiled is not None:
+        structure["compiled"] = {
+            "version": compiled_version(compiled),
+            "size": [compiled.width, compiled.height],
+            "origin": [compiled.origin_x, compiled.origin_y],
+            "tile_size": compiled.tile_size,
+            "format": compiled.tile_format,
+        }
+    own_token = runtime.active_map.token_for_entity(entity_id)
     visible_tokens = runtime.visible_tokens_for(entity_id)
     return {
         "map_id": runtime.active_map_id,
         "present": True,
-        "asset": {
-            "id": asset.id,
-            "name": asset.name,
-            "size": [asset.width, asset.height],
-            "origin": [asset.origin_x, asset.origin_y],
-            "grid": asset.grid.to_dict(),
-            "compiled": compiled,
-        },
+        "asset": structure,
         "fov": {
             "radius_cells": runtime.vision_radius_cells(entity_id),
-            "origin": fov_origin,
+            "origin": own_token.pos.to_list(),
             "metric": "chebyshev",
         },
         "tokens": [_token_view(runtime, entity_id, token) for token in visible_tokens],
-        # V2 currently treats runtime-added map elements as player-visible.
-        # Add a visibility policy here later if GM-only runtime elements are needed.
-        "elements": [element.to_dict() for element in runtime.active_map.elements],
+        # Annotations of the session, only those inside the field of view
+        "elements": [
+            element.to_dict() for element in runtime.active_map.elements
+            if getattr(element, "visible", True) and element_visible(element, box)
+        ],
     }
 
 

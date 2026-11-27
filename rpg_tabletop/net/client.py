@@ -14,7 +14,6 @@ from .connection import NetworkConnection
 from .protocol import (
     PROTOCOL_VERSION, ChatMessage, CommandMessage, ErrorMessage, NetworkMessage, PingMessage,
 )
-from .sync_cache import expand_projection
 from .tls import build_client_ssl_context, peer_certificate_fingerprint, verify_peer_fingerprint
 
 MessageCallback = Callable[[NetworkMessage], None]
@@ -42,9 +41,6 @@ class RPGNetworkClient:
         self.players: dict[str, int | None] = {}
         self._read_task: asyncio.Task[None] | None = None
         self._reply_queues: dict[str, asyncio.Queue[NetworkMessage]] = {}
-        # Heavy projection parts received on this connection (net.sync_cache)
-        self._token_images: dict[str, str] = {}
-        self._compiled_maps: dict[str, dict[str, Any]] = {}
 
     async def connect(self, *, auth_timeout: float = 15.0) -> CommandMessage:
         if self.is_connected:
@@ -146,7 +142,10 @@ class RPGNetworkClient:
                 self.on_disconnect()
 
     def _receive_asset_chunk(self, message: CommandMessage) -> CommandMessage | None:
-        """Store one chunk; return a short ASSET_CHUNK message when a file is complete."""
+        """
+        Store one chunk. Once a file is complete, return a short ASSET_CHUNK
+        {"ref", "file", "complete": true, + hash/version} for the interface.
+        """
         if self.asset_receiver is None:
             return None
         args = message.args
@@ -154,18 +153,14 @@ class RPGNetworkClient:
             stored = self.asset_receiver.receive_chunk(args)
         except (KeyError, TypeError, ValueError, OSError) as exc:
             # A damaged or unwritable file is not a reason to drop the connection
-            return CommandMessage(ServerCommand.ASSET_FAILED.value, {
-                "namespace": str(args.get("namespace", "")),
-                "path": str(args.get("path", "")),
-                "reason": str(exc),
+            return CommandMessage(ServerCommand.ASSET_STATUS.value, {
+                "ref": str(args.get("ref", "")), "status": "missing", "reason": str(exc),
             })
         if stored is None:
             return None
-        return CommandMessage(ServerCommand.ASSET_CHUNK.value, {
-            "namespace": str(args.get("namespace", "")),
-            "path": str(args.get("path", "")),
-            "complete": True,
-        })
+        info = {key: args[key] for key in ("ref", "hash", "version") if key in args}
+        info.update({"file": str(stored), "complete": True})
+        return CommandMessage(ServerCommand.ASSET_CHUNK.value, info)
 
     def _apply_local_state(self, message: NetworkMessage) -> None:
         if not isinstance(message, CommandMessage):
@@ -177,7 +172,6 @@ class RPGNetworkClient:
         elif message.command == ServerCommand.RUNTIME_SYNC.value:
             projection = message.args.get("projection", {})
             if isinstance(projection, dict):
-                expand_projection(projection, self._token_images, self._compiled_maps)
                 self.last_projection = projection
         elif message.command == ServerCommand.PLAYER_LIST.value:
             for name in message.args.get("players", []):
@@ -252,13 +246,8 @@ class RPGNetworkClient:
     async def request_end_turn(self) -> str:
         return await self.send_command(ClientCommand.END_TURN_REQUEST.value, {})
 
-    async def request_asset_manifest(self, namespaces: list[str] | None = None) -> str:
-        return await self.send_command(
-            ClientCommand.ASSET_MANIFEST_REQUEST.value,
-            {"namespaces": namespaces} if namespaces is not None else {},
-        )
-
     async def request_assets(self, items: list[dict[str, str]], *, replace: bool = False) -> str:
+        """items: [{"ref": "tile:<map>:<c>_<r>", "have": "<hash of the cached copy>"}, ...]"""
         # Streamed in the background by the server: no reply to wait for
         return await self.send(CommandMessage(
             ClientCommand.ASSET_REQUEST.value, {"items": items, "replace": bool(replace)}

@@ -2,7 +2,6 @@
 """Player-safe interactive map view driven only by server projections."""
 from __future__ import annotations
 
-from hashlib import sha256
 from math import floor, ceil
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -12,8 +11,9 @@ from PySide6.QtGui import QColor, QBrush, QImage, QMouseEvent, QPainter, QPen, Q
 from PySide6.QtWidgets import QWidget
 
 from rpg_tabletop.assets.map import MapElement, MediaCache, Vec2
-from rpg_tabletop.core.geometry import GridGeometry, chebyshev, line_cells, square_area
+from rpg_tabletop.core.geometry import GridGeometry, chebyshev, line_cells, square_area, tiles_in_box
 from rpg_tabletop.ui.common.token_overlay import draw_token_overlay
+from .tile_cache import TileCache
 
 def _number(value: Any) -> float | None:
     try:
@@ -43,8 +43,10 @@ class PlayerMapView(QWidget):
         self.combat: dict[str, Any] = {}
         self.center = Vec2()
         self.zoom = 1.0
+        # Decoded files: tiles and token pictures, by path in the cache
         self._tile_cache: dict[Path, QImage] = {}
         self._token_pictures: dict[str, QImage] = {}
+        self.tiles = TileCache()
         self._elements: list[MapElement] = []
         self._media: MediaCache | None = None
         self._panning = False
@@ -70,9 +72,6 @@ class PlayerMapView(QWidget):
     # ------------------------------------------------------------------ state
     def set_projection(self, projection: dict[str, Any]) -> None:
         old_map_id = str((self.map_data or {}).get("map_id", ""))
-        old_asset = self._asset_data() or {}
-        old_compiled = old_asset.get("compiled", {}) if isinstance(old_asset.get("compiled"), dict) else {}
-        old_source_hash = str(old_compiled.get("source_hash", ""))
         self.projection = dict(projection or {})
         self.own_entity = dict(self.projection.get("entity") or {})
         self.permissions = dict(self.projection.get("permissions") or {})
@@ -80,10 +79,7 @@ class PlayerMapView(QWidget):
         raw_map = self.projection.get("map")
         self.map_data = dict(raw_map) if isinstance(raw_map, dict) else None
         new_map_id = str((self.map_data or {}).get("map_id", ""))
-        new_asset = self._asset_data() or {}
-        new_compiled = new_asset.get("compiled", {}) if isinstance(new_asset.get("compiled"), dict) else {}
-        new_source_hash = str(new_compiled.get("source_hash", ""))
-        if new_map_id != old_map_id or new_source_hash != old_source_hash:
+        if new_map_id != old_map_id:
             self.center = Vec2()
             self.zoom = 1.0
             self._tile_cache.clear()
@@ -141,7 +137,14 @@ class PlayerMapView(QWidget):
 
     def invalidate_cached_assets(self) -> None:
         self._tile_cache.clear()
+        self._token_pictures.clear()
         self._media = None
+        self.update()
+
+    def forget_file(self, path: str | Path) -> None:
+        """A file of the cache was just written: decode it again next time."""
+        self._tile_cache.pop(Path(path), None)
+        self._token_pictures.pop(str(path), None)
         self.update()
 
     def set_has_pending(self, pending: bool) -> None:
@@ -225,39 +228,21 @@ class PlayerMapView(QWidget):
         return self.map_data is not None and self.map_data.get("present", True) is not False
 
     def visible_tile_keys(self) -> set[str]:
-        """Return only compiled tile files intersecting the current viewport."""
-        if not self.on_map:
+        """Keys of the compiled tiles the view shows (itself limited to the field of view)."""
+        if not self.on_map or self.width() <= 0 or self.height() <= 0:
             return set()
-        asset = self._asset_data()
-        compiled = asset.get("compiled") if isinstance(asset, dict) else None
+        compiled = (self._asset_data() or {}).get("compiled")
         if not isinstance(compiled, dict):
             return set()
-        tiles = compiled.get("tiles", {})
-        if not isinstance(tiles, dict) or not tiles:
-            return set()
         try:
-            tile_size = max(1, int(compiled.get("tile_size", 512)))
-            width, height = (float(value) for value in compiled.get("size", asset.get("size", [0, 0])))
+            tile_size = int(compiled.get("tile_size", 512))
+            width, height = (float(value) for value in compiled.get("size", [0, 0]))
         except (TypeError, ValueError):
             return set()
-        if width <= 0 or height <= 0 or self.width() <= 0 or self.height() <= 0:
-            return set()
-        # Tiles are counted from the corner of the compiled area
         ox, oy = self._origin(compiled)
-        visible = self._visible_world_rect().intersected(QRectF(ox, oy, width, height))
-        if visible.isEmpty():
-            return set()
-        visible.translate(-ox, -oy)
-        first_col = max(0, int(floor(visible.left() / tile_size)))
-        first_row = max(0, int(floor(visible.top() / tile_size)))
-        last_col = min(int(ceil(width / tile_size)) - 1, max(0, int(ceil(visible.right() / tile_size)) - 1))
-        last_row = min(int(ceil(height / tile_size)) - 1, max(0, int(ceil(visible.bottom() / tile_size)) - 1))
-        return {
-            f"{col}_{row}"
-            for row in range(first_row, last_row + 1)
-            for col in range(first_col, last_col + 1)
-            if f"{col}_{row}" in tiles
-        }
+        visible = self._visible_world_rect()
+        box = (visible.left(), visible.top(), visible.right(), visible.bottom())
+        return {f"{col}_{row}" for col, row in tiles_in_box(box, ox, oy, tile_size, width, height)}
 
     def prioritized_tile_keys(self) -> list[str]:
         """The visible tiles, nearest to the center of the view first."""
@@ -571,52 +556,37 @@ class PlayerMapView(QWidget):
         if not isinstance(compiled, dict):
             return
         tile_size = max(1, int(compiled.get("tile_size", 512)))
-        tile_format = str(compiled.get("format", "webp"))
-        if tile_format not in {"webp", "png"}:
-            return
-        map_id = str((self.map_data or {}).get("map_id", ""))
-        safe_map_id = PurePosixPath(map_id.replace("\\", "/"))
-        if not map_id or safe_map_id.is_absolute() or len(safe_map_id.parts) != 1 or map_id in {".", ".."}:
-            return
-        tiles = compiled.get("tiles", {}) if isinstance(compiled.get("tiles"), dict) else {}
-        uniform = compiled.get("uniform", {}) if isinstance(compiled.get("uniform"), dict) else {}
-        visible = self._visible_world_rect().intersected(map_rect)
-        if visible.isEmpty():
-            return
-        # Tiles are counted from the corner of the compiled area
         ox, oy = self._origin(compiled)
-        visible.translate(-ox, -oy)
-        first_col = max(0, int(floor(visible.left() / tile_size)))
-        last_col = max(0, int(floor(visible.right() / tile_size)))
-        first_row = max(0, int(floor(visible.top() / tile_size)))
-        last_row = max(0, int(floor(visible.bottom() / tile_size)))
-        root = self.cache_root / "maps" / map_id / "tiles"
-        for row in range(first_row, last_row + 1):
-            for col in range(first_col, last_col + 1):
-                key = f"{col}_{row}"
-                rect = QRectF(ox + col * tile_size, oy + row * tile_size, tile_size, tile_size)
-                if key in uniform:
-                    painter.fillRect(rect, QColor(str(uniform[key])))
-                    continue
-                if key not in tiles:
-                    continue
-                if not all(part.isdigit() for part in key.split("_", 1)):
-                    continue
-                path = root / f"{key}.{tile_format}"
-                image = self._tile_cache.get(path)
-                if image is None:
-                    if path.is_file():
-                        image = QImage(str(path))
-                        if not image.isNull():
-                            self._tile_cache[path] = image
-                    else:
-                        image = QImage()
-                if not image.isNull():
-                    painter.drawImage(rect.topLeft(), image)
-                else:
-                    painter.fillRect(rect, QColor("#252b36"))
-                    painter.setPen(QPen(QColor("#3b4553"), 1.0 / max(self.zoom, 0.05)))
-                    painter.drawRect(rect)
+        for key in self.visible_tile_keys():
+            col, row = (int(part) for part in key.split("_", 1))
+            rect = QRectF(ox + col * tile_size, oy + row * tile_size, tile_size, tile_size)
+            entry = self.tiles.lookup(key) or {}
+            if "c" in entry:
+                painter.fillRect(rect, QColor(str(entry["c"])))
+                continue
+            if "e" in entry:
+                continue  # nothing drawn there: the map background shows
+            image = self._tile_image(key) if "h" in entry else None
+            if image is not None:
+                painter.drawImage(rect.topLeft(), image)
+            else:
+                painter.fillRect(rect, QColor("#252b36"))
+                painter.setPen(QPen(QColor("#3b4553"), 1.0 / max(self.zoom, 0.05)))
+                painter.drawRect(rect)
+
+    def _tile_image(self, key: str) -> QImage | None:
+        path = self.tiles.tile_file(key)
+        if path is None:
+            return None
+        image = self._tile_cache.get(path)
+        if image is None:
+            if not path.is_file():
+                return None
+            image = QImage(str(path))  # format read from the content
+            if image.isNull():
+                return None
+            self._tile_cache[path] = image
+        return image
 
     def _draw_runtime_elements(self, painter: QPainter) -> None:
         if self._media is None:
@@ -693,28 +663,27 @@ class PlayerMapView(QWidget):
             y = oy + row * cell
             painter.drawLine(QPointF(visible.left(), y), QPointF(visible.right(), y))
 
-    def _token_picture(self, token: dict[str, Any]) -> QImage | None:
-        """
-        The decoded picture of a token, decoded once and kept by image id.
-
-        It used to be written to a temporary file and decoded again on every
-        repaint (every mouse move, every received tile), which froze the view.
-        """
-        raw = token.get("image")
-        if not raw:
+    def token_picture_file(self, token: dict[str, Any]) -> Path | None:
+        image_id = str(token.get("image_id") or "")
+        if len(image_id) != 64 or not all(char in "0123456789abcdef" for char in image_id):
             return None
-        key = str(token.get("image_id") or "") or sha256(str(raw).encode("ascii", "ignore")).hexdigest()
-        cached = self._token_pictures.get(key)
+        return self.cache_root / "tokens" / image_id
+
+    def _token_picture(self, token: dict[str, Any]) -> QImage | None:
+        """The picture of a token, downloaded once into the cache and decoded once."""
+        path = self.token_picture_file(token)
+        if path is None:
+            return None
+        cached = self._token_pictures.get(str(path))
         if cached is not None:
-            return None if cached.isNull() else cached
-        try:
-            picture = QImage.fromData(bytes.fromhex(str(raw)))
-        except ValueError:
-            picture = QImage()
-        if len(self._token_pictures) > 256:
-            self._token_pictures.clear()
-        self._token_pictures[key] = picture
-        return None if picture.isNull() else picture
+            return cached
+        if not path.is_file():
+            return None  # requested by the window, drawn once it arrives
+        picture = QImage(str(path))
+        if picture.isNull():
+            return None
+        self._token_pictures[str(path)] = picture
+        return picture
 
     def _draw_tokens(self, painter: QPainter) -> None:
         own_name = str(self.own_entity.get("name", "Vous"))
@@ -724,7 +693,6 @@ class PlayerMapView(QWidget):
             public = token.get("public") if isinstance(token.get("public"), dict) else dict()
             name = str(public.get("name") or (own_name if token.get("self") else ""))
             opacity = max(0.0, min(1.0, float(token.get("opacity", 1.0))))
-            image = token.get("image")
 
             painter.save()
             painter.setOpacity(opacity)
@@ -740,7 +708,7 @@ class PlayerMapView(QWidget):
                 outline = QColor("#f9e2af")
             painter.setPen(QPen(outline, max(1.5, 2.0 / self.zoom)))
             painter.drawEllipse(rect)
-            picture = self._token_picture(token) if image else None
+            picture = self._token_picture(token)
             if picture is not None:
                 clipath = QPainterPath()
                 clipath.addEllipse(rect)

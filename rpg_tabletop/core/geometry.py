@@ -286,3 +286,52 @@ def nearest_corner(grid: GridGeometry, x: float, y: float) -> Point:
 def nearest(cells: Iterable[Cell], target: Cell) -> Optional[Cell]:
     cells = list(cells)
     return min(cells, key=lambda cell: chebyshev(cell, target)) if cells else None
+
+
+# ---------------------------------------------------------------------------
+# Field of view and map tiles (shared by the server, which checks what a player
+# may download, and the player, which decides what to ask for)
+# ---------------------------------------------------------------------------
+Box = tuple[float, float, float, float]  # left, top, right, bottom
+
+
+def vision_square(
+    cell_size: float, offset_x: float, offset_y: float, x: float, y: float, radius: int
+) -> Box:
+    """The square of `radius` cells around the cell holding (x, y), in pixels."""
+    col = floor((x - offset_x) / cell_size)
+    row = floor((y - offset_y) / cell_size)
+    left = offset_x + (col - radius) * cell_size
+    top = offset_y + (row - radius) * cell_size
+    side = (radius * 2 + 1) * cell_size
+    return left, top, left + side, top + side
+
+
+def tiles_in_box(
+    box: Box, origin_x: float, origin_y: float, tile_size: int, width: float, height: float
+) -> list[tuple[int, int]]:
+    """
+    (column, row) of every tile of a compiled map that `box` overlaps.
+
+    Tiles are counted from the corner of the compiled area (`origin`); a box
+    that only touches a tile edge does not overlap it.
+    """
+    if tile_size <= 0 or width <= 0 or height <= 0:
+        return []
+    left = max(box[0], origin_x) - origin_x
+    top = max(box[1], origin_y) - origin_y
+    right = min(box[2], origin_x + width) - origin_x
+    bottom = min(box[3], origin_y + height) - origin_y
+    if right <= left or bottom <= top:
+        return []
+    columns = -(-int(width) // tile_size)
+    rows = -(-int(height) // tile_size)
+    first_col = max(0, floor(left / tile_size))
+    first_row = max(0, floor(top / tile_size))
+    last_col = min(columns - 1, -(-right // tile_size) - 1)
+    last_row = min(rows - 1, -(-bottom // tile_size) - 1)
+    return [
+        (col, row)
+        for row in range(int(first_row), int(last_row) + 1)
+        for col in range(int(first_col), int(last_col) + 1)
+    ]

@@ -15,6 +15,8 @@ from rpg_tabletop.core.rules import (
 from rpg_tabletop.core.stats import PRIVATE_STATS
 from rpg_tabletop.session.models import SessionEventType
 from rpg_tabletop.session.runtime import SessionRuntime
+from .asset_service import AssetAnswer, answer_asset
+from .assets import AssetRef
 from .commands import ActionIntent, ActionKind, ClientCommand, ServerCommand
 from .models import DiceProposal, PendingKind, PendingRequest, PendingStatus
 from .projection import build_player_runtime_projection
@@ -120,6 +122,10 @@ class RuntimeNetworkGateway:
             {"entity_id": entity_id, "value": value},
             reply_to=request.message_id,
         )])
+
+    def asset_answer(self, username: str, ref: AssetRef, have: str = "") -> AssetAnswer:
+        """Whether this player may have this file now, and what to send (net.asset_service)."""
+        return answer_asset(self.runtime, self.entity_for(username), ref, have)
 
     def projection_for(self, username: str) -> dict[str, Any]:
         entity_id = self.entity_for(username)

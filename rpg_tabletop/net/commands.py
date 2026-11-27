@@ -16,7 +16,7 @@ class ClientCommand(str, Enum):
     ACTION_CANCEL_REQUEST = "ACTION_CANCEL_REQUEST"
     TOKEN_INSPECT_REQUEST = "TOKEN_INSPECT_REQUEST"
     END_TURN_REQUEST = "END_TURN_REQUEST"
-    ASSET_MANIFEST_REQUEST = "ASSET_MANIFEST_REQUEST"
+    # References of the files a player needs (net.assets)
     ASSET_REQUEST = "ASSET_REQUEST"
     INITIATIVE_ROLL = "INITIATIVE_ROLL"
     # A player's result for one die of a pending request
@@ -41,11 +41,10 @@ class ServerCommand(str, Enum):
     PLAYER_JOINED = "PLAYER_JOINED"
     PLAYER_LEFT = "PLAYER_LEFT"
     PLAYER_PINGS = "PLAYER_PINGS"
-    ASSET_MANIFEST = "ASSET_MANIFEST"
     ASSET_CHUNK = "ASSET_CHUNK"
     ASSET_DONE = "ASSET_DONE"
-    # One requested asset could not be sent (missing or refused file)
-    ASSET_FAILED = "ASSET_FAILED"
+    # A requested asset without a file to send: unchanged, uniform, empty, denied, missing
+    ASSET_STATUS = "ASSET_STATUS"
     # The GM asks a player for the d20 initiative of their entity
     INITIATIVE_REQUEST = "INITIATIVE_REQUEST"
     INITIATIVE_CANCELLED = "INITIATIVE_CANCELLED"

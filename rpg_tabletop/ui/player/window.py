@@ -2,10 +2,7 @@
 """Main Player Runtime window. It only consumes server projections."""
 from __future__ import annotations
 
-from hashlib import sha256
-import json
 from pathlib import Path, PurePosixPath
-import shutil
 from typing import Any
 
 from PySide6.QtCore import QStandardPaths, QTimer, Qt, QSettings
@@ -16,6 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from rpg_tabletop.net import ClientSettings
+from rpg_tabletop.net.assets import parse_ref
 from rpg_tabletop.net.protocol import ChatMessage, CommandMessage, ErrorMessage
 from .connection import PlayerNetworkController
 from .dialogs import DiceRollDialog, InitiativeRollDialog, PlayerLoginDialog, TokenInspectDialog
@@ -46,11 +44,10 @@ class PlayerRuntimeWindow(QMainWindow):
         self.projection: dict[str, Any] | None = None
         self._pending_approval_id = ""
         self._has_pending = False
-        # Map files asked to the server and not received yet
+        # References asked to the server and not answered yet
         self._requested_assets: set[str] = set()
-        # Map files the server could not send: not asked again until "Recharger"
+        # References the server could not send: not asked again until "Recharger"
         self._failed_assets: set[str] = set()
-        self._prepared_compiled = ""
         self._closing = False
         self._asset_request_timer = QTimer(self)
         self._asset_request_timer.setSingleShot(True)
@@ -304,7 +301,6 @@ class PlayerRuntimeWindow(QMainWindow):
         self.controller.shutdown()
         self._requested_assets.clear()
         self._failed_assets.clear()
-        self._prepared_compiled = ""
         self.projection = None
         self._apply_projection({})
         dialog = PlayerLoginDialog(self)
@@ -400,15 +396,11 @@ class PlayerRuntimeWindow(QMainWindow):
             self.chat_panel.append_log(DEBUG, text)
             self.statusBar().showMessage(text, 5000)
         elif command == "ASSET_CHUNK":
-            # Sent once per complete file (see RPGNetworkClient)
-            self._requested_assets.discard(str(args.get("path", "")))
-            self.map_view.update()
-        elif command == "ASSET_FAILED":
-            relative = str(args.get("path", ""))
-            self._requested_assets.discard(relative)
-            self._failed_assets.add(relative)
-            self.chat_panel.append_log(DEBUG, f"Ressource indisponible : {relative} ({args.get('reason', '')})")
+            self._asset_received(args)
+        elif command == "ASSET_STATUS":
+            self._asset_status(args)
         elif command == "ASSET_DONE":
+            self.map_view.tiles.save()
             self.map_view.update()
             self.statusBar().showMessage("Synchronisation des ressources de carte terminée", 4000)
 
@@ -567,7 +559,7 @@ class PlayerRuntimeWindow(QMainWindow):
         map_data = projection.get("map")
         self._set_session_cache(str(session.get("id", "")))
         if isinstance(map_data, dict):
-            self._prepare_map_cache(map_data)
+            self._open_tile_cache(map_data)
         if self._sheet is not None and self._sheet.isVisible():
             self._sheet.set_entity(entity, self._own_token_image())
         self.action_panel.set_projection(projection)
@@ -641,14 +633,15 @@ class PlayerRuntimeWindow(QMainWindow):
             self.map_status.setText("Aucune carte active")
 
     def _own_token_image(self) -> bytes | None:
-        """Picture of the player's own token, as sent with the map."""
+        """Picture of the player's own token, from the cache (downloaded with the map)."""
         map_data = (self.projection or {}).get("map")
         tokens = map_data.get("tokens", []) if isinstance(map_data, dict) else []
         for token in tokens if isinstance(tokens, list) else []:
-            if isinstance(token, dict) and token.get("self") and token.get("image"):
+            if isinstance(token, dict) and token.get("self"):
+                path = self.map_view.token_picture_file(token)
                 try:
-                    return bytes.fromhex(str(token["image"]))
-                except ValueError:
+                    return path.read_bytes() if path is not None and path.is_file() else None
+                except OSError:
                     return None
         return None
 
@@ -675,13 +668,10 @@ class PlayerRuntimeWindow(QMainWindow):
         self._cache_session_id = session_id
         self._requested_assets.clear()
         self._failed_assets.clear()
-        self._prepared_compiled = ""
         self.controller.cache_root = session_root
         if self.controller.client is not None and self.controller.client.asset_receiver is not None:
-            receiver = self.controller.client.asset_receiver
-            receiver.cache_root = session_root
-            receiver._buffers.clear()
-            receiver._meta.clear()
+            self.controller.client.asset_receiver.reset(session_root)
+        self.map_view.tiles.close()
         self.map_view.set_cache_root(session_root)
 
     def _schedule_visible_asset_request(self) -> None:
@@ -692,72 +682,63 @@ class PlayerRuntimeWindow(QMainWindow):
         if self.projection and isinstance(self.projection.get("map"), dict):
             self._request_missing_map_assets(self.projection["map"])
 
-    def _prepare_map_cache(self, map_data: dict[str, Any]) -> None:
-        """
-        Keep the downloaded tiles that are still valid for this compilation.
-
-        Each tile has a hash in the compiled map: only the tiles whose hash
-        changed (or that disappeared) are deleted, so a map the GM edits and
-        saves again does not have to be downloaded again in full.
-        """
+    @staticmethod
+    def _safe_map_id(map_data: dict[str, Any]) -> str:
         map_id = str(map_data.get("map_id", ""))
-        safe_id = PurePosixPath(map_id.replace("\\", "/"))
-        if not map_id or safe_id.is_absolute() or len(safe_id.parts) != 1 or map_id in {".", ".."}:
+        path = PurePosixPath(map_id.replace("\\", "/"))
+        if not map_id or path.is_absolute() or len(path.parts) != 1 or map_id in {".", ".."}:
+            return ""
+        return map_id
+
+    def _open_tile_cache(self, map_data: dict[str, Any]) -> None:
+        map_id = self._safe_map_id(map_data)
+        if not map_id:
             return
         asset = map_data.get("asset", {})
         compiled = asset.get("compiled") if isinstance(asset, dict) else None
-        if not isinstance(compiled, dict):
-            return
-        signature = str(compiled.get("signature") or "") or sha256(
-            json.dumps(compiled, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
-        cache_key = f"{self.controller.cache_root}|{map_id}|{signature}"
-        if cache_key == self._prepared_compiled:
-            return  # same compilation as the last sync: nothing to check
-        self._prepared_compiled = cache_key
-
-        tiles = compiled.get("tiles", {}) if isinstance(compiled.get("tiles"), dict) else {}
-        layout = {
-            "format": str(compiled.get("format", "")),
-            "tile_size": compiled.get("tile_size"),
-            "origin": compiled.get("origin", [0, 0]),
-        }
-        map_root = self.controller.cache_root / "maps" / map_id
-        tiles_dir = map_root / "tiles"
-        index_file = map_root / ".tile_hashes.json"
-        try:
-            previous = json.loads(index_file.read_text(encoding="utf-8")) if index_file.is_file() else None
-        except (OSError, ValueError):
-            previous = None
-
-        removed = False
-        if not isinstance(previous, dict) or previous.get("layout") != layout:
-            # Unknown or different tiling (or a cache from an older version)
-            if tiles_dir.exists():
-                shutil.rmtree(tiles_dir, ignore_errors=True)
-                removed = True
-        else:
-            old_tiles = previous.get("tiles", {}) if isinstance(previous.get("tiles"), dict) else {}
-            suffix = layout["format"]
-            for key, old_hash in old_tiles.items():
-                if tiles.get(key) == old_hash or not all(part.isdigit() for part in str(key).split("_", 1)):
-                    continue
-                path = tiles_dir / f"{key}.{suffix}"
-                if path.is_file():
-                    try:
-                        path.unlink()
-                        removed = True
-                    except OSError:
-                        pass
-        (map_root / ".compiled_signature").unlink(missing_ok=True)  # old cache marker
-        map_root.mkdir(parents=True, exist_ok=True)
-        try:
-            index_file.write_text(json.dumps({"layout": layout, "tiles": tiles}), encoding="utf-8")
-        except OSError:
-            pass
-        if removed:
+        if self.map_view.tiles.open(self.controller.cache_root / "maps" / map_id, compiled):
             self._requested_assets.clear()
             self.map_view.invalidate_cached_assets()
+
+    def _asset_received(self, args: dict[str, Any]) -> None:
+        """A complete file reached the cache (one message per file, see RPGNetworkClient)."""
+        raw_ref = str(args.get("ref", ""))
+        self._requested_assets.discard(raw_ref)
+        try:
+            ref = parse_ref(raw_ref)
+        except ValueError:
+            return
+        if ref.kind == "tile" and self.map_view.tiles.map_root == self.controller.cache_root / "maps" / ref.map_id:
+            self.map_view.tiles.record(ref.name, version=str(args.get("version", "")),
+                                       file_hash=str(args.get("hash", "")))
+        self.map_view.forget_file(str(args.get("file", "")))
+
+    def _asset_status(self, args: dict[str, Any]) -> None:
+        """A requested reference without a file: unchanged, uniform, empty, denied, missing."""
+        raw_ref = str(args.get("ref", ""))
+        status = str(args.get("status", ""))
+        self._requested_assets.discard(raw_ref)
+        try:
+            ref = parse_ref(raw_ref)
+        except ValueError:
+            return
+        if status == "missing":
+            self._failed_assets.add(raw_ref)
+            self.chat_panel.append_log(DEBUG, f"Ressource indisponible : {raw_ref} {args.get('reason', '')}")
+            return
+        if status == "denied" or ref.kind != "tile":
+            return  # out of view now: asked again if it comes back on screen
+        tiles = self.map_view.tiles
+        if tiles.map_root != self.controller.cache_root / "maps" / ref.map_id:
+            return
+        version = str(args.get("version", ""))
+        if status == "unchanged":
+            tiles.record(ref.name, version=version, file_hash=str(args.get("hash", "")))
+        elif status == "uniform":
+            tiles.record(ref.name, version=version, color=str(args.get("color", "#00000000")))
+        elif status == "empty":
+            tiles.record(ref.name, version=version, empty=True)
+        self.map_view.update()
 
     def _retry_map_assets(self) -> None:
         if self.projection and isinstance(self.projection.get("map"), dict):
@@ -766,70 +747,60 @@ class PlayerRuntimeWindow(QMainWindow):
             self._request_missing_map_assets(self.projection["map"])
 
     def _forget_missing_asset_requests(self) -> None:
-        for relative in tuple(self._requested_assets):
-            local = self.controller.cache_root / "maps" / Path(*PurePosixPath(relative).parts)
-            if not local.is_file():
-                self._requested_assets.discard(relative)
-
-    def _local_asset(self, relative: str) -> Path:
-        return self.controller.cache_root / "maps" / Path(*PurePosixPath(relative).parts)
+        self._requested_assets.clear()
 
     def _request_missing_map_assets(self, map_data: dict[str, Any]) -> None:
         """
-        Ask the server for the map files on screen that are not in the cache.
+        Ask the server for what the screen needs and the cache does not have.
 
-        Only the tiles inside the viewport (itself limited to the field of view)
-        are asked for, nearest to the center first. When the view moves, the
-        files that left it and were not sent yet are dropped server-side
-        (`replace`), so the player never waits for tiles they cannot see.
+        The server sent only the structure of the map. From it, the view works
+        out the tiles of the field of view (nearest to the center first); each
+        one known from the cache for this compilation is drawn directly, the
+        others are asked for, with the hash of the cached copy when there is
+        one ("have"). When the view moves, what left it and was not answered
+        yet is dropped server-side (`replace`).
         """
         if not self.controller.is_connected:
             return
-        map_id = str(map_data.get("map_id", ""))
-        map_path = PurePosixPath(map_id.replace("\\", "/"))
-        if not map_id or map_path.is_absolute() or len(map_path.parts) != 1 or map_id in {".", ".."}:
+        map_id = self._safe_map_id(map_data)
+        if not map_id:
             return
+        wanted: dict[str, str] = {}  # reference -> have
+
         asset = map_data.get("asset", {})
-        if not isinstance(asset, dict):
-            asset = {}
-        wanted: list[str] = []
-
-        compiled = asset.get("compiled")
+        compiled = asset.get("compiled") if isinstance(asset, dict) else None
         if isinstance(compiled, dict) and self.map_view.on_map:
-            tile_format = str(compiled.get("format", "webp"))
-            if tile_format in {"webp", "png"}:
-                tiles = compiled.get("tiles", {}) if isinstance(compiled.get("tiles"), dict) else {}
-                for key in self.map_view.prioritized_tile_keys():
-                    if key not in tiles or not all(part.isdigit() for part in key.split("_", 1)):
-                        continue
-                    wanted.append(f"{map_id}/tiles/{key}.{tile_format}")
+            for key in self.map_view.prioritized_tile_keys():
+                have = self.map_view.tiles.request_for(key)
+                if have is not None:
+                    wanted[f"tile:{map_id}:{key}"] = have
 
-        # Runtime-added image elements may reference files under this map's media/ folder.
-        for element in map_data.get("elements", []):
+        for token in map_data.get("tokens", []) or []:
+            if isinstance(token, dict):
+                path = self.map_view.token_picture_file(token)
+                if path is not None and not path.is_file():
+                    wanted[f"token:{token['image_id']}"] = ""
+
+        for element in map_data.get("elements", []) or []:
             if not isinstance(element, dict) or not element.get("asset"):
                 continue
-            relative_asset = PurePosixPath(str(element["asset"]).replace("\\", "/"))
-            if relative_asset.is_absolute() or ".." in relative_asset.parts:
+            relative = PurePosixPath(str(element["asset"]).replace("\\", "/"))
+            if relative.is_absolute() or ".." in relative.parts:
                 continue
-            wanted.append(f"{map_id}/{relative_asset.as_posix()}")
+            if not (self.controller.cache_root / "maps" / map_id / Path(*relative.parts)).is_file():
+                wanted[f"media:{map_id}:{relative.as_posix()}"] = ""
 
-        wanted = [
-            relative for relative in dict.fromkeys(wanted)
-            if relative not in self._failed_assets and not self._local_asset(relative).is_file()
-        ]
-        wanted_set = set(wanted)
-        new = [relative for relative in wanted if relative not in self._requested_assets]
-        stale = {
-            relative for relative in self._requested_assets
-            if relative not in wanted_set and not self._local_asset(relative).is_file()
-        }
-        self._requested_assets = wanted_set
+        for ref in self._failed_assets:
+            wanted.pop(ref, None)
+        new = [ref for ref in wanted if ref not in self._requested_assets]
+        stale = self._requested_assets - set(wanted)
+        self._requested_assets = set(wanted)
         if stale:
             self.controller.request_assets(
-                [{"namespace": "maps", "path": relative} for relative in wanted], replace=True
+                [{"ref": ref, "have": have} for ref, have in wanted.items()], replace=True
             )
         elif new:
-            self.controller.request_assets([{"namespace": "maps", "path": relative} for relative in new])
+            self.controller.request_assets([{"ref": ref, "have": wanted[ref]} for ref in new])
 
     # --------------------------------------------------------------- players
     def _refresh_players(self, players: Any) -> None:
@@ -844,5 +815,6 @@ class PlayerRuntimeWindow(QMainWindow):
     # ---------------------------------------------------------------- lifecycle
     def closeEvent(self, event: QCloseEvent) -> None:
         self._closing = True
+        self.map_view.tiles.save()
         self.controller.shutdown()
         super().closeEvent(event)

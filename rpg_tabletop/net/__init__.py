@@ -1,5 +1,5 @@
 """Networking package for RPG Tabletop App."""
-from .assets import AssetCatalog, AssetEntry, AssetReceiver
+from .assets import AssetReceiver, AssetRef, AssetStatus, parse_ref
 from .client import RPGNetworkClient
 from .commands import ActionIntent, ActionKind, ClientCommand, ServerCommand, TargetSelection
 from .config import ClientSettings, RelaySettings, ServerSettings, TLSSettings
@@ -15,8 +15,8 @@ from .server import RPGNetworkServer, create_runtime_server
 from .tls import certificate_fingerprint
 
 __all__ = [
-    "PROTOCOL_VERSION", "AsyncioLoopThread", "ActionIntent", "ActionKind", "AssetCatalog", "AssetEntry",
-    "AssetReceiver", "ChatMessage", "ClientCommand", "ClientSettings", "CommandMessage",
+    "PROTOCOL_VERSION", "AsyncioLoopThread", "ActionIntent", "ActionKind", "AssetRef", "AssetStatus",
+    "AssetReceiver", "parse_ref", "ChatMessage", "ClientCommand", "ClientSettings", "CommandMessage",
     "DiceProposal", "ErrorMessage", "ErrorType", "LogMessage", "MessageType",
     "NetworkMessage", "PendingKind", "PendingRequest", "PendingStatus", "PingMessage",
     "RPGNetworkClient", "RPGNetworkServer", "RelayEndpoint", "RelaySettings",
